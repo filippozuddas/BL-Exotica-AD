@@ -1,0 +1,21 @@
+# Synthetic data generation via setigen
+# Used during development before real GBT data is available
+
+product: synthetic
+
+frame:
+  fchans: 1024          # Frequency channels per snippet
+  tchans: 32            # Time bins per snippet
+  df: 2.7939677238464355  # Hz per channel (GBT L-band fine resolution)
+  dt: 18.25361108         # Seconds per time bin
+  fch1: 1500.0            # MHz center frequency
+
+noise:
+  x_mean: 5.0
+  noise_type: chi2
+
+dataset:
+  n_train: 8000
+  n_val: 1000
+  n_test: 500
+  seed: 42

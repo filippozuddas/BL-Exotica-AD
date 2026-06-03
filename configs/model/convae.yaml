@@ -1,0 +1,22 @@
+# Convolutional Autoencoder architecture
+# Input: (tchans, fchans, 1) spectrogram snippet
+# Output: reconstructed snippet of same shape
+# Anomaly score: per-pixel MSE between input and reconstruction
+
+architecture: convae
+
+encoder:
+  filters: [32, 64, 128, 256]  # Filters per conv block
+  kernel_size: [3, 3]
+  activation: relu
+  use_batchnorm: true
+
+bottleneck:
+  latent_dim: 64   # Spatial bottleneck — kept as feature map, not flattened
+
+decoder:
+  filters: [256, 128, 64, 32]  # Mirror of encoder
+  kernel_size: [3, 3]
+  activation: relu
+  use_batchnorm: true
+  output_activation: sigmoid

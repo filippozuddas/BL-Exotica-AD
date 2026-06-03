@@ -1,0 +1,26 @@
+# Outputs — never commit artifacts
+outputs/
+data/processed/
+data/raw/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Environments
+.env
+.venv
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+CLAUDE.md

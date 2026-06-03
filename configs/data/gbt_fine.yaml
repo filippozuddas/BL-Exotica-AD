@@ -1,0 +1,18 @@
+# GBT fine-frequency data product
+# ~3 Hz/chan — sensitive to narrowband drifting signals
+
+product: gbt_fine
+
+frame:
+  fchans: 1024
+  tchans: 32
+  df: 2.7939677238464355   # Hz per channel
+  dt: 18.25361108           # Seconds per time bin
+
+loader:
+  chunk_size: 64            # Time bins loaded per chunk (memory control)
+  overlap: 16               # Overlapping bins between chunks
+
+dataset:
+  file_list: data/raw/gbt_fine_files.txt
+  seed: 42

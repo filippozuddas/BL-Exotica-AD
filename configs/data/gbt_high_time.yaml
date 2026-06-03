@@ -1,0 +1,18 @@
+# GBT high-time-resolution data product
+# Sub-millisecond bins — sensitive to broadband transients
+
+product: gbt_high_time
+
+frame:
+  fchans: 512
+  tchans: 128
+  df: 7629.0       # Hz per channel
+  dt: 0.000256     # Seconds per time bin (~256 us)
+
+loader:
+  chunk_size: 256
+  overlap: 64
+
+dataset:
+  file_list: data/raw/gbt_high_time_files.txt
+  seed: 42

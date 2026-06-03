@@ -1,0 +1,24 @@
+# Training configuration
+# Merges with a data config and model config at runtime
+
+data: configs/data/synthetic.yaml
+model: configs/model/convae.yaml
+
+training:
+  batch_size: 64
+  epochs: 100
+  learning_rate: 1.0e-3
+  optimizer: adam
+  loss: mse            # mse | ssim | mse+ssim
+  seed: 42
+
+  # Early stopping
+  patience: 15
+  min_delta: 1.0e-5
+  monitor: val_loss
+
+hardware:
+  num_gpus: 2          # Set to 0 for CPU-only
+  mixed_precision: true
+
+output_dir: outputs    # Run-specific subdir created automatically

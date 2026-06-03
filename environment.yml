@@ -1,0 +1,26 @@
+name: bl-exotica-ad
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - numpy>=1.24
+  - scipy>=1.11
+  - pandas>=2.0
+  - matplotlib>=3.8
+  - h5py>=3.10
+  - astropy>=6.0
+  - scikit-learn>=1.3
+  - pyyaml>=6.0
+  - tqdm>=4.66
+  - pytest>=7.4
+  - pip
+
+  - pip:
+      - tensorflow>=2.15.0
+      - keras>=3.0.0
+      - setigen>=2.4.0
+      - blimpy>=2.1.0
+      - ruff>=0.4
+      - mypy>=1.8

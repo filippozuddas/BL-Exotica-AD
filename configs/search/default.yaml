@@ -1,0 +1,19 @@
+# Search / inference configuration
+
+data: configs/data/synthetic.yaml
+model_path: null   # Set via CLI: --model outputs/<run_id>/checkpoints/best.keras
+
+search:
+  batch_size: 128
+  sliding_window: true
+  window_stride: 0.5      # Fraction of window size (0.5 = 50% overlap)
+  anomaly_metric: mse     # mse | ssim | combined
+
+candidates:
+  threshold_percentile: 99.5   # Flag top N% by reconstruction error
+  min_separation_bins: 8       # Deduplicate detections within N bins
+
+output:
+  save_stamps: true      # Save spectrogram stamps for each candidate
+  stamp_context: 4       # Extra bins around candidate window in stamp
+  format: csv            # csv | fits

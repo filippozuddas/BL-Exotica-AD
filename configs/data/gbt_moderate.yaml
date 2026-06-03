@@ -1,0 +1,18 @@
+# GBT moderate-resolution data product
+# ~364 kHz/chan, ~349 us/bin — sensitive to wideband/modulated signals
+
+product: gbt_moderate
+
+frame:
+  fchans: 256
+  tchans: 64
+  df: 364583.0   # Hz per channel
+  dt: 0.000349   # Seconds per time bin
+
+loader:
+  chunk_size: 128
+  overlap: 32
+
+dataset:
+  file_list: data/raw/gbt_moderate_files.txt
+  seed: 42
