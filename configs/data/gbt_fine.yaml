@@ -1,13 +1,18 @@
-# GBT fine-frequency data product
+# GBT fine-frequency data product (*.0000.fil)
 # ~3 Hz/chan — sensitive to narrowband drifting signals
 
 product: gbt_fine
 
-frame:
-  fchans: 1024
-  tchans: 32
-  df: 2.7939677238464355   # Hz per channel
+raw:
+  nchans: 67108864          # Fixed per product type
+  nifs: 1
+  df: 2.7939677238464355    # Hz per channel
   dt: 18.25361108           # Seconds per time bin
+  # nints varies per observation
+
+frame:
+  fchans: 1024              # TBD
+  tchans: 32                # TBD
 
 loader:
   chunk_size: 64            # Time bins loaded per chunk (memory control)

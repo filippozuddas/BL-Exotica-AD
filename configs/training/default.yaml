@@ -18,7 +18,7 @@ training:
   monitor: val_loss
 
 hardware:
-  num_gpus: 2          # Set to 0 for CPU-only
-  mixed_precision: true
+  num_gpus: 2          # -> Lightning Trainer(devices=...); set to 0 for CPU-only
+  mixed_precision: true  # trainer maps true -> "bf16-mixed" (native bf16 on Ada/4090, no GradScaler), false -> "32-true"
 
 output_dir: outputs    # Run-specific subdir created automatically

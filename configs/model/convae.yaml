@@ -1,12 +1,24 @@
 # Convolutional Autoencoder architecture
 # Input: (tchans, fchans, 1) spectrogram snippet
 # Output: reconstructed snippet of same shape
-# Anomaly score: per-pixel MSE between input and reconstruction
+# Anomaly score: per-pixel MSE between input and reconstruction (both backbones)
 
 architecture: convae
 
+# Backbone selector — mutually exclusive flags; conv stack is shared for fair comparison.
+#   mae=false, variational=false  ->  deterministic AE (default, primary scorer)
+#   mae=true                      ->  Masked Autoencoder (CNN-MAE)
+#   variational=true              ->  VAE (reconstruction + beta * KL)
+mae: false
+mask_ratio: 0.75   # fraction of patches masked during MAE training
+patch_size: [4, 4] # patch height × width in pixels; must divide input spatial dims
+
+variational: false
+beta: 1.0   # KL weight; only used when variational: true
+
 encoder:
-  filters: [32, 64, 128, 256]  # Filters per conv block
+  filters: [32, 64, 128, 256]  # Filters per downsampling block (4 blocks → 16x spatial reduction)
+  convs_per_block: 2            # stride-2 + (n-1) stride-1 refinement; Ma et al. use 2-3
   kernel_size: [3, 3]
   activation: relu
   use_batchnorm: true

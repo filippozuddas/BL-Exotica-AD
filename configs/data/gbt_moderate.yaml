@@ -1,13 +1,18 @@
-# GBT moderate-resolution data product
-# ~364 kHz/chan, ~349 us/bin — sensitive to wideband/modulated signals
+# GBT intermediate-resolution data product (*.0002.fil)
+# ~2.86 kHz/chan, ~1 s/bin — sensitive to wideband/modulated signals
 
 product: gbt_moderate
 
+raw:
+  nchans: 65536             # Fixed per product type
+  nifs: 1
+  df: 2861.02294921875      # Hz per channel
+  dt: 1.0737418239999998    # Seconds per time bin
+  # nints varies per observation
+
 frame:
-  fchans: 256
-  tchans: 64
-  df: 364583.0   # Hz per channel
-  dt: 0.000349   # Seconds per time bin
+  fchans: 256               # TBD
+  tchans: 64                # TBD
 
 loader:
   chunk_size: 128

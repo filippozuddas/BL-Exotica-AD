@@ -1,13 +1,32 @@
-# GBT high-time-resolution data product
-# Sub-millisecond bins — sensitive to broadband transients
+# GBT high-time-resolution data product (*.0001.fil)
+# ~364 kHz/chan, ~349 us/bin — sensitive to broadband transients (Gajjar et al. 2022)
 
 product: gbt_high_time
 
+raw:
+  nchans: 512               # Fixed per product type
+  nifs: 1
+  df: 364583.0              # Hz per channel
+  dt: 0.000349              # Seconds per time bin (~349 us)
+  fch1: 1500.0              # MHz, absolute freq of channel 0 (dispersion needs absolute freqs)
+  # nints varies per observation
+
 frame:
-  fchans: 512
-  tchans: 128
-  df: 7629.0       # Hz per channel
-  dt: 0.000256     # Seconds per time bin (~256 us)
+  fchans: 512               # TBD
+  tchans: 128               # TBD
+
+# Broadband transient (FRB-like) injection — see src/data/synthetic.py
+broadband:
+  dm_min: 100.0             # pc/cm^3 (extract_spectra.py default range)
+  dm_max: 1000.0
+  tau_int_bins: [1, 4]      # intrinsic Gaussian width, in time bins
+  tau_scatter_ms: 0.1       # scattering timescale at f_ref (ms); scales (nu/f_ref)^-4
+  nscint_max: 3             # spectral scintillation; nscint log-uniform in (1e-3, nscint_max)
+  frac_low: 0.5             # fractional bandwidth occupied
+  frac_high: 0.9
+  snr_min: 6.0              # log-normal peak SNR (dedispersed, freq-averaged)
+  snr_max: 20.0
+  snr_sigma: 1.0
 
 loader:
   chunk_size: 256

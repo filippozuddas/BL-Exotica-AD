@@ -1,7 +1,7 @@
 # Search / inference configuration
 
 data: configs/data/synthetic.yaml
-model_path: null   # Set via CLI: --model outputs/<run_id>/checkpoints/best.keras
+model_path: null   # Set via CLI: --model outputs/<run_id>/checkpoints/best.pt
 
 search:
   batch_size: 128
