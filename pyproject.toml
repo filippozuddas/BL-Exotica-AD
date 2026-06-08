@@ -7,8 +7,9 @@ name = "bl-exotica-ad"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
-    "tensorflow>=2.15.0",
-    "keras>=3.0.0",
+    "torch>=2.2",
+    "pytorch-lightning>=2.2",
+    "pytorch-msssim>=1.0",
     "setigen>=2.4.0",
     "blimpy>=2.1.0",
     "h5py>=3.10",

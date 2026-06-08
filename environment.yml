@@ -18,8 +18,11 @@ dependencies:
   - pip
 
   - pip:
-      - tensorflow>=2.15.0
-      - keras>=3.0.0
+      # torch: CPU wheel resolves for dev; install the CUDA build on the
+      # 2x RTX 4090 box (e.g. --index-url https://download.pytorch.org/whl/cu121).
+      - torch>=2.2
+      - pytorch-lightning>=2.2
+      - pytorch-msssim>=1.0
       - setigen>=2.4.0
       - blimpy>=2.1.0
       - ruff>=0.4
