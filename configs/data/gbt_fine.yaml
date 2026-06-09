@@ -11,8 +11,16 @@ raw:
   # nints varies per observation
 
 frame:
-  fchans: 1024              # TBD
-  tchans: 32                # TBD
+  tchans: 16                # confirmed from real data shape (16, 1, 67108864)
+  fchans: 1024
+  downsample_factor: 1      # no downsampling — 0000.fil is already at 2.79 Hz/chan; narrowband signals would be sub-pixel after pooling
+  stride_train: 1024        # no overlap in training
+  stride_infer: 512         # 50% overlap in inference
+
+preprocessing:
+  bandpass_method: polynomial   # 'polynomial' | 'median'
+  poly_degree: 3                # tune against real data on first Colab session
+  mad_epsilon: 1.0e-6
 
 # Narrowband drifting (ETI-like) injection — see src/data/synthetic.py
 narrowband:
