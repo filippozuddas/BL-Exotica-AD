@@ -14,6 +14,19 @@ frame:
   fchans: 256               # TBD
   tchans: 64                # TBD
 
+# Wideband pulsed injection — see src/data/synthetic.py
+# NOTE: default design pending confirmation with Vishal.
+wideband:
+  snr_min: 5.0             # log-uniform; sets the per-PULSE peak level (NOT frame-integrated — pulse is on only ~duty of the frame; confirm definition w/ Vishal)
+  snr_max: 50.0
+  frac_low: 0.1            # frequency extent = U(frac_low, frac_high) * fchans channels
+  frac_high: 0.5
+  period_bins_min: 8.0     # pulse period sampled in time bins, then -> seconds
+  period_bins_max_frac: 0.5   # max period = period_bins_max_frac * tchans (>=2 pulses/frame)
+  duty_max: 0.33           # pulse_width <= duty_max * period
+  drift_jitter: 0.05       # Hz/s — near-stationary frequency jitter
+  # Frequency profile weights (gaussian/box) are code-level defaults (WidebandParams).
+
 loader:
   chunk_size: 128
   overlap: 32

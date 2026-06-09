@@ -12,8 +12,8 @@ raw:
   # nints varies per observation
 
 frame:
-  fchans: 512               # TBD
-  tchans: 128               # TBD
+  fchans: 512               # confirmed from real data shape (884736, 1, 512)
+  tchans: 2048              # DM sweep at dm_max=1000 is ~1105 bins; 2048 gives ~75% margin
 
 # Broadband transient (FRB-like) injection — see src/data/synthetic.py
 broadband:

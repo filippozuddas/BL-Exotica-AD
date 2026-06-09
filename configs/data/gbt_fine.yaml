@@ -14,6 +14,25 @@ frame:
   fchans: 1024              # TBD
   tchans: 32                # TBD
 
+# Narrowband drifting (ETI-like) injection — see src/data/synthetic.py
+narrowband:
+  snr_min: 5.0             # log-uniform peak SNR (setigen frame-integrated)
+  snr_max: 50.0
+  drift_distribution: lognormal   # 'lognormal' (centred on drift_median) or 'loguniform'
+  drift_median: 0.3        # Hz/s — Earth+exoplanet rotational scale; |DR| upper clip is window-limited
+  drift_log_sigma: 0.5     # spread in dex
+  min_nonzero_drift: 0.01  # Hz/s — sampler floor
+  zero_drift_prob: 0.05    # P(exactly zero drift) — compensated beacon
+  eti_width_offset_min: 1.0   # Hz — width = |DR|*dt + U(offset_min, offset_max)
+  eti_width_offset_max: 10.0
+  scatter_width_min: 3.0   # Hz — lorentzian/voigt scattering-wing FWHM range
+  scatter_width_max: 40.0
+  scint_timescale_min: 60.0   # s — AR(1) scintillation correlation timescale
+  scint_timescale_max: 600.0
+  scint_depth_min: 0.2     # log-amplitude modulation depth
+  scint_depth_max: 0.6
+  # Frequency/temporal profile weights are code-level defaults (NarrowbandParams).
+
 loader:
   chunk_size: 64            # Time bins loaded per chunk (memory control)
   overlap: 16               # Overlapping bins between chunks
