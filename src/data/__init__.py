@@ -1,6 +1,25 @@
-from .loader import H5Loader
-from .synthetic import SyntheticDataset
-from .preprocessing import normalize_snippet
-from .tf_dataset import build_tf_dataset
+from .synthetic import (
+    BroadbandParams,
+    BroadbandTransientGenerator,
+    NarrowbandParams,
+    NarrowbandDriftingGenerator,
+    WidebandParams,
+    WidebandPulsedGenerator,
+)
+from .preprocessing import bandpass_correct, core_transform
+from .loader import load_observation
+from .torch_dataset import SpectrogramDataset, build_datasets
 
-__all__ = ["H5Loader", "SyntheticDataset", "normalize_snippet", "build_tf_dataset"]
+__all__ = [
+    "BroadbandParams",
+    "BroadbandTransientGenerator",
+    "NarrowbandParams",
+    "NarrowbandDriftingGenerator",
+    "WidebandParams",
+    "WidebandPulsedGenerator",
+    "bandpass_correct",
+    "core_transform",
+    "load_observation",
+    "SpectrogramDataset",
+    "build_datasets",
+]
