@@ -7,7 +7,8 @@ same view as Gajjar et al. 2022 Fig. A1.
 
 Run from the repo root (needs setigen + matplotlib):
 
-    python scripts/preview_broadband.py --n 9 --out outputs/preview_broadband.png
+    python scripts/preview_broadband.py
+    python scripts/preview_broadband.py --config configs/data/gbt_high_time.yaml --n 9
     python scripts/preview_broadband.py --dm 150 --snr 12   # fix DM / SNR
 """
 
@@ -24,6 +25,7 @@ from src.data.synthetic import BroadbandParams, BroadbandTransientGenerator  # n
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=9, help="number of examples")
+    ap.add_argument("--config", type=str, default="configs/data/gbt_high_time.yaml", help="path to data config YAML")
     ap.add_argument("--dm", type=float, default=None, help="fix DM (pc/cm^3)")
     ap.add_argument("--snr", type=float, default=None, help="fix peak SNR")
     ap.add_argument("--seed", type=int, default=0)
@@ -35,7 +37,10 @@ def main():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    p = BroadbandParams()
+    import yaml
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+    p = BroadbandParams.from_config(cfg)
     gen = BroadbandTransientGenerator(p, seed=args.seed)
 
     freqs = gen.freqs_mhz
