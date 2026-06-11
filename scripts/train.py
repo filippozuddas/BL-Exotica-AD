@@ -13,6 +13,7 @@ Outputs (checkpoints, logs, snapshots) are written to outputs/<run_id>/.
 """
 
 import argparse
+import logging
 import os
 from pathlib import Path
 
@@ -51,6 +52,10 @@ def _parse_args():
 
 
 def main():
+    # Suppress Lightning's per-run INFO messages (GPU/DDP setup, tensor-core
+    # tip, etc.) - the EpochSummary callback prints the per-epoch progress.
+    logging.getLogger("pytorch_lightning").setLevel(logging.WARNING)
+
     args = _parse_args()
 
     cfg = load_config(args.config)

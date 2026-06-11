@@ -61,7 +61,34 @@ def build_callbacks(
             )
         )
 
+    callbacks.append(EpochSummary())
+
     return callbacks
+
+
+class EpochSummary(pl.Callback):
+    """Print one compact line per epoch instead of a per-step progress bar.
+
+    Useful when stdout isn't a TTY (e.g. ``!python`` in a notebook), where
+    Lightning's progress bar prints a new line per refresh.
+    """
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if not trainer.is_global_zero:
+            return
+
+        metrics = trainer.callback_metrics
+        train_loss = metrics.get("train_loss")
+        val_loss = metrics.get("val_loss")
+        lr = trainer.optimizers[0].param_groups[0]["lr"]
+
+        parts = [f"epoch {trainer.current_epoch + 1}/{trainer.max_epochs}"]
+        if train_loss is not None:
+            parts.append(f"train_loss={train_loss:.4f}")
+        if val_loss is not None:
+            parts.append(f"val_loss={val_loss:.4f}")
+        parts.append(f"lr={lr:.2e}")
+        print(" - ".join(parts), flush=True)
 
 
 class ReconstructionSnapshot(pl.Callback):

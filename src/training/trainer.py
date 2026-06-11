@@ -131,7 +131,8 @@ def build_trainer(
         callbacks=callbacks or [],
         logger=logger,
         log_every_n_steps=10,
-        enable_model_summary=True,
+        enable_model_summary=False,
+        enable_progress_bar=False,
     )
 
 
