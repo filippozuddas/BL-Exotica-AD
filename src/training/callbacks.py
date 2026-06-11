@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -61,9 +62,62 @@ def build_callbacks(
             )
         )
 
+    callbacks.append(TrainProgressBar())
     callbacks.append(EpochSummary())
 
     return callbacks
+
+
+class TrainProgressBar(pl.Callback):
+    """In-place, single-line progress bar for non-interactive stdout.
+
+    Lightning's TQDMProgressBar prints a new line per refresh when stdout
+    isn't a TTY (e.g. ``!python`` in a Colab cell). This writes ``\\r`` and
+    overwrites the same line instead, then yields to EpochSummary's final
+    per-epoch line.
+    """
+
+    def __init__(self, refresh_every: int = 10):
+        super().__init__()
+        self.refresh_every = refresh_every
+        self._epoch_start = 0.0
+
+    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if not trainer.is_global_zero:
+            return
+        self._epoch_start = time.monotonic()
+
+    def on_train_batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, outputs, batch, batch_idx: int) -> None:
+        if not trainer.is_global_zero:
+            return
+
+        total = trainer.num_training_batches
+        step = batch_idx + 1
+        if step % self.refresh_every != 0 and step != total:
+            return
+
+        frac = step / total
+        elapsed = time.monotonic() - self._epoch_start
+        eta = elapsed / frac - elapsed if frac > 0 else 0.0
+
+        bar_len = 30
+        filled = int(bar_len * frac)
+        bar = "#" * filled + "-" * (bar_len - filled)
+
+        loss = trainer.callback_metrics.get("train_loss")
+        loss_str = f" loss={loss:.4f}" if loss is not None else ""
+
+        print(
+            f"\repoch {trainer.current_epoch + 1}/{trainer.max_epochs} "
+            f"[{bar}] {step}/{total}{loss_str} ({elapsed:.0f}s, eta {eta:.0f}s)",
+            end="",
+            flush=True,
+        )
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if not trainer.is_global_zero:
+            return
+        print()  # finalize the progress line before EpochSummary's recap
 
 
 class EpochSummary(pl.Callback):
