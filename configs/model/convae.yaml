@@ -31,4 +31,6 @@ decoder:
   kernel_size: [3, 3]
   activation: relu
   use_batchnorm: true
-  output_activation: sigmoid
+  # Linear output: core_transform() (log1p + median/MAD) produces unbounded,
+  # signed values, so a sigmoid (range [0,1]) cannot reproduce the input.
+  output_activation: null

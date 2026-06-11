@@ -1,0 +1,25 @@
+# CPU smoke-test config: small synthetic dataset, few epochs, snapshots every
+# epoch. Verifies the train.py pipeline runs end to end (not a real run).
+#
+#   python scripts/train.py --config configs/training/smoke_test.yaml
+
+data: configs/data/synthetic_fine.yaml
+model: configs/model/convae.yaml
+
+training:
+  batch_size: 4
+  epochs: 3
+  learning_rate: 1.0e-3
+  optimizer: adam
+  loss: mse
+  seed: 42
+  patience: 15
+  min_delta: 1.0e-5
+  monitor: val_loss
+  snapshot_every: 1
+
+hardware:
+  num_gpus: 0
+  mixed_precision: false
+
+output_dir: outputs

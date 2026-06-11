@@ -1,0 +1,30 @@
+# Convolutional Masked Autoencoder (CNN-MAE) — primary backbone per CLAUDE.md.
+# Same conv stack as convae.yaml; mae: true switches build_autoencoder() to the
+# masked-patch training path (mask_ratio fraction of patches zeroed during
+# training, loss on masked positions only). At inference, no masking.
+
+architecture: convae
+
+mae: true
+mask_ratio: 0.75
+patch_size: [4, 4]
+
+variational: false
+beta: 1.0
+
+encoder:
+  filters: [32, 64, 128, 256]
+  convs_per_block: 2
+  kernel_size: [3, 3]
+  activation: relu
+  use_batchnorm: true
+
+bottleneck:
+  latent_dim: 64
+
+decoder:
+  filters: [256, 128, 64, 32]
+  kernel_size: [3, 3]
+  activation: relu
+  use_batchnorm: true
+  output_activation: null

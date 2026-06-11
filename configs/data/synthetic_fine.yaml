@@ -1,0 +1,33 @@
+# Synthetic gbt_fine-like data product, for pipeline smoke tests.
+# Same geometry/preprocessing as gbt_fine.yaml but with a wider frequency
+# window (4096 ch) so a handful of train/val snippets can be sliced per
+# observation file via frame.stride_train / stride_infer.
+
+product: synthetic_fine
+
+raw:
+  nchans: 4096
+  nifs: 1
+  df: 2.7939677238464355    # Hz per channel
+  dt: 18.25361108           # Seconds per time bin
+
+frame:
+  tchans: 16
+  fchans: 1024
+  downsample_factor: 1
+  stride_train: 1024        # 4 snippets per 4096-channel observation
+  stride_infer: 512         # 7 snippets per 4096-channel observation
+
+preprocessing:
+  bandpass_method: polynomial
+  poly_degree: 3
+  mad_epsilon: 1.0e-6
+
+# Narrowband drifting injection params (only noise_mean is used by
+# synthetic_background(); the rest are NarrowbandParams defaults).
+narrowband:
+  noise_mean: 5.0
+
+dataset:
+  file_list: data/synthetic/gbt_fine_smoke/file_list.txt
+  seed: 42
