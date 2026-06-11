@@ -1,0 +1,27 @@
+# Full training run on real SRT 0000-equivalent cadence data (MAE backbone).
+# Run in background (nohup/tmux) — a multi-epoch DDP run will outlast a Colab
+# browser session.
+#
+#   PYTHONPATH=. nohup python scripts/train.py --config configs/training/srt_real.yaml \
+#       > train.log 2>&1 &
+
+data: configs/data/gbt_fine.yaml
+model: configs/model/convae_mae.yaml
+
+training:
+  batch_size: 128
+  epochs: 30
+  learning_rate: 1.0e-3
+  optimizer: adam
+  loss: mse
+  seed: 42
+  patience: 10
+  min_delta: 1.0e-5
+  monitor: val_loss
+  snapshot_every: 2
+
+hardware:
+  num_gpus: 2
+  mixed_precision: true
+
+output_dir: outputs
