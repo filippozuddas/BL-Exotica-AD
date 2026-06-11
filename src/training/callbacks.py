@@ -84,6 +84,9 @@ class ReconstructionSnapshot(pl.Callback):
         self.every_n_epochs = every_n_epochs
 
     def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if not trainer.is_global_zero:
+            return
+
         epoch = trainer.current_epoch
         if (epoch + 1) % self.every_n_epochs != 0:
             return

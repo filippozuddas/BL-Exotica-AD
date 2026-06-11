@@ -13,6 +13,7 @@ Outputs (checkpoints, logs, snapshots) are written to outputs/<run_id>/.
 """
 
 import argparse
+import os
 from pathlib import Path
 
 import yaml
@@ -108,7 +109,16 @@ def main():
     )
 
     # --------------------------------------------------------- output / train
-    run_dir = make_run_dir(cfg.get("output_dir", "outputs"))
+    # Lightning's DDP subprocess launcher re-executes this script per GPU rank,
+    # so without sharing the path each rank would create its own timestamped
+    # run directory. Rank 0 picks the directory and exports it for the other
+    # ranks via the environment, which the launcher copies at trainer.fit().
+    if "BL_EXOTICA_RUN_DIR" in os.environ:
+        run_dir = Path(os.environ["BL_EXOTICA_RUN_DIR"])
+        run_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        run_dir = make_run_dir(cfg.get("output_dir", "outputs"))
+        os.environ["BL_EXOTICA_RUN_DIR"] = str(run_dir)
     print(f"Run directory: {run_dir}")
 
     val_sample = val_ds[0].unsqueeze(0)
