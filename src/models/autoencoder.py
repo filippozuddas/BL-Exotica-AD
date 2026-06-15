@@ -1,19 +1,29 @@
 """
 Full anomaly-detection model: encoder + bottleneck + decoder.
 
-Three backbones share the same CNN conv stack, selected by config flags:
+Four backbones, selected by config flags. The first three share the same CNN
+conv stack:
 
 - ``Autoencoder`` (default, ``mae=false``, ``variational=false``): deterministic
   AE. Loss = reconstruction error on the full input. Comparison baseline.
-- ``MAE`` (``mae=true``, primary): Masked Autoencoder. During training, ~75% of
-  patches are zeroed and the loss is computed only on those masked positions,
+- ``MAE`` (``mae=true``, primary): CNN Masked Autoencoder. During training, ~75%
+  of patches are zeroed and the loss is computed only on those masked positions,
   forcing the model to predict occluded regions from context. At inference, no
   masking — scored by full reconstruction error like the plain AE. Addresses the
   "too-good reconstruction" failure mode for locally-regular signals.
 - ``VAE`` (``variational=true``): variational backbone. Loss = reconstruction +
   ``beta`` * KL. Optional, fairly-comparable variant for empirical comparison.
 
-All three are pure ``nn.Module`` wrappers exposing ``forward`` (inference) and
+The 4th backbone is selected by ``architecture`` rather than the CNN flags:
+
+- ``ViTMAE`` (``architecture: vit_mae``, see ``vit_mae.py``): He et al.-style
+  Vision-Transformer Masked Autoencoder — Conv2d patch tokeniser +
+  ``nn.TransformerEncoder`` stacks, token-removal masking during training,
+  deterministic partitioned reconstruction at inference. A ViT alternative to
+  the CNN ``MAE`` (which is inherently CNN-based), bypassing the
+  encoder/bottleneck/decoder config sections entirely.
+
+All four are pure ``nn.Module`` wrappers exposing ``forward`` (inference) and
 ``compute_loss`` (training); a PyTorch Lightning ``LightningModule`` wraps them
 in ``src/training/trainer.py`` for the optimiser/checkpoint/multi-GPU loop. At
 search time they are scored by reconstruction error only (see
@@ -29,7 +39,8 @@ from typing import Dict, List, Tuple
 
 from .encoder import build_encoder
 from .decoder import build_decoder
-from .losses import reconstruction_loss, kl_divergence
+from .losses import reconstruction_loss, kl_divergence, _masked_mse
+from .vit_mae import build_vit_mae
 
 __all__ = ["Autoencoder", "MAE", "VAE", "build_autoencoder"]
 
@@ -101,8 +112,7 @@ class MAE(nn.Module):
         self, x: torch.Tensor, reconstruction: torch.Tensor, mask: torch.Tensor
     ) -> torch.Tensor:
         """Mean squared error averaged over masked pixel positions only."""
-        per_pixel = (x - reconstruction) ** 2 * mask
-        return per_pixel.sum() / (mask.sum() + 1e-8)
+        return _masked_mse(x, reconstruction, mask)
 
     def compute_loss(self, x: torch.Tensor) -> torch.Tensor:
         """Scalar training loss: masked-position reconstruction error."""
@@ -157,86 +167,94 @@ def build_autoencoder(
 ) -> nn.Module:
     """Build the anomaly-detection model from a merged config.
 
-    Returns a bare ``nn.Module`` (``Autoencoder`` | ``MAE`` | ``VAE``); the
-    optimiser/training loop lives in the Lightning trainer, which reads
-    ``model.learning_rate`` set here.
+    Returns a bare ``nn.Module`` (``Autoencoder`` | ``MAE`` | ``VAE`` |
+    ``ViTMAE``); the optimiser/training loop lives in the Lightning trainer,
+    which reads ``model.learning_rate`` set here.
 
     Args:
         input_shape: ``(tchans, fchans, 1)`` snippet shape. Both spatial dims
             must be divisible by ``2 ** len(encoder.filters)`` (and by
-            ``patch_size`` when ``mae`` is set).
+            ``patch_size`` when ``mae`` is set). For ``architecture: vit_mae``
+            both dims must instead be divisible by ``patch_size`` only.
         model_config: parsed ``configs/model/*.yaml`` (encoder/bottleneck/
-            decoder sections + optional ``mae`` / ``variational`` flags).
+            decoder sections + optional ``mae`` / ``variational`` flags; or,
+            for ``architecture: vit_mae``, the ViT-MAE hyperparameters
+            consumed by ``build_vit_mae``).
         loss: reconstruction loss name (``mse`` | ``ssim`` | ``mse+ssim``).
         learning_rate: Adam learning rate, attached to the returned module.
         beta: KL weight (VAE path only).
 
     Returns:
-        An ``Autoencoder``, ``MAE``, or ``VAE`` module.
+        An ``Autoencoder``, ``MAE``, ``VAE``, or ``ViTMAE`` module.
     """
-    enc_cfg = model_config["encoder"]
-    dec_cfg = model_config.get("decoder", {})
-    bottleneck = model_config["bottleneck"]
+    architecture = model_config.get("architecture", "convae")
 
-    filters: List[int] = list(enc_cfg["filters"])
-    kernel_size = tuple(enc_cfg.get("kernel_size", (3, 3)))
-    activation = enc_cfg.get("activation", "relu")
-    use_batchnorm = enc_cfg.get("use_batchnorm", True)
-    convs_per_block = int(enc_cfg.get("convs_per_block", 2))
-    latent_dim = bottleneck["latent_dim"]
-    output_activation = dec_cfg.get("output_activation", "sigmoid")
-    variational = bool(model_config.get("variational", False))
-    mae = bool(model_config.get("mae", False))
-    patch_size = tuple(model_config.get("patch_size", (4, 4)))
-    mask_ratio = float(model_config.get("mask_ratio", 0.75))
-
-    n_blocks = len(filters)
-    factor = 2 ** n_blocks
-    th, fw, _ = input_shape
-    if th % factor or fw % factor:
-        raise ValueError(
-            f"Input spatial dims {(th, fw)} must be divisible by {factor} "
-            f"(2 ** {n_blocks} downsampling blocks). Pad/crop snippets upstream."
-        )
-    if mae:
-        ph, pw = patch_size
-        if th % ph or fw % pw:
-            raise ValueError(
-                f"Input spatial dims {(th, fw)} must be divisible by patch_size "
-                f"{patch_size} for MAE patch tokenisation."
-            )
-    spatial_shape = (th // factor, fw // factor)
-
-    encoder = build_encoder(
-        input_shape=input_shape,
-        filters=filters,
-        latent_dim=latent_dim,
-        kernel_size=kernel_size,
-        activation=activation,
-        use_batchnorm=use_batchnorm,
-        convs_per_block=convs_per_block,
-        variational=variational,
-    )
-    decoder = build_decoder(
-        output_shape=input_shape,
-        filters=filters,
-        latent_dim=latent_dim,
-        spatial_shape=spatial_shape,
-        kernel_size=kernel_size,
-        activation=activation,
-        use_batchnorm=use_batchnorm,
-        output_activation=output_activation,
-        convs_per_block=convs_per_block,
-        variational=variational,
-    )
-
-    loss_fn = reconstruction_loss(loss)
-    if mae:
-        model: nn.Module = MAE(encoder, decoder, loss_fn, patch_size=patch_size, mask_ratio=mask_ratio)
-    elif variational:
-        model = VAE(encoder, decoder, loss_fn, beta=beta)
+    if architecture == "vit_mae":
+        model: nn.Module = build_vit_mae(input_shape, model_config, loss=loss, learning_rate=learning_rate)
     else:
-        model = Autoencoder(encoder, decoder, loss_fn)
+        enc_cfg = model_config["encoder"]
+        dec_cfg = model_config.get("decoder", {})
+        bottleneck = model_config["bottleneck"]
+
+        filters: List[int] = list(enc_cfg["filters"])
+        kernel_size = tuple(enc_cfg.get("kernel_size", (3, 3)))
+        activation = enc_cfg.get("activation", "relu")
+        use_batchnorm = enc_cfg.get("use_batchnorm", True)
+        convs_per_block = int(enc_cfg.get("convs_per_block", 2))
+        latent_dim = bottleneck["latent_dim"]
+        output_activation = dec_cfg.get("output_activation", "sigmoid")
+        variational = bool(model_config.get("variational", False))
+        mae = bool(model_config.get("mae", False))
+        patch_size = tuple(model_config.get("patch_size", (4, 4)))
+        mask_ratio = float(model_config.get("mask_ratio", 0.75))
+
+        n_blocks = len(filters)
+        factor = 2 ** n_blocks
+        th, fw, _ = input_shape
+        if th % factor or fw % factor:
+            raise ValueError(
+                f"Input spatial dims {(th, fw)} must be divisible by {factor} "
+                f"(2 ** {n_blocks} downsampling blocks). Pad/crop snippets upstream."
+            )
+        if mae:
+            ph, pw = patch_size
+            if th % ph or fw % pw:
+                raise ValueError(
+                    f"Input spatial dims {(th, fw)} must be divisible by patch_size "
+                    f"{patch_size} for MAE patch tokenisation."
+                )
+        spatial_shape = (th // factor, fw // factor)
+
+        encoder = build_encoder(
+            input_shape=input_shape,
+            filters=filters,
+            latent_dim=latent_dim,
+            kernel_size=kernel_size,
+            activation=activation,
+            use_batchnorm=use_batchnorm,
+            convs_per_block=convs_per_block,
+            variational=variational,
+        )
+        decoder = build_decoder(
+            output_shape=input_shape,
+            filters=filters,
+            latent_dim=latent_dim,
+            spatial_shape=spatial_shape,
+            kernel_size=kernel_size,
+            activation=activation,
+            use_batchnorm=use_batchnorm,
+            output_activation=output_activation,
+            convs_per_block=convs_per_block,
+            variational=variational,
+        )
+
+        loss_fn = reconstruction_loss(loss)
+        if mae:
+            model = MAE(encoder, decoder, loss_fn, patch_size=patch_size, mask_ratio=mask_ratio)
+        elif variational:
+            model = VAE(encoder, decoder, loss_fn, beta=beta)
+        else:
+            model = Autoencoder(encoder, decoder, loss_fn)
 
     # Read by the Lightning trainer's configure_optimizers (replaces compile()).
     model.learning_rate = learning_rate

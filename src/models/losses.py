@@ -19,6 +19,7 @@ __all__ = [
     "mse_ssim_loss",
     "reconstruction_loss",
     "kl_divergence",
+    "_masked_mse",
 ]
 
 
@@ -70,6 +71,18 @@ def reconstruction_loss(name: str = "mse"):
             f"Expected one of {sorted(table)}."
         )
     return table[key]
+
+
+def _masked_mse(x: torch.Tensor, reconstruction: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Mean squared error averaged over masked pixel positions only.
+
+    ``mask``: binary, broadcastable to ``x``/``reconstruction`` (typically
+    ``(B, 1, H, W)``, 1 = masked/scored, 0 = visible/ignored). Shared by CNN
+    ``MAE`` (pixel-zeroing mask) and ``ViTMAE`` (token-removal mask, expanded
+    to pixel space via repeat_interleave) — identical arithmetic.
+    """
+    per_pixel = (x - reconstruction) ** 2 * mask
+    return per_pixel.sum() / (mask.sum() + 1e-8)
 
 
 def kl_divergence(z_mean: torch.Tensor, z_log_var: torch.Tensor) -> torch.Tensor:
