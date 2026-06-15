@@ -10,12 +10,13 @@ model: configs/model/convae_mae.yaml
 
 training:
   batch_size: 128
-  epochs: 30
+  epochs: 100
+  warmup_epochs: 10
   learning_rate: 1.0e-3
   optimizer: adam
   loss: mse
   seed: 42
-  patience: 10
+  patience: 30
   min_delta: 1.0e-5
   monitor: val_loss
   snapshot_every: 2
