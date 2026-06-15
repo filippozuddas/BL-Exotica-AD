@@ -1,0 +1,39 @@
+# Vision-Transformer Masked Autoencoder (ViT-MAE) — 4th build_autoencoder
+# backbone, alongside convae / convae_mae (CNN-MAE) / VAE. architecture:
+# vit_mae routes build_autoencoder() straight to build_vit_mae(), bypassing
+# the CNN encoder/bottleneck/decoder config sections entirely.
+#
+# Patch tokenisation: Conv2d PatchEmbed with patch_size (4, 64) on the
+# (16, 1024) 0000.fil snippet -> a (4, 16) = 64-patch grid, 4*64*1=256 raw
+# values per patch.
+#
+# Training (compute_loss): He et al. token-removal masking — mask_ratio=0.75
+# means the encoder sees only 16 of 64 patch tokens per sample (fresh random
+# subset each step); decoder reconstructs all 64 from those 16 + a shared
+# learnable mask token, loss on the 48 masked patches only.
+#
+# Inference (forward): deterministic 4-pass partitioned reconstruction (each
+# of the 4 grid rows is, in turn, the "visible" group) — see
+# src/models/vit_mae.py.
+
+architecture: vit_mae
+
+patch_size: [4, 64]
+
+# --- Encoder (ViT, pre-norm transformer blocks) ---
+embed_dim: 128
+depth: 6
+num_heads: 4
+
+# --- Decoder (lightweight transformer, global attention) ---
+decoder_embed_dim: 64
+decoder_depth: 2
+decoder_num_heads: 4
+
+# --- Shared ---
+mlp_ratio: 4
+mask_ratio: 0.75       # training only; inference uses the fixed nh-pass partition
+
+# He et al. per-patch target normalisation: off by default. If true,
+# ViTMAE.compute_loss raises NotImplementedError (not yet implemented).
+norm_pix_loss: false
