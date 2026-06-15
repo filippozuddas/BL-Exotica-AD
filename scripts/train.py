@@ -51,6 +51,39 @@ def _parse_args():
     return p.parse_args()
 
 
+def _print_config_summary(cfg, args):
+    model_cfg = cfg["model"]
+    if model_cfg.get("architecture") == "vit_mae":
+        backbone = "ViT-MAE"
+    elif model_cfg.get("mae"):
+        backbone = "MAE"
+    elif model_cfg.get("variational"):
+        backbone = "VAE"
+    else:
+        backbone = "AE"
+
+    train_cfg = cfg["training"]
+    hw_cfg = cfg["hardware"]
+    frame = cfg["data"]["frame"]
+
+    print("=" * 60)
+    print("Config summary")
+    print(f"  training config : {args.config}")
+    print(f"  data config      : {args.data or '(from training config)'}")
+    print(f"  model config     : {args.model or '(from training config)'}")
+    print(f"  backbone         : {backbone} (architecture={model_cfg.get('architecture')})")
+    print(f"  frame shape      : (tchans={frame['tchans']}, fchans={frame['fchans']})")
+    print(f"  loss             : {train_cfg['loss']}")
+    print(f"  optimizer        : {train_cfg['optimizer']}")
+    print(f"  learning_rate    : {train_cfg['learning_rate']}")
+    print(f"  batch_size       : {train_cfg['batch_size']}")
+    print(f"  epochs           : {train_cfg['epochs']} (patience={train_cfg['patience']})")
+    print(f"  seed             : {train_cfg['seed']}")
+    print(f"  hardware         : num_gpus={hw_cfg.get('num_gpus', 0)}, "
+          f"mixed_precision={hw_cfg.get('mixed_precision', False)}")
+    print("=" * 60)
+
+
 def main():
     # Suppress Lightning's per-run INFO messages (GPU/DDP setup, tensor-core
     # tip, etc.) - the EpochSummary callback prints the per-epoch progress.
@@ -66,6 +99,8 @@ def main():
     if args.model is not None:
         with open(args.model) as f:
             cfg["model"] = yaml.safe_load(f)
+
+    _print_config_summary(cfg, args)
 
     pl.seed_everything(cfg["training"]["seed"], workers=True)
 
