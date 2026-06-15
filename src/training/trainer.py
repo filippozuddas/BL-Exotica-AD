@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import CSVLogger
 
@@ -61,7 +61,23 @@ class AELightningModule(pl.LightningModule):
     def configure_optimizers(self):
         train_cfg = self.cfg["training"]
         opt = Adam(self.parameters(), lr=self.model.learning_rate)
-        scheduler = CosineAnnealingLR(opt, T_max=train_cfg["epochs"], eta_min=1e-6)
+
+        total_epochs = train_cfg["epochs"]
+        warmup_epochs = train_cfg.get("warmup_epochs", 0)
+
+        if warmup_epochs > 0:
+            warmup = LinearLR(
+                opt, start_factor=1e-2, end_factor=1.0, total_iters=warmup_epochs
+            )
+            cosine = CosineAnnealingLR(
+                opt, T_max=total_epochs - warmup_epochs, eta_min=1e-6
+            )
+            scheduler = SequentialLR(
+                opt, schedulers=[warmup, cosine], milestones=[warmup_epochs]
+            )
+        else:
+            scheduler = CosineAnnealingLR(opt, T_max=total_epochs, eta_min=1e-6)
+
         return {
             "optimizer": opt,
             "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
