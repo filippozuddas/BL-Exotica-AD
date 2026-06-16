@@ -147,6 +147,50 @@ class SpectrogramDataset(Dataset):
         return torch.from_numpy(result).float().unsqueeze(0)  # (1, tchans, fchans)
 
 
+class CachedDataset(Dataset):
+    """
+    In-RAM dataset backed by a preprocessed NPZ cache (see scripts/preprocess_cache.py).
+
+    Loads the entire split into a numpy array at init. Raw snippets have shape
+    (N, n_obs, tchans_per_obs, fchans). __getitem__ applies bandpass_correct +
+    core_transform per observation (fast — no I/O), concatenates along the time
+    axis, and returns a (1, tchans, fchans) float32 tensor.
+
+    Storing RAW data means preprocessing hyperparameters can be changed without
+    re-extracting the cache (same approach as RST background_extractor.py).
+
+    RAM cost: N × n_obs × tchans_per_obs × fchans × 4 bytes
+    (≈78 GB for 200k × 6 × 16 × 1024 float32).
+    """
+
+    def __init__(self, npz_path: Path, split: str, cfg_preproc: Dict[str, Any]):
+        print(f"Loading {split} cache from {npz_path} into RAM...")
+        archive = np.load(str(npz_path))
+        self.data = archive[split]          # (N, n_obs, tchans_per_obs, fchans)
+        self.cfg_preproc = cfg_preproc
+        print(f"  {split}: {self.data.shape[0]} snippets  "
+              f"shape={self.data.shape[1:]}  "
+              f"{self.data.nbytes / 1e9:.1f} GB in RAM")
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        method = self.cfg_preproc.get("bandpass_method", "polynomial")
+        poly_degree = self.cfg_preproc.get("poly_degree", 3)
+        mad_epsilon = self.cfg_preproc.get("mad_epsilon", 1e-6)
+
+        raw = self.data[idx]   # (n_obs, tchans_per_obs, fchans)
+        sub_frames = []
+        for obs in raw:
+            frame = bandpass_correct(obs, method=method, poly_degree=poly_degree)
+            frame = core_transform(frame, mad_epsilon)
+            sub_frames.append(frame)
+
+        result = np.concatenate(sub_frames, axis=0)   # (tchans, fchans)
+        return torch.from_numpy(result).float().unsqueeze(0)
+
+
 def build_datasets(
     cadence_list: List[List[Union[str, Path]]],
     cfg_data: Dict[str, Any],
@@ -168,8 +212,17 @@ def build_datasets(
         seed: RNG seed for the cadence shuffle.
 
     Returns:
-        (train_dataset, val_dataset) pair of SpectrogramDatasets.
+        (train_dataset, val_dataset) pair of SpectrogramDatasets (lazy) or
+        CachedDatasets (if cfg_data["dataset"]["cache_file"] exists on disk).
     """
+    cache_file = cfg_data.get("dataset", {}).get("cache_file")
+    if cache_file and Path(cache_file).exists():
+        cfg_preproc = cfg_data["preprocessing"]
+        cache_path = Path(cache_file)
+        train_ds = CachedDataset(cache_path, "train", cfg_preproc)
+        val_ds   = CachedDataset(cache_path, "val",   cfg_preproc)
+        return train_ds, val_ds
+
     rng = np.random.default_rng(seed)
     cadences = [[Path(p) for p in group] for group in cadence_list]
     rng.shuffle(cadences)

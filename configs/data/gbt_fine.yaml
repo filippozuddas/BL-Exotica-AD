@@ -51,4 +51,5 @@ loader:
 
 dataset:
   cadence_list: data/raw/gbt_fine_cadences.txt  # one cadence per line, 6 space-separated paths
+  # cache_file: data/processed/cache_gbt_fine.h5  # uncomment after running scripts/preprocess_cache.py
   seed: 42
