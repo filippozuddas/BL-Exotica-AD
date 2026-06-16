@@ -232,8 +232,14 @@ def build_datasets(
     rng.shuffle(cadences)
 
     n_val = max(1, int(len(cadences) * val_fraction))
-    val_paths = cadences[:n_val]
-    train_paths = cadences[n_val:]
+    n_val = min(n_val, len(cadences) - 1)  # guarantee at least 1 cadence in train
+    if n_val == 0:
+        # single cadence: val and train share the same data
+        val_paths = cadences
+        train_paths = cadences
+    else:
+        val_paths = cadences[:n_val]
+        train_paths = cadences[n_val:]
 
     frame_cfg = cfg_data["frame"]
     tchans = frame_cfg["tchans"]
