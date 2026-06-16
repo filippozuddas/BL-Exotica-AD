@@ -76,16 +76,25 @@ def _extract_cadence_snippets(
     Extract snippets at the given frequency indices from all obs in a cadence.
 
     Returns (n_snippets, n_obs, tchans_per_obs, fchans) float32 RAW array.
-    Reads only the requested windows via h5py slicing — peak memory is the
-    output array, not the full observations.
+    Each file is opened once and all snippets are read in a single pass —
+    avoids the overhead of 3850 × 6 = 23k file open/close per cadence.
     """
     n_obs = len(cadence_paths)
     n_snip = len(indices)
     out = np.empty((n_snip, n_obs, tchans_per_obs, fchans), dtype=np.float32)
 
     for oi, path in enumerate(cadence_paths):
-        for si, idx in enumerate(indices):
-            out[si, oi] = _read_window(path, int(idx) * fchans, fchans, tchans_per_obs)
+        # 256 MB chunk cache: sorted indices let adjacent windows reuse
+        # already-decompressed chunks (same pattern as RST background_extractor).
+        with h5py.File(str(path), "r", rdcc_nbytes=256 * 1024 * 1024) as hf:
+            dset = hf["data"]
+            three_d = dset.ndim == 3
+            for si, idx in enumerate(indices):
+                start = int(idx) * fchans
+                if three_d:
+                    out[si, oi] = dset[:tchans_per_obs, 0, start : start + fchans]
+                else:
+                    out[si, oi] = dset[:tchans_per_obs, start : start + fchans]
 
     return out
 
