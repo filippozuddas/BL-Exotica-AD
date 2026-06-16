@@ -28,6 +28,10 @@ import random
 from pathlib import Path
 
 import h5py
+try:
+    import hdf5plugin  # noqa: F401 — registers bitshuffle/LZ4 filters for BL HDF5 files
+except ImportError:
+    pass
 import numpy as np
 from tqdm import tqdm
 

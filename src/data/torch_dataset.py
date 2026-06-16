@@ -1,6 +1,10 @@
 import numpy as np
 import torch
 import h5py
+try:
+    import hdf5plugin  # noqa: F401 — registers bitshuffle/LZ4 filters for BL HDF5 files
+except ImportError:
+    pass
 from pathlib import Path
 from torch.utils.data import Dataset
 from typing import Any, Dict, List, Tuple, Union
