@@ -1,5 +1,9 @@
 # GBT fine-frequency data product (*.0000.fil)
 # ~3 Hz/chan — sensitive to narrowband drifting signals
+#
+# Input to the model is the full 6-observation cadence stacked along the time
+# axis: 6 × 16 bins = 96 bins total (tchans below). Each observation is
+# normalised independently before stacking (per-observation bandpass + log/MAD).
 
 product: gbt_fine
 
@@ -7,11 +11,11 @@ raw:
   nchans: 67108864          # Fixed per product type
   nifs: 1
   df: 2.7939677238464355    # Hz per channel
-  dt: 18.25361108           # Seconds per time bin
-  # nints varies per observation
+  dt: 18.25361108           # Seconds per time bin (single observation bin)
+  # nints per observation: 16 (confirmed from real data shape (16, 1, 67108864))
 
 frame:
-  tchans: 16                # confirmed from real data shape (16, 1, 67108864)
+  tchans: 96                # 6 obs × 16 bins/obs — full cadence, input shape to model
   fchans: 1024
   downsample_factor: 1      # no downsampling — 0000.fil is already at 2.79 Hz/chan; narrowband signals would be sub-pixel after pooling
   stride_train: 1024        # no overlap in training
@@ -46,5 +50,5 @@ loader:
   overlap: 16               # Overlapping bins between chunks
 
 dataset:
-  file_list: data/raw/gbt_fine_files.txt
+  cadence_list: data/raw/gbt_fine_cadences.txt  # one cadence per line, 6 space-separated paths
   seed: 42

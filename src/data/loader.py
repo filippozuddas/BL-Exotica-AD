@@ -1,8 +1,34 @@
 import numpy as np
 from pathlib import Path
-from typing import Union
+from typing import List, Union
 
 import blimpy
+
+
+def load_cadence(
+    file_paths: List[Union[str, Path]],
+    downsample_factor: int = 1,
+) -> List[np.ndarray]:
+    """
+    Load a cadence (group of observations) and return a list of (ntime, nchans) arrays.
+
+    Files are sorted by MJD-seconds extracted from the filename (field index 3
+    when splitting by '_', e.g. 'blc01_guppi_59378_47976_...' → 47976) so that
+    out-of-order entries in the manifest are corrected automatically.
+
+    Args:
+        file_paths: paths to the observation files belonging to one cadence.
+        downsample_factor: passed through to load_observation().
+
+    Returns:
+        List of float32 arrays, one per file, each shaped (ntime, nchans // downsample_factor),
+        sorted chronologically by MJD-seconds.
+    """
+    sorted_paths = sorted(
+        [Path(p) for p in file_paths],
+        key=lambda p: int(p.name.split("_")[3]),
+    )
+    return [load_observation(p, downsample_factor) for p in sorted_paths]
 
 
 def load_observation(

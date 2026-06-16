@@ -106,11 +106,15 @@ def main():
 
     # ------------------------------------------------------------------ data
     data_cfg = cfg["data"]
-    file_list_path = Path(data_cfg["dataset"]["file_list"])
-    file_list = [p.strip() for p in file_list_path.read_text().splitlines() if p.strip()]
+    cadence_list_path = Path(data_cfg["dataset"]["cadence_list"])
+    cadence_list = [
+        line.strip().split()
+        for line in cadence_list_path.read_text().splitlines()
+        if line.strip()
+    ]
 
     train_ds, val_ds = build_datasets(
-        file_list,
+        cadence_list,
         data_cfg,
         val_fraction=0.15,
         seed=cfg["training"]["seed"],
