@@ -123,7 +123,9 @@ def main():
 
     num_gpus = int(cfg["hardware"].get("num_gpus", 0))
     pin_memory = num_gpus > 0
-    num_workers = 4 if num_gpus > 0 else 0
+    # Lazy dataset loads from disk per __getitem__ — workers hide I/O latency
+    # regardless of GPU count.
+    num_workers = cfg["hardware"].get("num_workers", 4)
 
     train_loader = DataLoader(
         train_ds,

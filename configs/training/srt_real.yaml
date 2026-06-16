@@ -24,5 +24,6 @@ training:
 hardware:
   num_gpus: 2
   mixed_precision: true
+  num_workers: 8    # workers per GPU for lazy I/O; tune up if GPUs are starved
 
 output_dir: outputs

@@ -1,55 +1,115 @@
 import numpy as np
 import torch
+import h5py
 from pathlib import Path
 from torch.utils.data import Dataset
 from typing import Any, Dict, List, Tuple, Union
 
-from .loader import load_cadence
 from .preprocessing import bandpass_correct, core_transform
+
+
+def _read_nchans(path: Path, downsample_factor: int = 1) -> int:
+    """Read channel count from file header without loading any data."""
+    if path.suffix == '.h5':
+        with h5py.File(str(path), 'r') as f:
+            return int(f['data'].shape[2]) // downsample_factor
+    else:
+        import blimpy
+        wf = blimpy.Waterfall(str(path), load_data=False)
+        return int(wf.header['nchans']) // downsample_factor
+
+
+def _load_channel_window(
+    path: Path,
+    f_start: int,
+    fchans: int,
+    downsample_factor: int = 1,
+) -> np.ndarray:
+    """
+    Load a (ntime, fchans) window from a filterbank file using partial I/O.
+
+    For .h5 files uses h5py hyperslab selection — reads only the requested
+    channel range from disk (O(ntime * fchans), not O(ntime * nchans_total)).
+    For .fil files falls back to loading the full file.
+
+    Args:
+        path: path to the .h5 or .fil file.
+        f_start: start channel index in downsampled space.
+        fchans: number of channels to read (downsampled).
+        downsample_factor: average-pool along frequency by this factor.
+
+    Returns:
+        float32 array of shape (ntime, fchans).
+    """
+    raw_start = f_start * downsample_factor
+    raw_fchans = fchans * downsample_factor
+
+    if path.suffix == '.h5':
+        with h5py.File(str(path), 'r') as f:
+            data = f['data'][:, 0, raw_start : raw_start + raw_fchans]
+        data = np.asarray(data, dtype=np.float32)
+    else:
+        import blimpy
+        wf = blimpy.Waterfall(str(path), load_data=True)
+        raw = wf.data
+        if raw.ndim == 3:
+            raw = raw[:, 0, :]
+        data = raw[:, raw_start : raw_start + raw_fchans].astype(np.float32)
+
+    if downsample_factor > 1:
+        ntime = data.shape[0]
+        data = data.reshape(ntime, fchans, downsample_factor).mean(axis=-1)
+
+    return data
 
 
 class SpectrogramDataset(Dataset):
     """
-    PyTorch Dataset serving (1, ntime, fchans) tensors from pre-loaded cadences.
+    Lazy PyTorch Dataset serving (1, ntime, fchans) tensors from cadence files.
 
-    A cadence is a list of per-observation (ntime_obs, nchans_ds) arrays. Each
-    __getitem__ slides a frequency window of width `fchans` across the cadence,
-    normalises each observation independently (bandpass + log1p/MAD), concatenates
-    them along the time axis, and returns a float32 NCHW tensor.
+    No observation data is loaded at init — only file headers are read to build
+    the snippet index. Each __getitem__ loads only the requested `fchans`-wide
+    frequency window from disk via HDF5 partial I/O, normalises each observation
+    independently (bandpass_correct + core_transform), concatenates along the
+    time axis, and returns a float32 NCHW tensor.
+
+    RAM cost: O(n_cadences) for the path index — effectively zero regardless of
+    dataset size. I/O cost per snippet: n_obs × ntime × fchans × 4 bytes
+    (≈ 384 KB for 0000.fil with 6 obs × 16 bins × 1024 chans).
 
     For single-observation products (e.g. 0001.fil) pass cadences where each
-    inner list contains exactly one array — the logic is identical.
-
-    Cadences are stored in memory as List[List[np.ndarray]] (already downsampled).
-    The snippet index is built once at __init__ by sliding a window of width
-    `fchans` along the frequency axis of each cadence with the given stride.
+    inner list contains exactly one path — the logic is identical.
     """
 
     def __init__(
         self,
-        cadences: List[List[np.ndarray]],
+        cadence_paths: List[List[Path]],
         fchans: int,
         stride: int,
         cfg_preproc: Dict[str, Any],
+        downsample_factor: int = 1,
     ):
         """
         Args:
-            cadences: list of cadences; each cadence is a list of (ntime_obs, nchans_ds)
-                float32 arrays sorted chronologically.
-            fchans: snippet width in downsampled channels.
-            stride: step between consecutive snippet start positions (channels).
-            cfg_preproc: preprocessing config with keys:
-                bandpass_method ('polynomial' | 'median'),
-                poly_degree (int),
-                mad_epsilon (float).
+            cadence_paths: list of cadences; each cadence is a list of Paths to
+                observation files sorted chronologically.
+            fchans: snippet width in (downsampled) channels.
+            stride: step between consecutive snippet start positions.
+            cfg_preproc: preprocessing config (bandpass_method, poly_degree,
+                mad_epsilon).
+            downsample_factor: frequency-axis average-pooling factor applied
+                during loading.
         """
-        self.cadences = cadences
+        self.cadence_paths = cadence_paths
         self.fchans = fchans
         self.cfg_preproc = cfg_preproc
+        self.downsample_factor = downsample_factor
 
+        # Build snippet index by reading nchans from the header of the first
+        # file in each cadence (all files in a cadence share the same nchans).
         self.snippet_index: List[Tuple[int, int]] = []
-        for cad_idx, cadence in enumerate(cadences):
-            nchans = cadence[0].shape[1]
+        for cad_idx, cadence in enumerate(cadence_paths):
+            nchans = _read_nchans(cadence[0], downsample_factor)
             f_start = 0
             while f_start + fchans <= nchans:
                 self.snippet_index.append((cad_idx, f_start))
@@ -65,9 +125,8 @@ class SpectrogramDataset(Dataset):
         mad_epsilon = self.cfg_preproc.get("mad_epsilon", 1e-6)
 
         sub_frames = []
-        for obs_arr in self.cadences[cad_idx]:
-            # .copy() so preprocessing operates on its own buffer, not a view
-            frame = obs_arr[:, f_start : f_start + self.fchans].copy()
+        for path in self.cadence_paths[cad_idx]:
+            frame = _load_channel_window(path, f_start, self.fchans, self.downsample_factor)
             frame = bandpass_correct(frame, method=method, poly_degree=poly_degree)
             frame = core_transform(frame, mad_epsilon)
             sub_frames.append(frame)
@@ -83,16 +142,16 @@ def build_datasets(
     seed: int = 42,
 ) -> Tuple[SpectrogramDataset, SpectrogramDataset]:
     """
-    Load cadences from disk and build train/val SpectrogramDatasets.
+    Build train/val SpectrogramDatasets from a cadence list (lazy, no data loaded).
 
-    Cadences are split at the cadence level (not snippet level) to ensure
-    no noise realisations appear in both train and val sets.
+    Cadences are split at the cadence level for statistical independence between
+    train and val sets.
 
     Args:
         cadence_list: list of cadences; each cadence is a list of paths to
-            observation files (typically 6 for 0000.fil, 1 for 0001.fil).
+            observation files (6 for 0000.fil, 1 for 0001.fil).
         cfg_data: merged data config dict containing 'frame' and
-            'preprocessing' sub-dicts (see configs/data/gbt_fine.yaml).
+            'preprocessing' sub-dicts.
         val_fraction: fraction of cadences reserved for validation.
         seed: RNG seed for the cadence shuffle.
 
@@ -108,16 +167,13 @@ def build_datasets(
     train_paths = cadences[n_val:]
 
     frame_cfg = cfg_data["frame"]
-    downsample_factor = frame_cfg["downsample_factor"]
     fchans = frame_cfg["fchans"]
     stride_train = frame_cfg["stride_train"]
     stride_infer = frame_cfg["stride_infer"]
+    downsample_factor = frame_cfg.get("downsample_factor", 1)
     cfg_preproc = cfg_data["preprocessing"]
 
-    train_obs = [load_cadence(group, downsample_factor) for group in train_paths]
-    val_obs = [load_cadence(group, downsample_factor) for group in val_paths]
-
-    train_ds = SpectrogramDataset(train_obs, fchans, stride_train, cfg_preproc)
-    val_ds = SpectrogramDataset(val_obs, fchans, stride_infer, cfg_preproc)
+    train_ds = SpectrogramDataset(train_paths, fchans, stride_train, cfg_preproc, downsample_factor)
+    val_ds = SpectrogramDataset(val_paths, fchans, stride_infer, cfg_preproc, downsample_factor)
 
     return train_ds, val_ds
