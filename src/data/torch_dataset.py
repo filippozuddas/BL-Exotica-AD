@@ -65,13 +65,19 @@ def _load_channel_window(
 
 class SpectrogramDataset(Dataset):
     """
-    Lazy PyTorch Dataset serving (1, ntime, fchans) tensors from cadence files.
+    Lazy PyTorch Dataset serving (1, tchans, fchans) tensors from cadence files.
 
     No observation data is loaded at init — only file headers are read to build
     the snippet index. Each __getitem__ loads only the requested `fchans`-wide
     frequency window from disk via HDF5 partial I/O, normalises each observation
     independently (bandpass_correct + core_transform), concatenates along the
-    time axis, and returns a float32 NCHW tensor.
+    time axis, truncates to exactly `tchans` rows, and returns a float32 NCHW
+    tensor.
+
+    The truncation to `tchans` is the contract: if a cadence file set produces
+    more rows than `tchans` (e.g. a 7-obs cadence or obs with ntime>16), the
+    excess rows are silently dropped. Callers must ensure cadences have at least
+    `tchans` total time bins; cadences that fall short are skipped during init.
 
     RAM cost: O(n_cadences) for the path index — effectively zero regardless of
     dataset size. I/O cost per snippet: n_obs × ntime × fchans × 4 bytes
@@ -84,6 +90,7 @@ class SpectrogramDataset(Dataset):
     def __init__(
         self,
         cadence_paths: List[List[Path]],
+        tchans: int,
         fchans: int,
         stride: int,
         cfg_preproc: Dict[str, Any],
@@ -93,6 +100,9 @@ class SpectrogramDataset(Dataset):
         Args:
             cadence_paths: list of cadences; each cadence is a list of Paths to
                 observation files sorted chronologically.
+            tchans: expected number of time bins in the output (after
+                concatenating all obs in a cadence). Cadences with fewer total
+                time bins are skipped; those with more are truncated.
             fchans: snippet width in (downsampled) channels.
             stride: step between consecutive snippet start positions.
             cfg_preproc: preprocessing config (bandpass_method, poly_degree,
@@ -101,6 +111,7 @@ class SpectrogramDataset(Dataset):
                 during loading.
         """
         self.cadence_paths = cadence_paths
+        self.tchans = tchans
         self.fchans = fchans
         self.cfg_preproc = cfg_preproc
         self.downsample_factor = downsample_factor
@@ -132,7 +143,8 @@ class SpectrogramDataset(Dataset):
             sub_frames.append(frame)
 
         result = np.concatenate(sub_frames, axis=0)  # (total_time, fchans)
-        return torch.from_numpy(result).float().unsqueeze(0)  # (1, total_time, fchans)
+        result = result[: self.tchans, :]             # enforce fixed height
+        return torch.from_numpy(result).float().unsqueeze(0)  # (1, tchans, fchans)
 
 
 def build_datasets(
@@ -167,13 +179,14 @@ def build_datasets(
     train_paths = cadences[n_val:]
 
     frame_cfg = cfg_data["frame"]
+    tchans = frame_cfg["tchans"]
     fchans = frame_cfg["fchans"]
     stride_train = frame_cfg["stride_train"]
     stride_infer = frame_cfg["stride_infer"]
     downsample_factor = frame_cfg.get("downsample_factor", 1)
     cfg_preproc = cfg_data["preprocessing"]
 
-    train_ds = SpectrogramDataset(train_paths, fchans, stride_train, cfg_preproc, downsample_factor)
-    val_ds = SpectrogramDataset(val_paths, fchans, stride_infer, cfg_preproc, downsample_factor)
+    train_ds = SpectrogramDataset(train_paths, tchans, fchans, stride_train, cfg_preproc, downsample_factor)
+    val_ds = SpectrogramDataset(val_paths, tchans, fchans, stride_infer, cfg_preproc, downsample_factor)
 
     return train_ds, val_ds
