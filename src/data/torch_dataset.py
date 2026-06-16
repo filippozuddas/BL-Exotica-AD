@@ -6,7 +6,7 @@ try:
 except ImportError:
     pass
 from pathlib import Path
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 from typing import Any, Dict, List, Tuple, Union
 
 from .preprocessing import bandpass_correct, core_transform
@@ -231,25 +231,28 @@ def build_datasets(
     cadences = [[Path(p) for p in group] for group in cadence_list]
     rng.shuffle(cadences)
 
-    n_val = max(1, int(len(cadences) * val_fraction))
-    n_val = min(n_val, len(cadences) - 1)  # guarantee at least 1 cadence in train
-    if n_val == 0:
-        # single cadence: val and train share the same data
-        val_paths = cadences
-        train_paths = cadences
-    else:
-        val_paths = cadences[:n_val]
-        train_paths = cadences[n_val:]
-
     frame_cfg = cfg_data["frame"]
     tchans = frame_cfg["tchans"]
     fchans = frame_cfg["fchans"]
     stride_train = frame_cfg["stride_train"]
-    stride_infer = frame_cfg["stride_infer"]
     downsample_factor = frame_cfg.get("downsample_factor", 1)
     cfg_preproc = cfg_data["preprocessing"]
 
-    train_ds = SpectrogramDataset(train_paths, tchans, fchans, stride_train, cfg_preproc, downsample_factor)
-    val_ds = SpectrogramDataset(val_paths, tchans, fchans, stride_train, cfg_preproc, downsample_factor)
+    n_val = max(1, int(len(cadences) * val_fraction))
+    n_val = min(n_val, len(cadences) - 1)  # guarantee at least 1 cadence in train
+
+    if n_val == 0:
+        # Single cadence: split at the snippet level so train/val are disjoint.
+        full_ds = SpectrogramDataset(cadences, tchans, fchans, stride_train, cfg_preproc, downsample_factor)
+        n_total = len(full_ds)
+        n_val_snip = max(1, int(n_total * val_fraction))
+        indices = rng.permutation(n_total).tolist()
+        train_ds = Subset(full_ds, indices[n_val_snip:])
+        val_ds   = Subset(full_ds, indices[:n_val_snip])
+    else:
+        val_paths   = cadences[:n_val]
+        train_paths = cadences[n_val:]
+        train_ds = SpectrogramDataset(train_paths, tchans, fchans, stride_train, cfg_preproc, downsample_factor)
+        val_ds   = SpectrogramDataset(val_paths,   tchans, fchans, stride_train, cfg_preproc, downsample_factor)
 
     return train_ds, val_ds
