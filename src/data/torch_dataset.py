@@ -250,6 +250,6 @@ def build_datasets(
     cfg_preproc = cfg_data["preprocessing"]
 
     train_ds = SpectrogramDataset(train_paths, tchans, fchans, stride_train, cfg_preproc, downsample_factor)
-    val_ds = SpectrogramDataset(val_paths, tchans, fchans, stride_infer, cfg_preproc, downsample_factor)
+    val_ds = SpectrogramDataset(val_paths, tchans, fchans, stride_train, cfg_preproc, downsample_factor)
 
     return train_ds, val_ds
