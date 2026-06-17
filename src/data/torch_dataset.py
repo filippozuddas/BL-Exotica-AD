@@ -139,15 +139,14 @@ class SpectrogramDataset(Dataset):
         poly_degree = self.cfg_preproc.get("poly_degree", 3)
         mad_epsilon = self.cfg_preproc.get("mad_epsilon", 1e-6)
 
-        sub_frames = []
-        for path in self.cadence_paths[cad_idx]:
-            frame = _load_channel_window(path, f_start, self.fchans, self.downsample_factor)
-            frame = bandpass_correct(frame, method=method, poly_degree=poly_degree)
-            frame = core_transform(frame, mad_epsilon)
-            sub_frames.append(frame)
-
-        result = np.concatenate(sub_frames, axis=0)  # (total_time, fchans)
-        result = result[: self.tchans, :]             # enforce fixed height
+        sub_frames = [
+            _load_channel_window(path, f_start, self.fchans, self.downsample_factor)
+            for path in self.cadence_paths[cad_idx]
+        ]
+        result = np.concatenate(sub_frames, axis=0)          # (total_time, fchans)
+        result = result[: self.tchans, :]                    # enforce fixed height
+        result = bandpass_correct(result, method=method, poly_degree=poly_degree)
+        result = core_transform(result, mad_epsilon)
         return torch.from_numpy(result).float().unsqueeze(0)  # (1, tchans, fchans)
 
 
@@ -184,14 +183,10 @@ class CachedDataset(Dataset):
         poly_degree = self.cfg_preproc.get("poly_degree", 3)
         mad_epsilon = self.cfg_preproc.get("mad_epsilon", 1e-6)
 
-        raw = self.data[idx]   # (n_obs, tchans_per_obs, fchans)
-        sub_frames = []
-        for obs in raw:
-            frame = bandpass_correct(obs, method=method, poly_degree=poly_degree)
-            frame = core_transform(frame, mad_epsilon)
-            sub_frames.append(frame)
-
-        result = np.concatenate(sub_frames, axis=0)   # (tchans, fchans)
+        raw = self.data[idx]                          # (n_obs, tchans_per_obs, fchans)
+        result = np.concatenate(raw, axis=0)          # (tchans, fchans)
+        result = bandpass_correct(result, method=method, poly_degree=poly_degree)
+        result = core_transform(result, mad_epsilon)
         return torch.from_numpy(result).float().unsqueeze(0)
 
 
