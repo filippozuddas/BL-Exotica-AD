@@ -92,33 +92,56 @@ class NpzSampler:
     """
     Random-access sampler over a CachedDataset NPZ.
 
-    Opens the file with mmap_mode='r' so only the rows we actually request
-    are paged in from disk — no need to load the full 73 GB into RAM.
+    To avoid loading the full file (potentially 60+ GB) into RAM, we:
+      1. Open the NPZ with mmap_mode='r' to get the array shape cheaply.
+      2. Let the caller generate random indices (via set_indices).
+      3. Load ONLY those rows in one contiguous read (~n_samples × snippet_bytes).
+      4. Close the mmap immediately.
 
-    The NPZ stores raw (unpreprocessed) data as
-        arr[i]  →  (n_obs, tchans_per_obs, fchans)
-    __getitem__ concatenates along the time axis, applies bandpass_correct
-    and core_transform, and returns (tchans, fchans) float32.
+    set_indices() must be called before __getitem__().
     """
 
     def __init__(self, npz_path: Path, split: str, cfg_preproc: dict):
-        print(f"Opening NPZ cache (mmap_mode='r'): {npz_path}")
+        print(f"Peeking at NPZ shape (mmap_mode='r'): {npz_path}")
         archive = np.load(str(npz_path), mmap_mode="r")
-        self.data = archive[split]          # (N, n_obs, tchans_per_obs, fchans)
+        arr = archive[split]                # mmap — shape known, data not loaded
+        self._shape = arr.shape             # (N, n_obs, tchans_per_obs, fchans)
+        self._n_total = arr.shape[0]
         self.cfg_preproc = cfg_preproc
-        print(f"  split='{split}'  shape={self.data.shape}  "
-              f"dtype={self.data.dtype}  "
-              f"~{self.data.nbytes / 1e9:.1f} GB (memory-mapped)")
+        self._npz_path = npz_path
+        self._split = split
+        self._data: np.ndarray | None = None
+        self._indices: list | None = None
+        print(f"  split='{split}'  full shape={arr.shape}  "
+              f"dtype={arr.dtype}  "
+              f"full size ~{arr.nbytes / 1e9:.1f} GB")
+        del arr, archive   # release mmap immediately
 
     def __len__(self) -> int:
-        return len(self.data)
+        return self._n_total
 
-    def __getitem__(self, idx: int) -> np.ndarray:
+    def set_indices(self, indices: list) -> None:
+        """Load only the requested rows from disk into RAM."""
+        sorted_pos = np.argsort(indices)          # sort for sequential disk access
+        sorted_idx = np.array(indices)[sorted_pos]
+        print(f"Loading {len(indices)} rows from NPZ "
+              f"(~{len(indices) * np.prod(self._shape[1:]) * 4 / 1e9:.2f} GB)...")
+        archive = np.load(str(self._npz_path), mmap_mode="r")
+        arr = archive[self._split]
+        rows = np.array(arr[sorted_idx])          # only these rows hit RAM
+        del arr, archive
+        # restore original order so self._data[i] corresponds to indices[i]
+        self._data = rows[np.argsort(sorted_pos)]
+        self._indices = list(range(len(indices)))
+        print("  Done.")
+
+    def __getitem__(self, local_idx: int) -> np.ndarray:
+        if self._data is None:
+            raise RuntimeError("Call set_indices() before __getitem__().")
         method      = self.cfg_preproc.get("bandpass_method", "polynomial")
         poly_degree = self.cfg_preproc.get("poly_degree", 3)
         mad_epsilon = self.cfg_preproc.get("mad_epsilon", 1e-6)
-
-        raw    = np.array(self.data[idx])          # force load: (n_obs, tchans_per_obs, fchans)
+        raw    = self._data[local_idx]             # (n_obs, tchans_per_obs, fchans)
         result = np.concatenate(raw, axis=0)       # (tchans, fchans)
         result = bandpass_correct(result, method=method, poly_degree=poly_degree)
         result = core_transform(result, mad_epsilon)
@@ -298,10 +321,17 @@ def main():
     indices   = rng.choice(n_total, size=n_samples, replace=False).tolist()
     print(f"\nTotal snippets: {n_total}  →  sampling {n_samples}")
 
+    # For the NPZ path, pre-load only the sampled rows before iterating.
+    if isinstance(sampler, NpzSampler):
+        sampler.set_indices(indices)
+        local_indices = list(range(n_samples))   # iterate over local positions
+    else:
+        local_indices = indices                  # SpectrogramDataset: use global idx
+
     # --- compute metrics ---
     records = []
-    for i, idx in enumerate(indices):
-        arr = sampler[idx]
+    for i, local_idx in enumerate(local_indices):
+        arr = sampler[local_idx]
         records.append(compute_metrics(arr))
         if (i + 1) % 500 == 0:
             print(f"  {i+1}/{n_samples}")
@@ -345,7 +375,7 @@ def main():
     _plot_scatter(data, args.out_dir / "rfi_scatter.png")
     print(f"Saved → {args.out_dir / 'rfi_scatter.png'}")
 
-    _plot_examples(sampler, indices, records, data,
+    _plot_examples(sampler, local_indices, records, data,
                    is_clean, is_mild, is_strong,
                    args.out_dir / "example_snippets.png")
     print(f"Saved → {args.out_dir / 'example_snippets.png'}")
