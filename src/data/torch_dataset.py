@@ -23,6 +23,33 @@ def _read_nchans(path: Path, downsample_factor: int = 1) -> int:
         return int(wf.header['nchans']) // downsample_factor
 
 
+def _load_full_obs(path: Path, downsample_factor: int = 1) -> np.ndarray:
+    """Load a full observation into a (ntime, nchans_downsampled) float32 array.
+
+    Called once per file at Dataset init to populate the in-RAM observation
+    cache, eliminating all per-snippet file I/O during training.
+    """
+    if path.suffix == '.h5':
+        with h5py.File(str(path), 'r') as f:
+            data = np.asarray(f['data'][:, 0, :], dtype=np.float32)
+    else:
+        import blimpy
+        wf = blimpy.Waterfall(str(path), load_data=True)
+        raw = wf.data
+        if raw.ndim == 3:
+            raw = raw[:, 0, :]
+        data = raw.astype(np.float32)
+
+    if downsample_factor > 1:
+        ntime, nchans = data.shape
+        nchans_ds = nchans // downsample_factor
+        data = data[:, : nchans_ds * downsample_factor].reshape(
+            ntime, nchans_ds, downsample_factor
+        ).mean(axis=-1)
+
+    return data
+
+
 def _load_channel_window(
     path: Path,
     f_start: int,
@@ -69,23 +96,19 @@ def _load_channel_window(
 
 class SpectrogramDataset(Dataset):
     """
-    Lazy PyTorch Dataset serving (1, tchans, fchans) tensors from cadence files.
+    PyTorch Dataset serving (1, tchans, fchans) tensors from cadence files.
 
-    No observation data is loaded at init — only file headers are read to build
-    the snippet index. Each __getitem__ loads only the requested `fchans`-wide
-    frequency window from disk via HDF5 partial I/O, normalises each observation
-    independently (bandpass_correct + core_transform), concatenates along the
-    time axis, truncates to exactly `tchans` rows, and returns a float32 NCHW
-    tensor.
+    All observation files are loaded fully into RAM at init (one float32 array
+    per file). __getitem__ slices the requested frequency window directly from
+    RAM — zero disk I/O during training, keeping GPU utilisation high.
+
+    RAM cost: n_unique_obs × ntime × nchans × 4 bytes
+    (≈ 4.3 GB per 0000.fil observation at 16 bins × 67M chans).
 
     The truncation to `tchans` is the contract: if a cadence file set produces
     more rows than `tchans` (e.g. a 7-obs cadence or obs with ntime>16), the
     excess rows are silently dropped. Callers must ensure cadences have at least
     `tchans` total time bins; cadences that fall short are skipped during init.
-
-    RAM cost: O(n_cadences) for the path index — effectively zero regardless of
-    dataset size. I/O cost per snippet: n_obs × ntime × fchans × 4 bytes
-    (≈ 384 KB for 0000.fil with 6 obs × 16 bins × 1024 chans).
 
     For single-observation products (e.g. 0001.fil) pass cadences where each
     inner list contains exactly one path — the logic is identical.
@@ -120,11 +143,24 @@ class SpectrogramDataset(Dataset):
         self.cfg_preproc = cfg_preproc
         self.downsample_factor = downsample_factor
 
-        # Build snippet index by reading nchans from the header of the first
-        # file in each cadence (all files in a cadence share the same nchans).
+        # Load all observation files into RAM once — eliminates per-snippet HDF5
+        # I/O that would otherwise starve the GPU (each __getitem__ would open
+        # and close n_obs files, keeping GPU utilisation at ~0%).
+        all_paths = sorted(
+            {path for cadence in cadence_paths for path in cadence},
+            key=str,
+        )
+        print(f"Loading {len(all_paths)} observation files into RAM...")
+        self._obs_cache: Dict[Path, np.ndarray] = {}
+        for path in all_paths:
+            self._obs_cache[path] = _load_full_obs(path, downsample_factor)
+            gb = self._obs_cache[path].nbytes / 1e9
+            print(f"  {path.name}  {self._obs_cache[path].shape}  {gb:.2f} GB")
+
+        # Build snippet index using nchans from the cached arrays.
         self.snippet_index: List[Tuple[int, int]] = []
         for cad_idx, cadence in enumerate(cadence_paths):
-            nchans = _read_nchans(cadence[0], downsample_factor)
+            nchans = self._obs_cache[cadence[0]].shape[1]
             f_start = 0
             while f_start + fchans <= nchans:
                 self.snippet_index.append((cad_idx, f_start))
@@ -140,7 +176,7 @@ class SpectrogramDataset(Dataset):
         mad_epsilon = self.cfg_preproc.get("mad_epsilon", 1e-6)
 
         sub_frames = [
-            _load_channel_window(path, f_start, self.fchans, self.downsample_factor)
+            self._obs_cache[path][:, f_start : f_start + self.fchans]
             for path in self.cadence_paths[cad_idx]
         ]
         result = np.concatenate(sub_frames, axis=0)          # (total_time, fchans)
