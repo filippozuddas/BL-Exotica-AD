@@ -18,9 +18,9 @@
 # subset each step); decoder reconstructs all 384 from those 96 + a shared
 # learnable mask token, loss on the 288 masked patches only.
 #
-# Inference (forward): deterministic 24-pass partitioned reconstruction — the
+# Inference (forward): deterministic 6-pass partitioned reconstruction — the
 # (6, 64) grid has nh=6 row groups; each pass keeps one row of 64 tokens visible
-# so every token is masked in 23 of 24 passes. Reconstruction error = average
+# so every token is masked in 5 of 6 passes. Reconstruction error = average
 # over the passes where the token was masked. See src/models/vit_mae.py.
 
 architecture: vit_mae
@@ -39,7 +39,7 @@ decoder_num_heads: 4
 
 # --- Shared ---
 mlp_ratio: 4
-mask_ratio: 0.75       # training only; inference uses the fixed 24-pass partition
+mask_ratio: 0.75       # training only; inference uses the fixed 6-pass partition
 
 # He et al. per-patch target normalisation: off by default. If true,
 # ViTMAE.compute_loss raises NotImplementedError (not yet implemented).
