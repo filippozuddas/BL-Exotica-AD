@@ -9,12 +9,13 @@ data: configs/data/gbt_fine.yaml
 model: configs/model/convae_mae.yaml
 
 training:
-  batch_size: 1024
+  batch_size: 128
   epochs: 100
   warmup_epochs: 10
-  learning_rate: 1.0e-3
+  learning_rate: 3.0e-4
   optimizer: adam
   loss: mse
+  gradient_clip_val: 1.0
   seed: 42
   patience: 30
   min_delta: 1.0e-5

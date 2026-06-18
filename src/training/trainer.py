@@ -138,6 +138,8 @@ def build_trainer(
 
     logger = CSVLogger(save_dir=str(run_dir / "logs"), name="", version="")
 
+    gradient_clip_val = cfg["training"].get("gradient_clip_val", None)
+
     return pl.Trainer(
         max_epochs=cfg["training"]["epochs"],
         accelerator=accelerator,
@@ -149,6 +151,7 @@ def build_trainer(
         log_every_n_steps=10,
         enable_model_summary=False,
         enable_progress_bar=False,
+        gradient_clip_val=gradient_clip_val,
     )
 
 
