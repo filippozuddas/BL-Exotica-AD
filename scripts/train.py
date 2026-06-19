@@ -167,8 +167,20 @@ def main():
         os.environ["BL_EXOTICA_RUN_DIR"] = str(run_dir)
     print(f"Run directory: {run_dir}")
 
-    val_sample = val_ds[0].unsqueeze(0)
-    callbacks = build_callbacks(cfg, run_dir, val_sample=val_sample)
+    n_snap = min(4, len(val_ds))
+    if n_snap >= 4:
+        variances = torch.tensor(
+            [val_ds[i].var().item() for i in range(len(val_ds))]
+        )
+        top_idx = int(variances.argmax())
+        rng = torch.Generator().manual_seed(42)
+        others = torch.randperm(len(val_ds), generator=rng)
+        others = [int(i) for i in others if int(i) != top_idx][:n_snap - 1]
+        snap_indices = [top_idx] + others
+    else:
+        snap_indices = list(range(n_snap))
+    val_samples = torch.stack([val_ds[i] for i in snap_indices])
+    callbacks = build_callbacks(cfg, run_dir, val_sample=val_samples)
 
     module = AELightningModule(model, cfg)
     trainer = build_trainer(cfg, run_dir, callbacks=callbacks)

@@ -146,10 +146,12 @@ class EpochSummary(pl.Callback):
 
 
 class ReconstructionSnapshot(pl.Callback):
-    """Save a side-by-side input / reconstruction figure every N epochs.
+    """Save input / reconstruction / error grid every N epochs.
 
-    Useful for visually verifying that the model is learning the noise
-    distribution rather than collapsing or copying the input trivially.
+    Accepts ``(B, C, H, W)`` with ``B >= 1`` samples.  The first sample is
+    typically the highest-variance snippet (most structure); the rest provide
+    diversity.  Each sample gets one row of three panels: Input, Reconstruction,
+    |Error|.
     """
 
     def __init__(
@@ -159,8 +161,9 @@ class ReconstructionSnapshot(pl.Callback):
         every_n_epochs: int = 10,
     ):
         super().__init__()
-        # Register as buffer-free attribute; will be moved to device in hook
-        self._val_sample = val_sample
+        if val_sample.dim() == 3:
+            val_sample = val_sample.unsqueeze(0)
+        self._val_samples = val_sample
         self.output_dir = Path(output_dir)
         self.every_n_epochs = every_n_epochs
 
@@ -174,26 +177,26 @@ class ReconstructionSnapshot(pl.Callback):
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        x = self._val_sample.to(pl_module.device)
+        x = self._val_samples.to(pl_module.device)
         with torch.no_grad():
             recon = pl_module.model(x)
 
-        # Convert to numpy for plotting — squeeze batch and channel dims
-        inp = x[0, 0].cpu().numpy()       # (H, W)
-        rec = recon[0, 0].cpu().numpy()   # (H, W)
-        err = np.abs(inp - rec)
-
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-        for ax, img, title in zip(
-            axes,
-            [inp, rec, err],
-            ["Input", "Reconstruction", "|Error|"],
-        ):
-            im = ax.imshow(img, aspect="auto", origin="lower", interpolation="nearest")
-            ax.set_title(f"{title}  (epoch {epoch + 1})")
-            ax.set_xlabel("Frequency channel")
-            ax.set_ylabel("Time bin")
-            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        n = x.shape[0]
+        fig, axes = plt.subplots(n, 3, figsize=(15, 4 * n), squeeze=False)
+        for row in range(n):
+            inp = x[row, 0].cpu().numpy()
+            rec = recon[row, 0].cpu().numpy()
+            err = np.abs(inp - rec)
+            label = "highest-var" if row == 0 else f"sample {row}"
+            for col, (img, title) in enumerate(
+                zip([inp, rec, err], ["Input", "Reconstruction", "|Error|"])
+            ):
+                ax = axes[row, col]
+                im = ax.imshow(img, aspect="auto", origin="lower", interpolation="nearest")
+                ax.set_title(f"{title}  (epoch {epoch + 1}, {label})")
+                ax.set_xlabel("Frequency channel")
+                ax.set_ylabel("Time bin")
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
         fig.tight_layout()
         fig.savefig(self.output_dir / f"epoch_{epoch + 1:04d}.png", dpi=100)
