@@ -50,7 +50,7 @@ infonce_temperature: 0.07  # InfoNCE logit temperature. Embeddings are L2-normal
 # NOTE: recon/infonce inference masks scattered round-robin patches, whereas training
 # masks C×C clusters — a train/inference masking-geometry shift that can depress those
 # two scores. The default embedding score (encode() uses no masking) sidesteps it.
-scoring: embedding
+scoring: recon
 
 # SSAST per-patch target normalisation: off (compute_loss raises if true).
 norm_pix_loss: false
