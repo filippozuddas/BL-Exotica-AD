@@ -152,16 +152,20 @@ def compute_track_error_per_obs(snippet, recon, start_chan, drift_rate, width=10
             center = int(start_chan + global_t * drift_chans_per_bin)
             lo = max(0, center - width)
             hi = min(fchans, center + width + 1)
-            err = (snippet[global_t, lo:hi] - recon[global_t, lo:hi]) ** 2
-            track_pixels.extend(err.tolist())
+            if hi > lo:
+                err = (snippet[global_t, lo:hi] - recon[global_t, lo:hi]) ** 2
+                track_pixels.extend(err.tolist())
 
-            bg_lo = max(0, center + 100)
-            bg_hi = min(fchans, center + 100 + (hi - lo))
-            if bg_hi > bg_lo:
+            # Background: offset by 200 channels (safe margin)
+            track_width = hi - lo
+            bg_center = center + 200
+            bg_lo = max(0, bg_center - width)
+            bg_hi = min(fchans, bg_center + width + 1)
+            if bg_hi > bg_lo and bg_lo >= hi:
                 bg_err = (snippet[global_t, bg_lo:bg_hi] - recon[global_t, bg_lo:bg_hi]) ** 2
                 bg_pixels.extend(bg_err.tolist())
 
-        obs_track_errors.append(np.mean(track_pixels))
+        obs_track_errors.append(np.mean(track_pixels) if track_pixels else 0.0)
         obs_bg_errors.append(np.mean(bg_pixels) if bg_pixels else 0.0)
 
     return np.array(obs_track_errors), np.array(obs_bg_errors)
@@ -351,7 +355,7 @@ def main():
     ax.set_ylabel("Track MSE on OFF predictions")
     ax.set_title("Signal track error on predicted OFF obs")
     ax.legend(fontsize=7)
-    ax.set_xscale("log")
+    ax.set_xscale("linear")
 
     # Panel 2: track/background ratio vs SNR
     ax = axes[1]
@@ -363,7 +367,7 @@ def main():
     ax.set_ylabel("Track / Background error ratio")
     ax.set_title("Discrimination ratio on OFF predictions")
     ax.legend(fontsize=7)
-    ax.set_xscale("log")
+    ax.set_xscale("linear")
 
     # Panel 3: full OFF error vs SNR
     ax = axes[2]
@@ -381,7 +385,7 @@ def main():
     ax.set_ylabel("Full OFF prediction MSE")
     ax.set_title("Full OFF observation error")
     ax.legend(fontsize=7)
-    ax.set_xscale("log")
+    ax.set_xscale("linear")
 
     plt.tight_layout()
     plt.savefig(args.out_dir / "snr_sweep.png", dpi=150)
