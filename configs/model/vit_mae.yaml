@@ -1,46 +1,56 @@
-# Vision-Transformer Masked Autoencoder (ViT-MAE) — 4th build_autoencoder
-# backbone, alongside convae / convae_mae (CNN-MAE) / VAE. architecture:
-# vit_mae routes build_autoencoder() straight to build_vit_mae(), bypassing
-# the CNN encoder/bottleneck/decoder config sections entirely.
+# SSAST-style ViT-MAE — 4th build_autoencoder backbone, alongside convae /
+# convae_mae (CNN-MAE) / VAE. architecture: vit_mae routes build_autoencoder()
+# straight to build_vit_mae(), bypassing the CNN encoder/bottleneck/decoder
+# config sections entirely. See src/models/vit_mae.py.
 #
-# Input: (96, 1024) — full 6-observation cadence (6 × 16 time bins) × 1024 freq channels.
+# Design follows SSAST (Gong et al. 2022, arXiv:2110.09784), not He et al.:
+#   - In-place (BERT-style) masking, single transformer: every patch token is
+#     fed to the encoder; masked positions get a shared learnable mask_token.
+#     No separate decoder. Keeps the full encoder representation at masked
+#     positions (needed by the discriminative head) and makes encode() (no
+#     masking) the same token regime as training (needed by embedding scoring).
+#   - Joint discriminative (InfoNCE) + generative (MSE) objective, L = L_d + λ·L_g.
+#   - MSPM cluster masking: C×C blocks, C ~ unif{cluster_factor}.
 #
-# Patch tokenisation: Conv2d PatchEmbed with patch_size (16, 16) on the
-# (96, 1024) cadence snippet -> a (6, 64) = 384-patch grid, 16*16*1=256 raw
-# values per patch. Each patch covers exactly one full observation (16 time bins)
-# × 64 frequency channels (~179 Hz), giving attention direct access to
-# inter-observation drift structure. patch_size (16,16) keeps narrowband signals
-# (~3-10 Hz, 1-4 channels) at ~6-25% of the patch area — 4× less diluted than
-# (16,64) which gives only 1-6%.
-#
-# Training (compute_loss): He et al. token-removal masking — mask_ratio=0.75
-# means the encoder sees only 96 of 384 patch tokens per sample (fresh random
-# subset each step); decoder reconstructs all 384 from those 96 + a shared
-# learnable mask token, loss on the 288 masked patches only.
-#
-# Inference (forward): deterministic 6-pass partitioned reconstruction — the
-# (6, 64) grid has nh=6 row groups; each pass keeps one row of 64 tokens visible
-# so every token is masked in 5 of 6 passes. Reconstruction error = average
-# over the passes where the token was masked. See src/models/vit_mae.py.
+# ---- Per-product adaptation: change ONLY input_shape (in the data config) and
+#      patch_size below. No code branches per product. ----
+#   0000.fil (narrowband): input (96,1024) [6-obs cadence × 1024 chans], patch [16,16]
+#                          -> (6,64)=384 patches, 256 raw values/patch.
+#   0001.fil (broadband transient): single observation; input_shape/patch_size TBD.
+#   0002.fil (wideband): TBD pending signal morphology.
 
 architecture: vit_mae
 
 patch_size: [16, 16]
 
-# --- Encoder (ViT, pre-norm transformer blocks) ---
+# --- Transformer encoder (pre-norm) ---
 embed_dim: 128
 depth: 6
 num_heads: 4
-
-# --- Decoder (lightweight transformer, global attention) ---
-decoder_embed_dim: 64
-decoder_depth: 2
-decoder_num_heads: 4
-
-# --- Shared ---
 mlp_ratio: 4
-mask_ratio: 0.75       # training only; inference uses the fixed 6-pass partition
 
-# He et al. per-patch target normalisation: off by default. If true,
-# ViTMAE.compute_loss raises NotImplementedError (not yet implemented).
+# --- Masking ---
+mask_ratio: 0.75           # fraction of patches masked during training
+mask_mode: cluster         # cluster (SSAST MSPM) | random (He-style scattered)
+cluster_factor: [3, 5]     # C ~ unif{c_min, c_max} for cluster masking
+
+# --- Joint objective ---
+loss_mode: joint           # joint | generative | discriminative
+infonce_lambda: 10.0       # L = L_d + infonce_lambda * L_g  (SSAST λ=10)
+infonce_temperature: 0.07  # InfoNCE logit temperature. Embeddings are L2-normalised
+                           # (cosine logits in [-1,1]); a low temp is required so the
+                           # softmax can concentrate over the ~n_masked candidates
+                           # (temp=1.0 floors the loss near log(n_masked) → inert).
+
+# --- Inference anomaly score ---
+#   embedding (default): encoder features + one-class classifier (src/search/scorer.py);
+#                        independent of reconstruction magnitude — best for narrowband.
+#   infonce: per-patch self-recognition difficulty.
+#   recon:   partitioned reconstruction MSE — for morphology-rich products (0001/0002).
+# NOTE: recon/infonce inference masks scattered round-robin patches, whereas training
+# masks C×C clusters — a train/inference masking-geometry shift that can depress those
+# two scores. The default embedding score (encode() uses no masking) sidesteps it.
+scoring: embedding
+
+# SSAST per-patch target normalisation: off (compute_loss raises if true).
 norm_pix_loss: false

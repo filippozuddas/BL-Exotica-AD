@@ -1,30 +1,50 @@
 """
-ViT-MAE: Vision-Transformer Masked Autoencoder (He et al.-style).
+ViT-MAE (SSAST-style): Vision-Transformer Masked Autoencoder for anomaly detection.
 
-4th ``build_autoencoder`` backbone (``architecture: vit_mae``), alongside the
-CNN ``Autoencoder`` / ``MAE`` / ``VAE`` in ``autoencoder.py``. A Conv2d
-``PatchEmbed`` tokenises the spectrogram into non-overlapping patches; an
-``nn.TransformerEncoder`` processes a random subset of "visible" tokens; a
-lightweight decoder reconstructs every patch from the visible tokens plus a
-shared learnable mask token. Training loss is masked-patch MSE, computed via
-the same ``losses._masked_mse`` used by the CNN ``MAE``.
+4th ``build_autoencoder`` backbone (``architecture: vit_mae``), alongside the CNN
+``Autoencoder`` / ``MAE`` / ``VAE`` in ``autoencoder.py``. The design follows
+SSAST (Gong et al. 2022, arXiv:2110.09784) rather than He et al.'s MAE:
 
-``input_shape = (H, W, C)`` matches the ``build_autoencoder``/``build_encoder``
-convention (NOT ``(C, H, W)``); tensors passed to ``forward``/``compute_loss``
-are NCHW.
+- **In-place (BERT-style) masking, single transformer.** Every patch token is
+  fed to one ``nn.TransformerEncoder``; masked positions have their patch
+  embedding replaced by a shared learnable ``mask_token`` (then positional
+  embedding is added to all). There is no separate decoder. This keeps the full
+  encoder representation available at masked positions — required by the
+  discriminative head — and means ``encode(x)`` (no masking) is the *same* token
+  regime as training, so the encoder embeddings are meaningful (the embedding
+  scoring path depends on this).
 
-Patch index ``k = i*nw + j`` (``i`` = time/tchans row, ``j`` = freq/fchans
-col) is the single source of truth: it underlies ``PatchEmbed``'s
-Conv2d-flatten, ``patchify``/``unpatchify``, both positional embeddings, the
-mask ``.view(B, 1, nh, nw)``, and ``_partition_ids``'s row slicing. This is
-what makes the patch-mask <-> pixel-mask equivalence hold.
+- **Joint discriminative + generative objective** (SSAST Algorithm 1). Two
+  2-layer MLP heads read the encoder output ``O_i`` at masked positions:
+  ``reconstruction_head`` -> ``r_i`` (generative, MSE) and ``classification_head``
+  -> ``c_i`` (discriminative, InfoNCE: identify the correct raw patch among all
+  masked patches of the *same* spectrogram). Total loss ``L = L_d + lambda*L_g``.
+
+- **MSPM cluster masking.** ``mask_mode: cluster`` masks ``C x C`` patch blocks
+  (``C ~ unif{c_min, c_max}`` per step) instead of scattered random patches,
+  forcing both local (small C) and global (large C) structure. ``mask_mode:
+  random`` keeps He-style scattered masking.
+
+Three inference anomaly scores (``anomaly_score``), all from one trained model:
+``recon`` (partitioned reconstruction MSE — anti-copy, for morphology-rich
+products), ``infonce`` (per-patch self-recognition difficulty), and
+``embedding`` (encoder features + an external one-class classifier — the
+default, independent of reconstruction magnitude; see
+``src/search/scorer.py``).
+
+``input_shape = (H, W, C)`` matches the ``build_autoencoder`` convention (NOT
+``(C, H, W)``); tensors passed to ``forward``/``compute_loss``/``encode`` are NCHW.
+
+Patch index ``k = i*nw + j`` (``i`` = time/tchans row, ``j`` = freq/fchans col)
+is the single source of truth: it underlies ``PatchEmbed``'s Conv2d-flatten,
+``patchify``/``unpatchify``, the positional embedding, and all mask bookkeeping.
 """
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 from typing import Dict, Optional, Tuple
-
-from .losses import _masked_mse
 
 __all__ = ["PatchEmbed", "ViTMAE", "build_vit_mae", "patchify", "unpatchify"]
 
@@ -32,7 +52,7 @@ __all__ = ["PatchEmbed", "ViTMAE", "build_vit_mae", "patchify", "unpatchify"]
 class PatchEmbed(nn.Module):
     """Conv2d patch tokeniser: ``(B,C,H,W) -> (B, nh*nw, embed_dim)``."""
 
-    def __init__(self, patch_size: Tuple[int, int] = (4, 64), in_chans: int = 1, embed_dim: int = 128):
+    def __init__(self, patch_size: Tuple[int, int] = (16, 16), in_chans: int = 1, embed_dim: int = 128):
         super().__init__()
         ph, pw = patch_size
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=(ph, pw), stride=(ph, pw))
@@ -66,68 +86,86 @@ def unpatchify(patches: torch.Tensor, patch_size: Tuple[int, int], shape: Tuple[
     return x.reshape(b, c, h, w)
 
 
-def _sample_random_ids(
+def _sample_random_masked_ids(
     batch_size: int,
     num_patches: int,
-    len_keep: int,
+    n_masked: int,
     device: torch.device,
     generator: Optional[torch.Generator] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """He-style random token removal: exactly ``len_keep`` visible per sample.
-
-    Returns ``(ids_keep, ids_restore)``: ``ids_keep`` is ``(B, len_keep)``
-    int64 indices into ``[0, N)``; ``ids_restore`` is ``(B, N)`` int64 such
-    that gathering ``cat([x_vis, mask_tokens], dim=1)`` with ``ids_restore``
-    recovers the original ``k=0..N-1`` patch order.
-    """
+) -> torch.Tensor:
+    """He-style scattered masking: ``(B, n_masked)`` int64 masked-patch indices."""
     noise = torch.rand(batch_size, num_patches, device=device, generator=generator)
-    ids_shuffle = noise.argsort(dim=1)
-    ids_restore = ids_shuffle.argsort(dim=1)
-    ids_keep = ids_shuffle[:, :len_keep]
-    return ids_keep, ids_restore
+    return noise.argsort(dim=1)[:, :n_masked]
 
 
-def _partition_ids(batch_size: int, nh: int, nw: int, group: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Deterministic inference partition: patch row ``group`` is "visible".
+def _sample_cluster_masked_ids(
+    batch_size: int,
+    nh: int,
+    nw: int,
+    n_masked: int,
+    c_min: int,
+    c_max: int,
+    device: torch.device,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """SSAST MSPM cluster masking: ``(B, n_masked)`` int64 masked-patch indices.
 
-    Same ``(ids_keep, ids_restore)`` contract as ``_sample_random_ids``, used
-    by ``ViTMAE.forward``'s ``nh``-pass partitioned reconstruction.
+    Per sample, stamp ``C x C`` blocks (``C ~ unif{c_min, c_max}``, fresh per
+    block, clipped to the grid) at random seed positions until at least
+    ``n_masked`` patches are covered, then trim to exactly ``n_masked`` (row-major
+    order; the surplus is only the final block's overshoot). The fixed count per
+    sample keeps the batch rectangular for the InfoNCE objective.
+
+    Sampling/stamping is done in NumPy on the CPU and transferred to ``device``
+    once — the per-block Python loop must not touch the GPU (a per-block
+    ``.item()`` sync would dominate the step time and throttle training). A
+    single int is drawn from ``generator`` to seed NumPy so the result stays
+    reproducible under Lightning's ``seed_everything``.
     """
-    num_patches = nh * nw
-    visible = torch.arange(group * nw, (group + 1) * nw, device=device)
-    masked = torch.cat([torch.arange(0, group * nw, device=device),
-                         torch.arange((group + 1) * nw, num_patches, device=device)])
-    ids_shuffle = torch.cat([visible, masked])
-    ids_restore = ids_shuffle.argsort().unsqueeze(0).expand(batch_size, -1)
-    ids_keep = visible.unsqueeze(0).expand(batch_size, -1)
-    return ids_keep, ids_restore
+    seed = int(torch.randint(0, 2 ** 31 - 1, (1,), generator=generator).item())
+    rng = np.random.default_rng(seed)
+    out = np.empty((batch_size, n_masked), dtype=np.int64)
+    for b in range(batch_size):
+        grid = np.zeros((nh, nw), dtype=bool)
+        while grid.sum() < n_masked:
+            c = int(rng.integers(c_min, c_max + 1))
+            si = int(rng.integers(0, nh))
+            sj = int(rng.integers(0, nw))
+            grid[si:si + c, sj:sj + c] = True  # NumPy slicing clips at the grid edge
+        out[b] = np.flatnonzero(grid.ravel())[:n_masked]
+    return torch.from_numpy(out).to(device)
+
+
+def _partition_groups(num_patches: int, n_groups: int, device: torch.device) -> list:
+    """Disjoint round-robin partition of ``[0, N)`` into ``n_groups`` groups.
+
+    Used by partitioned inference (``forward`` / ``infonce`` scoring): each pass
+    keeps one group *visible* and masks the rest, so every patch is predicted
+    from context that never includes itself (anti-copy), at a mask ratio of
+    ``(n_groups-1)/n_groups`` matching training.
+    """
+    ids = torch.arange(num_patches, device=device)
+    return [ids[g::n_groups] for g in range(n_groups)]
 
 
 class ViTMAE(nn.Module):
-    """ViT Masked Autoencoder, scored by masked-patch reconstruction error.
-
-    Training (``compute_loss``): a fresh random subset of
-    ``N * (1 - mask_ratio)`` patch tokens is encoded; the decoder reconstructs
-    all ``N`` patches from those tokens plus a shared mask token; loss is the
-    pixel-space masked MSE over the dropped patches only.
-
-    Inference (``forward``): deterministic ``nh``-pass partitioned
-    reconstruction — each grid row is, in turn, the "visible" group — so every
-    patch is reconstructed from context that never includes itself.
-    """
+    """SSAST-style ViT masked autoencoder with a joint discriminative+generative loss."""
 
     def __init__(
         self,
         input_shape: Tuple[int, int, int],
-        patch_size: Tuple[int, int] = (4, 64),
+        patch_size: Tuple[int, int] = (16, 16),
         embed_dim: int = 128,
         depth: int = 6,
         num_heads: int = 4,
-        decoder_embed_dim: int = 64,
-        decoder_depth: int = 2,
-        decoder_num_heads: int = 4,
         mlp_ratio: int = 4,
         mask_ratio: float = 0.75,
+        loss_mode: str = "joint",
+        mask_mode: str = "cluster",
+        cluster_factor: Tuple[int, int] = (3, 5),
+        infonce_lambda: float = 10.0,
+        infonce_temperature: float = 0.07,
+        scoring: str = "embedding",
         norm_pix_loss: bool = False,
     ):
         super().__init__()
@@ -138,6 +176,10 @@ class ViTMAE(nn.Module):
                 f"Input spatial dims {(h, w)} must be divisible by patch_size "
                 f"{patch_size} for ViT-MAE patch tokenisation."
             )
+        if loss_mode not in ("generative", "discriminative", "joint"):
+            raise ValueError(f"Unknown loss_mode '{loss_mode}'.")
+        if mask_mode not in ("random", "cluster"):
+            raise ValueError(f"Unknown mask_mode '{mask_mode}'.")
 
         self.input_shape = (c, h, w)
         self.patch_size = patch_size
@@ -146,10 +188,19 @@ class ViTMAE(nn.Module):
         self.num_patches = nh * nw
         self.patch_dim = ph * pw * c
         self.mask_ratio = mask_ratio
+        self.loss_mode = loss_mode
+        self.mask_mode = mask_mode
+        self.cluster_factor = (int(cluster_factor[0]), int(cluster_factor[1]))
+        self.infonce_lambda = infonce_lambda
+        self.infonce_temperature = infonce_temperature
+        self.scoring = scoring
         self.norm_pix_loss = norm_pix_loss
+        self._discriminative = loss_mode in ("discriminative", "joint")
 
         self.patch_embed = PatchEmbed(patch_size, in_chans=c, embed_dim=embed_dim)
-        self.encoder_pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
@@ -161,80 +212,206 @@ class ViTMAE(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth, norm=nn.LayerNorm(embed_dim))
 
-        self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim)
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
-        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, decoder_embed_dim))
-        decoder_layer = nn.TransformerEncoderLayer(
-            d_model=decoder_embed_dim,
-            nhead=decoder_num_heads,
-            dim_feedforward=decoder_embed_dim * mlp_ratio,
-            dropout=0.0,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+        self.reconstruction_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Linear(embed_dim, self.patch_dim)
         )
-        self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=decoder_depth, norm=nn.LayerNorm(decoder_embed_dim))
-        self.decoder_pred = nn.Linear(decoder_embed_dim, self.patch_dim)
+        if self._discriminative:
+            self.classification_head = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Linear(embed_dim, self.patch_dim)
+            )
 
         self._init_weights()
 
     def _init_weights(self) -> None:
-        nn.init.trunc_normal_(self.encoder_pos_embed, std=0.02)
-        nn.init.trunc_normal_(self.decoder_pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.mask_token, std=0.02)
 
-    def _decode_from_keep(self, x: torch.Tensor, ids_keep: torch.Tensor, ids_restore: torch.Tensor) -> torch.Tensor:
-        """Shared encode-decode path: ``(B,C,H,W)`` -> ``(B,N,patch_dim)``."""
-        embed_dim = self.encoder_pos_embed.shape[-1]
-        dec_dim = self.decoder_pos_embed.shape[-1]
-        b = x.shape[0]
+    @property
+    def n_masked(self) -> int:
+        return int(round(self.mask_ratio * self.num_patches))
 
-        tokens = self.patch_embed(x) + self.encoder_pos_embed          # (B,N,De)
-        x_vis = tokens.gather(1, ids_keep.unsqueeze(-1).expand(-1, -1, embed_dim))
-        x_vis = self.encoder(x_vis)                                     # (B,K,De)
+    # ---- core encode path (in-place mask substitution) ----
 
-        x_vis = self.decoder_embed(x_vis)                               # (B,K,Dd)
-        mask_tokens = self.mask_token.expand(b, self.num_patches - x_vis.shape[1], -1)
-        x_full = torch.cat([x_vis, mask_tokens], dim=1)                 # shuffled order
-        x_full = x_full.gather(1, ids_restore.unsqueeze(-1).expand(-1, -1, dec_dim))
-        x_full = x_full + self.decoder_pos_embed                        # original order
-        x_full = self.decoder(x_full)
-        return self.decoder_pred(x_full)                                # (B,N,patch_dim)
+    def _encode(self, x: torch.Tensor, mask_bool: Optional[torch.Tensor]) -> torch.Tensor:
+        """``(B,C,H,W)`` + optional ``(B,N)`` bool mask -> encoder output ``(B,N,De)``.
 
-    def compute_loss(self, x: torch.Tensor) -> torch.Tensor:
-        """Scalar training loss: masked-patch reconstruction error."""
+        Masked positions (``mask_bool`` True) get their patch embedding replaced
+        by the shared ``mask_token``; positional embedding is then added to all.
+        ``mask_bool=None`` means no masking (used by ``encode``).
+        """
+        tokens = self.patch_embed(x)  # (B,N,De)
+        if mask_bool is not None:
+            m = mask_bool.unsqueeze(-1).to(tokens.dtype)
+            tokens = tokens * (1.0 - m) + self.mask_token * m
+        tokens = tokens + self.pos_embed
+        return self.encoder(tokens)
+
+    def _mask_from_ids(self, ids_masked: torch.Tensor) -> torch.Tensor:
+        """``(B, n_masked)`` indices -> ``(B, N)`` bool mask (True = masked)."""
+        b = ids_masked.shape[0]
+        mask = torch.zeros(b, self.num_patches, dtype=torch.bool, device=ids_masked.device)
+        mask.scatter_(1, ids_masked, True)
+        return mask
+
+    def _sample_masked_ids(self, b: int, device: torch.device,
+                           generator: Optional[torch.Generator] = None) -> torch.Tensor:
+        if self.mask_mode == "cluster":
+            nh, nw = self.grid_size
+            return _sample_cluster_masked_ids(
+                b, nh, nw, self.n_masked, self.cluster_factor[0], self.cluster_factor[1],
+                device, generator)
+        return _sample_random_masked_ids(b, self.num_patches, self.n_masked, device, generator)
+
+    # ---- training ----
+
+    def _generative_loss(self, pred_patches: torch.Tensor, target_patches: torch.Tensor,
+                         mask_bool: torch.Tensor) -> torch.Tensor:
+        """Masked per-patch MSE (mean over masked patches). ``mask_bool`` is ``(B,N)``."""
+        per_patch = ((pred_patches - target_patches) ** 2).mean(dim=-1)  # (B,N)
+        m = mask_bool.to(per_patch.dtype)
+        return (per_patch * m).sum() / (m.sum() + 1e-8)
+
+    def _infonce_loss(self, O: torch.Tensor, target_patches: torch.Tensor,
+                      ids_masked: torch.Tensor) -> torch.Tensor:
+        """SSAST discriminative loss: identify the correct raw patch among masked.
+
+        For each masked position the classification head predicts ``c_i``; the
+        InfoNCE logits are ``c_i . x_j`` over all masked ``j`` in the *same*
+        sample (negatives), with the diagonal as the positive. Both are
+        L2-normalised (cosine logits in [-1, 1]); ``infonce_temperature`` must be
+        small (~0.07) so the softmax can concentrate over the ~M candidates —
+        otherwise the loss is floored near ``log(M)`` and the objective is inert.
+        """
+        d = O.shape[-1]
+        c = self.classification_head(
+            O.gather(1, ids_masked.unsqueeze(-1).expand(-1, -1, d))
+        )  # (B, M, patch_dim)
+        x = target_patches.gather(
+            1, ids_masked.unsqueeze(-1).expand(-1, -1, self.patch_dim)
+        )  # (B, M, patch_dim)
+        c = F.normalize(c, dim=-1)
+        x = F.normalize(x, dim=-1)
+        logits = torch.bmm(c, x.transpose(1, 2)) / self.infonce_temperature  # (B, M, M)
+        b, m, _ = logits.shape
+        labels = torch.arange(m, device=logits.device).expand(b, m).reshape(-1)
+        return F.cross_entropy(logits.reshape(b * m, m), labels)
+
+    def compute_loss(self, x: torch.Tensor):
+        """Training loss.
+
+        Returns a scalar for ``generative``/``discriminative`` ``loss_mode``, and a
+        ``(total, {"recon_loss":…, "infonce_loss":…})`` tuple for ``joint`` — the
+        tuple path is handled by the Lightning trainer exactly like the VAE.
+        """
         if self.norm_pix_loss:
             raise NotImplementedError("norm_pix_loss=True is not yet implemented")
-        b, n = x.shape[0], self.num_patches
-        len_keep = n - int(self.mask_ratio * n)
-        ids_keep, ids_restore = _sample_random_ids(b, n, len_keep, device=x.device)
-        pred_patches = self._decode_from_keep(x, ids_keep, ids_restore)
+        b = x.shape[0]
+        ids_masked = self._sample_masked_ids(b, x.device)
+        mask_bool = self._mask_from_ids(ids_masked)
+        O = self._encode(x, mask_bool)
+        target_patches = patchify(x, self.patch_size)
 
-        mask = torch.ones(b, n, device=x.device, dtype=x.dtype)
-        mask[:, :len_keep] = 0
-        mask = mask.gather(1, ids_restore)  # (B,N), 1=masked, original patch order
+        if self.loss_mode == "discriminative":
+            return self._infonce_loss(O, target_patches, ids_masked)
 
-        nh, nw = self.grid_size
-        ph, pw = self.patch_size
-        pred = unpatchify(pred_patches, self.patch_size, (b, *self.input_shape))
-        pixel_mask = mask.view(b, 1, nh, nw).repeat_interleave(ph, dim=2).repeat_interleave(pw, dim=3)
-        return _masked_mse(x, pred, pixel_mask)
+        pred_patches = self.reconstruction_head(O)
+        recon = self._generative_loss(pred_patches, target_patches, mask_bool)
+        if self.loss_mode == "generative":
+            return recon
+
+        infonce = self._infonce_loss(O, target_patches, ids_masked)
+        total = infonce + self.infonce_lambda * recon
+        return total, {"recon_loss": recon, "infonce_loss": infonce}
+
+    # ---- inference ----
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Mean-pooled encoder embedding ``(B, embed_dim)`` (no masking).
+
+        Feature extractor for the ``embedding`` anomaly score (one-class
+        classifier). Because training uses in-place masking, the unmasked
+        forward here is the same token regime minus the substitution.
+        """
+        O = self._encode(x, mask_bool=None)
+        return O.mean(dim=1)
+
+    def _n_groups(self) -> int:
+        """Partition group count whose mask ratio ``(G-1)/G`` matches ``mask_ratio``."""
+        return max(2, int(round(1.0 / (1.0 - self.mask_ratio))))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Deterministic ``nh``-pass partitioned reconstruction."""
-        b, n = x.shape[0], self.num_patches
-        nh, nw = self.grid_size
-        accum = torch.zeros(b, n, self.patch_dim, device=x.device, dtype=x.dtype)
-        counts = torch.zeros(n, device=x.device, dtype=x.dtype)
-        for g in range(nh):
-            ids_keep, ids_restore = _partition_ids(b, nh, nw, g, x.device)
-            pred_patches = self._decode_from_keep(x, ids_keep, ids_restore)
-            masked = torch.ones(n, device=x.device, dtype=x.dtype)
-            masked[g * nw:(g + 1) * nw] = 0.0
-            accum += pred_patches * masked.view(1, n, 1)
-            counts += masked
-        pred_patches = accum / counts.view(1, n, 1)  # counts == nh-1 everywhere
+        """Deterministic partitioned reconstruction ``(B,C,H,W)``.
+
+        Each of ``G`` passes keeps one round-robin group visible and masks the
+        rest; a patch's reconstruction is averaged over the passes where it was
+        masked. Used by the ``recon`` anomaly score.
+        """
+        b = x.shape[0]
+        groups = _partition_groups(self.num_patches, self._n_groups(), x.device)
+        accum = torch.zeros(b, self.num_patches, self.patch_dim, device=x.device, dtype=x.dtype)
+        counts = torch.zeros(self.num_patches, device=x.device, dtype=x.dtype)
+        for visible in groups:
+            mask_bool = torch.ones(b, self.num_patches, dtype=torch.bool, device=x.device)
+            mask_bool[:, visible] = False
+            O = self._encode(x, mask_bool)
+            pred_patches = self.reconstruction_head(O)
+            masked_f = mask_bool[0].to(x.dtype)  # same group structure across batch
+            accum += pred_patches * masked_f.view(1, -1, 1)
+            counts += masked_f
+        pred_patches = accum / counts.view(1, -1, 1).clamp_min(1.0)
         return unpatchify(pred_patches, self.patch_size, (b, *self.input_shape))
+
+    @torch.no_grad()
+    def anomaly_score(self, x: torch.Tensor, method: Optional[str] = None, occ=None) -> torch.Tensor:
+        """Per-sample anomaly score ``(B,)``.
+
+        ``method``: ``recon`` (partitioned reconstruction MSE), ``infonce``
+        (per-patch self-recognition difficulty), or ``embedding`` (one-class
+        classifier ``occ`` on ``encode(x)``). Defaults to ``self.scoring``.
+        """
+        method = method or self.scoring
+        if method == "recon":
+            recon = self.forward(x)
+            return ((x - recon) ** 2).mean(dim=(1, 2, 3))
+        if method == "infonce":
+            return self._infonce_score(x)
+        if method == "embedding":
+            if occ is None:
+                raise ValueError("method='embedding' requires a fitted one-class classifier `occ`.")
+            return torch.as_tensor(occ.score(self.encode(x).cpu().numpy()), device=x.device)
+        raise ValueError(f"Unknown scoring method '{method}'.")
+
+    def _infonce_score(self, x: torch.Tensor) -> torch.Tensor:
+        """Partitioned per-patch self-recognition difficulty, averaged per sample.
+
+        For each masked patch the discriminative head must recognise its own raw
+        patch among the masked set; the negative log-probability of the correct
+        match is the per-patch anomaly score. Requires the classification head.
+        """
+        if not self._discriminative:
+            raise ValueError("infonce scoring requires loss_mode 'discriminative' or 'joint'.")
+        b = x.shape[0]
+        target_patches = patchify(x, self.patch_size)
+        groups = _partition_groups(self.num_patches, self._n_groups(), x.device)
+        score = torch.zeros(b, device=x.device)
+        counts = 0
+        for visible in groups:
+            mask_bool = torch.ones(b, self.num_patches, dtype=torch.bool, device=x.device)
+            mask_bool[:, visible] = False
+            ids_masked = mask_bool[0].nonzero(as_tuple=False).squeeze(1).unsqueeze(0).expand(b, -1)
+            O = self._encode(x, mask_bool)
+            d = O.shape[-1]
+            c = F.normalize(self.classification_head(
+                O.gather(1, ids_masked.unsqueeze(-1).expand(-1, -1, d))), dim=-1)
+            xt = F.normalize(target_patches.gather(
+                1, ids_masked.unsqueeze(-1).expand(-1, -1, self.patch_dim)), dim=-1)
+            logits = torch.bmm(c, xt.transpose(1, 2)) / self.infonce_temperature  # (B,M,M)
+            m = logits.shape[1]
+            logp = F.log_softmax(logits, dim=-1)
+            diag = logp.diagonal(dim1=1, dim2=2)  # (B, M) log p(correct)
+            score += (-diag).mean(dim=1)
+            counts += 1
+        return score / max(counts, 1)
 
 
 def build_vit_mae(
@@ -246,20 +423,23 @@ def build_vit_mae(
     """Build a ``ViTMAE`` from a merged ``configs/model/vit_mae.yaml``.
 
     ``loss``/``learning_rate`` are accepted only for call-site parity with the
-    other ``build_autoencoder`` branches — ``ViTMAE.compute_loss`` always uses
-    ``_masked_mse`` (hardcoded MSE), same as the CNN ``MAE``.
-    ``model.learning_rate`` is set by ``build_autoencoder``, not here.
+    other ``build_autoencoder`` branches; ``ViTMAE`` hardcodes its objective
+    (masked-patch MSE + InfoNCE). ``model.learning_rate`` is set by
+    ``build_autoencoder``, not here.
     """
     return ViTMAE(
         input_shape=input_shape,
-        patch_size=tuple(model_config.get("patch_size", (4, 64))),
+        patch_size=tuple(model_config.get("patch_size", (16, 16))),
         embed_dim=int(model_config.get("embed_dim", 128)),
         depth=int(model_config.get("depth", 6)),
         num_heads=int(model_config.get("num_heads", 4)),
-        decoder_embed_dim=int(model_config.get("decoder_embed_dim", 64)),
-        decoder_depth=int(model_config.get("decoder_depth", 2)),
-        decoder_num_heads=int(model_config.get("decoder_num_heads", 4)),
         mlp_ratio=int(model_config.get("mlp_ratio", 4)),
         mask_ratio=float(model_config.get("mask_ratio", 0.75)),
+        loss_mode=str(model_config.get("loss_mode", "joint")),
+        mask_mode=str(model_config.get("mask_mode", "cluster")),
+        cluster_factor=tuple(model_config.get("cluster_factor", (3, 5))),
+        infonce_lambda=float(model_config.get("infonce_lambda", 10.0)),
+        infonce_temperature=float(model_config.get("infonce_temperature", 0.07)),
+        scoring=str(model_config.get("scoring", "embedding")),
         norm_pix_loss=bool(model_config.get("norm_pix_loss", False)),
     )
