@@ -214,7 +214,7 @@ class ViTMAE(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth, norm=nn.LayerNorm(embed_dim))
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth, norm=nn.LayerNorm(embed_dim), enable_nested_tensor=False)
 
         self.reconstruction_head = nn.Sequential(
             nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Linear(embed_dim, self.patch_dim)
