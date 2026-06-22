@@ -20,7 +20,7 @@ Reuses the injection/preprocess helpers from injection_vs_rfi_test.py.
 Usage (run on the server, not the dev machine):
     PYTHONPATH=. python scripts/debug/ssast_scoring_test.py \
         --checkpoint outputs/<run>/checkpoints/best_model.ckpt \
-        --cache /path/to/cache_gbt_fine.npz \
+        --cache /path/to/cache_gbt_fine \
         --data_config configs/data/gbt_fine.yaml \
         --model_config configs/model/vit_mae.yaml \
         --n_samples 100 --inject_snr 25 \
@@ -76,7 +76,7 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--checkpoint", type=Path, required=True)
-    p.add_argument("--cache", type=Path, required=True, help="NPZ cache path")
+    p.add_argument("--cache", type=Path, required=True, help="Cache directory path")
     p.add_argument("--split", default="train")
     p.add_argument("--data_config", type=Path, default=ROOT / "configs/data/gbt_fine.yaml")
     p.add_argument("--model_config", type=Path, default=ROOT / "configs/model/vit_mae.yaml")
@@ -102,12 +102,12 @@ def main():
     print(f"Loading model from {args.checkpoint}")
     model = load_model(args.checkpoint, model_cfg, args.device)
 
-    print(f"Loading NPZ: {args.cache}")
-    archive = np.load(str(args.cache), mmap_mode="r")
-    arr = archive[args.split]
+    npy_path = Path(args.cache) / f"{args.split}.npy"
+    print(f"Loading cache: {npy_path}")
+    arr = np.load(str(npy_path), mmap_mode="r")
     indices = rng.choice(arr.shape[0], size=min(args.n_samples, arr.shape[0]), replace=False)
     raw_snippets = np.array(arr[indices])
-    del arr, archive
+    del arr
     print(f"  Raw snippets: {raw_snippets.shape}")
 
     # Preprocess + categorise by RFI content (hot-pixel fraction).

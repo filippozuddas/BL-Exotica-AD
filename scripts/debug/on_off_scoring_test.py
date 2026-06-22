@@ -1,4 +1,10 @@
 """
+DEPRECATED (2026-06-19): targets the old He-style token-removal ViT-MAE and calls
+``model._decode_from_keep``, which no longer exists after the SSAST-style in-place
+rewrite of ``src/models/vit_mae.py``. Superseded by ``ssast_scoring_test.py``
+(three anomaly scores: recon / infonce / embedding). Kept for reference only; will
+error if run against the current model.
+
 ON/OFF cadence-aware scoring test (Zhang et al. 2019 approach).
 
 Exploits the ABACAD cadence: ETI appears only in ON obs (0,2,4), RFI in all 6.
@@ -19,7 +25,7 @@ Runs an SNR sweep to characterize detection sensitivity.
 Usage:
     python scripts/debug/on_off_scoring_test.py \
         --checkpoint outputs/.../best_model.ckpt \
-        --cache /path/to/cache_gbt_fine.npz \
+        --cache /path/to/cache_gbt_fine \
         --model_config configs/model/vit_mae.yaml \
         --out_dir outputs/on_off_test
 """
@@ -204,15 +210,15 @@ def main():
     print(f"Loading model from {args.checkpoint}")
     model = load_model(args.checkpoint, model_cfg, args.device)
 
-    print(f"Loading NPZ: {args.cache}")
-    archive = np.load(str(args.cache), mmap_mode="r")
-    arr = archive[args.split]
+    npy_path = Path(args.cache) / f"{args.split}.npy"
+    print(f"Loading cache: {npy_path}")
+    arr = np.load(str(npy_path), mmap_mode="r")
     n_total = arr.shape[0]
 
     n_scan = min(200, n_total)
     scan_idx = rng.choice(n_total, size=n_scan, replace=False)
     scan_raw = np.array(arr[scan_idx])
-    del arr, archive
+    del arr
 
     hot_fracs = []
     preprocessed = []

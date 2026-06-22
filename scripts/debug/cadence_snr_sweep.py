@@ -14,7 +14,7 @@ Usage (run on the server, not the dev machine):
     CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
     python scripts/debug/cadence_snr_sweep.py \
         --checkpoint outputs/<run>/checkpoints/last.ckpt \
-        --cache /path/to/cache_gbt_fine.npz \
+        --cache /path/to/cache_gbt_fine \
         --out_dir outputs/cadence_snr_sweep
 """
 
@@ -89,12 +89,12 @@ def main():
     print(f"Loading model from {args.checkpoint}")
     model = load_model(args.checkpoint, model_cfg, args.device)
 
-    print(f"Loading NPZ: {args.cache}")
-    archive = np.load(str(args.cache), mmap_mode="r")
-    arr = archive[args.split]
+    npy_path = Path(args.cache) / f"{args.split}.npy"
+    print(f"Loading cache: {npy_path}")
+    arr = np.load(str(npy_path), mmap_mode="r")
     indices = rng.choice(arr.shape[0], size=min(args.n_samples, arr.shape[0]), replace=False)
     raw_snippets = np.array(arr[indices])
-    del arr, archive
+    del arr
     print(f"  Raw snippets: {raw_snippets.shape}")
 
     preprocessed, hot_fracs = [], []

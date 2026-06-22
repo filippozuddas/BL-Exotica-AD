@@ -9,17 +9,17 @@ core_transform), exactly as the model sees them. After core_transform the
 noise is approximately Gaussian centred at 0 with MAD=1 (std ~1.48).
 
 Two data sources are supported (auto-detected):
-  --cache   path to the NPZ cache (CachedDataset format).
-            Shape: (N, n_obs, tchans_per_obs, fchans), raw power values.
-            Opened with mmap_mode='r' so only the sampled rows are loaded.
+  --cache   path to the cache directory (contains train.npy, val.npy).
+            Shape per .npy: (N, n_obs, tchans_per_obs, fchans), raw power values.
+            Loaded with mmap_mode='r' so only the sampled rows hit RAM.
   --cadences / --data_config
             fallback: load from raw HDF5 files via SpectrogramDataset.
 
 Usage
 -----
-    # preferred — uses existing NPZ cache with memory-mapping
+    # preferred — uses .npy cache with memory-mapping
     PYTHONPATH=. python scripts/debug/rfi_composition_analysis.py \\
-        --cache /home/acabras/data/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine.npz \\
+        --cache /home/acabras/data/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine \\
         --data_config configs/data/gbt_fine.yaml \\
         --split train \\
         --n_samples 3000 \\
@@ -88,49 +88,39 @@ def compute_metrics(snippet: np.ndarray) -> dict:
 # Data sources
 # ---------------------------------------------------------------------------
 
-class NpzSampler:
+class CacheSampler:
     """
-    Random-access sampler over a CachedDataset NPZ.
+    Random-access sampler over a mmap'd .npy cache directory.
 
-    To avoid loading the full file (potentially 60+ GB) into RAM, we:
-      1. Open the NPZ with mmap_mode='r' to get the array shape cheaply.
-      2. Let the caller generate random indices (via set_indices).
-      3. Load ONLY those rows in one contiguous read (~n_samples × snippet_bytes).
-      4. Close the mmap immediately.
+    Uses mmap to avoid loading the full file into RAM — only the requested
+    rows are copied when set_indices() is called.
 
     set_indices() must be called before __getitem__().
     """
 
-    def __init__(self, npz_path: Path, split: str, cfg_preproc: dict):
-        print(f"Peeking at NPZ shape (mmap_mode='r'): {npz_path}")
-        archive = np.load(str(npz_path), mmap_mode="r")
-        arr = archive[split]                # mmap — shape known, data not loaded
-        self._shape = arr.shape             # (N, n_obs, tchans_per_obs, fchans)
-        self._n_total = arr.shape[0]
+    def __init__(self, cache_dir: Path, split: str, cfg_preproc: dict):
+        npy_path = cache_dir / f"{split}.npy"
+        print(f"Memory-mapping cache: {npy_path}")
+        self._mmap = np.load(str(npy_path), mmap_mode="r")
+        self._shape = self._mmap.shape       # (N, n_obs, tchans_per_obs, fchans)
+        self._n_total = self._mmap.shape[0]
         self.cfg_preproc = cfg_preproc
-        self._npz_path = npz_path
-        self._split = split
         self._data: np.ndarray | None = None
         self._indices: list | None = None
-        print(f"  split='{split}'  full shape={arr.shape}  "
-              f"dtype={arr.dtype}  "
-              f"full size ~{arr.nbytes / 1e9:.1f} GB")
-        del arr, archive   # release mmap immediately
+        print(f"  split='{split}'  full shape={self._mmap.shape}  "
+              f"dtype={self._mmap.dtype}  "
+              f"full size ~{self._mmap.nbytes / 1e9:.1f} GB")
 
     def __len__(self) -> int:
         return self._n_total
 
     def set_indices(self, indices: list) -> None:
-        """Load only the requested rows from disk into RAM."""
-        sorted_pos = np.argsort(indices)          # sort for sequential disk access
+        """Load only the requested rows from the mmap into RAM."""
+        sorted_pos = np.argsort(indices)
         sorted_idx = np.array(indices)[sorted_pos]
-        print(f"Loading {len(indices)} rows from NPZ "
+        print(f"Loading {len(indices)} rows from mmap "
               f"(~{len(indices) * np.prod(self._shape[1:]) * 4 / 1e9:.2f} GB)...")
-        archive = np.load(str(self._npz_path), mmap_mode="r")
-        arr = archive[self._split]
-        rows = np.array(arr[sorted_idx])          # only these rows hit RAM
-        del arr, archive
-        # restore original order so self._data[i] corresponds to indices[i]
+        rows = np.array(self._mmap[sorted_idx])
         self._data = rows[np.argsort(sorted_pos)]
         self._indices = list(range(len(indices)))
         print("  Done.")
@@ -280,7 +270,7 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--cache",        type=Path, default=None,
-                   help="Path to NPZ cache (preferred). If set, --cadences is ignored.")
+                   help="Path to cache directory (preferred). If set, --cadences is ignored.")
     p.add_argument("--split",        default="train",
                    help="NPZ split to analyse: 'train' or 'val'. Default: train.")
     p.add_argument("--cadences",     type=Path, default=None,
@@ -306,7 +296,7 @@ def main():
 
     # --- build sampler ---
     if args.cache is not None:
-        sampler = NpzSampler(args.cache, args.split, preproc)
+        sampler = CacheSampler(args.cache, args.split, preproc)
     elif args.cadences is not None:
         sampler = DatasetSampler(args.cadences, cfg, args.max_cadences)
     else:
@@ -322,7 +312,7 @@ def main():
     print(f"\nTotal snippets: {n_total}  →  sampling {n_samples}")
 
     # For the NPZ path, pre-load only the sampled rows before iterating.
-    if isinstance(sampler, NpzSampler):
+    if isinstance(sampler, CacheSampler):
         sampler.set_indices(indices)
         local_indices = list(range(n_samples))   # iterate over local positions
     else:

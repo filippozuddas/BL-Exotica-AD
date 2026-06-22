@@ -12,7 +12,7 @@ Red dashed lines mark ON/OFF observation boundaries.
 Usage:
     python scripts/debug/ae_recon_visual.py \
         --checkpoint outputs/.../best_model.ckpt \
-        --cache /path/to/cache_gbt_fine.npz \
+        --cache /path/to/cache_gbt_fine \
         --model_config configs/model/convae.yaml \
         --n_examples 4 --inject_snr 25
 """
@@ -127,16 +127,16 @@ def main():
     print(f"Loading model from {args.checkpoint}")
     model = load_model(args.checkpoint, model_cfg, args.device)
 
-    print(f"Loading NPZ: {args.cache}")
-    archive = np.load(str(args.cache), mmap_mode="r")
-    arr = archive[args.split]
+    npy_path = Path(args.cache) / f"{args.split}.npy"
+    print(f"Loading cache: {npy_path}")
+    arr = np.load(str(npy_path), mmap_mode="r")
     n_total = arr.shape[0]
 
     # Pick quiet snippets (low hot_frac)
     n_scan = min(200, n_total)
     scan_idx = rng.choice(n_total, size=n_scan, replace=False)
     scan_raw = np.array(arr[scan_idx])
-    del arr, archive
+    del arr
 
     hot_fracs = []
     for i in range(n_scan):

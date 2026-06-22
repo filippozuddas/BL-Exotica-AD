@@ -51,5 +51,5 @@ loader:
 
 dataset:
   cadence_list: data/raw/gbt_fine_cadences.txt  # one cadence per line, 6 space-separated paths
-  cache_file: /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine.npz  # uncomment after running scripts/preprocess_cache.py
+  cache_dir: /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine  # directory with train.npy, val.npy, meta.json
   seed: 42

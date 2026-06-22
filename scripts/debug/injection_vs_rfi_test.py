@@ -15,7 +15,7 @@ Three snippet categories:
 Usage:
     PYTHONPATH=. python scripts/debug/injection_vs_rfi_test.py \
         --checkpoint outputs/20260617_134719_dc9d83c/checkpoints/best_model.ckpt \
-        --cache /path/to/cache_gbt_fine.npz \
+        --cache /path/to/cache_gbt_fine \
         --data_config configs/data/gbt_fine.yaml \
         --n_samples 50 \
         --out_dir outputs/injection_test
@@ -146,7 +146,7 @@ def parse_args():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--cache", type=Path, required=True,
-                   help="NPZ cache path")
+                   help="Cache directory path")
     p.add_argument("--split", default="train")
     p.add_argument("--data_config", type=Path,
                    default=ROOT / "configs/data/gbt_fine.yaml")
@@ -179,15 +179,15 @@ def main():
     model = load_model(args.checkpoint, model_cfg, args.device)
     print(f"  Model loaded on {args.device}")
 
-    # --- Load snippets from NPZ ---
-    print(f"Loading NPZ: {args.cache}")
-    archive = np.load(str(args.cache), mmap_mode="r")
-    arr = archive[args.split]
+    # --- Load snippets from cache ---
+    npy_path = Path(args.cache) / f"{args.split}.npy"
+    print(f"Loading cache: {npy_path}")
+    arr = np.load(str(npy_path), mmap_mode="r")
     n_total = arr.shape[0]
     indices = rng.choice(n_total, size=min(args.n_samples, n_total), replace=False)
     print(f"  Loading {len(indices)} raw snippets...")
     raw_snippets = np.array(arr[indices])  # (n_samples, n_obs, tchans_per_obs, fchans)
-    del arr, archive
+    del arr
     print(f"  Shape: {raw_snippets.shape}")
 
     # --- Preprocess all and compute RFI metrics ---
