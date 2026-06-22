@@ -167,6 +167,8 @@ class ViTMAE(nn.Module):
         infonce_temperature: float = 0.07,
         scoring: str = "embedding",
         norm_pix_loss: bool = False,
+        cadence_n_obs: int = 6,
+        cadence_on_obs: Tuple[int, ...] = (0, 2, 4),
     ):
         super().__init__()
         h, w, c = input_shape
@@ -196,6 +198,8 @@ class ViTMAE(nn.Module):
         self.scoring = scoring
         self.norm_pix_loss = norm_pix_loss
         self._discriminative = loss_mode in ("discriminative", "joint")
+        self.cadence_n_obs = cadence_n_obs
+        self.cadence_on_obs = tuple(cadence_on_obs)
 
         self.patch_embed = PatchEmbed(patch_size, in_chans=c, embed_dim=embed_dim)
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
@@ -361,18 +365,53 @@ class ViTMAE(nn.Module):
         pred_patches = accum / counts.view(1, -1, 1).clamp_min(1.0)
         return unpatchify(pred_patches, self.patch_size, (b, *self.input_shape))
 
+    def _cadence_on_mask(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """``(B, N)`` bool mask: True for all ON-observation patches."""
+        nh, nw = self.grid_size
+        tchans_per_obs = (nh * self.patch_size[0]) // self.cadence_n_obs
+        rows_per_obs = tchans_per_obs // self.patch_size[0]
+        if rows_per_obs < 1 or nh < self.cadence_n_obs:
+            raise ValueError(
+                f"Cadence scoring requires grid height nh={nh} >= cadence_n_obs="
+                f"{self.cadence_n_obs} and patch_size[0]={self.patch_size[0]} "
+                f"to divide evenly into observation boundaries."
+            )
+        mask = torch.zeros(self.num_patches, dtype=torch.bool, device=device)
+        for obs_idx in self.cadence_on_obs:
+            start_row = obs_idx * rows_per_obs
+            for r in range(start_row, start_row + rows_per_obs):
+                mask[r * nw : (r + 1) * nw] = True
+        return mask.unsqueeze(0).expand(batch_size, -1)
+
+    def _cadence_score(self, x: torch.Tensor) -> torch.Tensor:
+        """Cadence-aware anomaly score: mask all ON, reconstruct from OFF context.
+
+        Single forward pass. Score = MSE on ON (masked) patches only.
+        """
+        b = x.shape[0]
+        mask_bool = self._cadence_on_mask(b, x.device)
+        O = self._encode(x, mask_bool)
+        pred_patches = self.reconstruction_head(O)
+        target_patches = patchify(x, self.patch_size)
+        on_mask = mask_bool[0].float()
+        diff_sq = (pred_patches - target_patches).pow(2).mean(dim=-1)
+        return (diff_sq * on_mask).sum(dim=1) / on_mask.sum()
+
     @torch.no_grad()
     def anomaly_score(self, x: torch.Tensor, method: Optional[str] = None, occ=None) -> torch.Tensor:
         """Per-sample anomaly score ``(B,)``.
 
-        ``method``: ``recon`` (partitioned reconstruction MSE), ``infonce``
-        (per-patch self-recognition difficulty), or ``embedding`` (one-class
-        classifier ``occ`` on ``encode(x)``). Defaults to ``self.scoring``.
+        ``method``: ``recon`` (partitioned reconstruction MSE), ``cadence``
+        (mask-ON/reconstruct-from-OFF), ``infonce`` (per-patch self-recognition
+        difficulty), or ``embedding`` (one-class classifier ``occ`` on
+        ``encode(x)``). Defaults to ``self.scoring``.
         """
         method = method or self.scoring
         if method == "recon":
             recon = self.forward(x)
             return ((x - recon) ** 2).mean(dim=(1, 2, 3))
+        if method == "cadence":
+            return self._cadence_score(x)
         if method == "infonce":
             return self._infonce_score(x)
         if method == "embedding":
@@ -442,4 +481,6 @@ def build_vit_mae(
         infonce_temperature=float(model_config.get("infonce_temperature", 0.07)),
         scoring=str(model_config.get("scoring", "embedding")),
         norm_pix_loss=bool(model_config.get("norm_pix_loss", False)),
+        cadence_n_obs=int(model_config.get("cadence_n_obs", 6)),
+        cadence_on_obs=tuple(model_config.get("cadence_on_obs", (0, 2, 4))),
     )

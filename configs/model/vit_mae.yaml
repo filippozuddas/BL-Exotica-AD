@@ -43,14 +43,19 @@ infonce_temperature: 0.07  # InfoNCE logit temperature. Embeddings are L2-normal
                            # (temp=1.0 floors the loss near log(n_masked) → inert).
 
 # --- Inference anomaly score ---
-#   embedding (default): encoder features + one-class classifier (src/search/scorer.py);
-#                        independent of reconstruction magnitude — best for narrowband.
-#   infonce: per-patch self-recognition difficulty.
-#   recon:   partitioned reconstruction MSE — for morphology-rich products (0001/0002).
-# NOTE: recon/infonce inference masks scattered round-robin patches, whereas training
-# masks C×C clusters — a train/inference masking-geometry shift that can depress those
-# two scores. The default embedding score (encode() uses no masking) sidesteps it.
+#   recon:      partitioned reconstruction MSE — empirically validated on 0000.fil
+#               (Inject-ON/Quiet=1.80x at SNR=25; det@3σ: 88% at SNR=20, 94% at SNR=25).
+#   cadence:    mask all ON observations, reconstruct from OFF-only context, score =
+#               MSE on ON patches. Eliminates ON→ON signal leakage (single pass).
+#               Only valid for cadence products (0000.fil, 0002.fil).
+#   infonce:    per-patch self-recognition difficulty (weak: 1.12x, not recommended).
+#   embedding:  encoder features + one-class classifier (failed: -0.05x, mean-pooling
+#               dilutes narrowband signal across 384 patches).
 scoring: recon
+
+# --- Cadence-aware scoring ---
+cadence_n_obs: 6             # observations per ABACAD cadence
+cadence_on_obs: [0, 2, 4]    # ON observation indices (0-indexed)
 
 # SSAST per-patch target normalisation: off (compute_loss raises if true).
 norm_pix_loss: false
