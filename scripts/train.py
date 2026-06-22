@@ -17,6 +17,7 @@ import logging
 import os
 from pathlib import Path
 
+import torch
 import yaml
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
