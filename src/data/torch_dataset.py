@@ -157,9 +157,32 @@ class SpectrogramDataset(Dataset):
             gb = self._obs_cache[path].nbytes / 1e9
             print(f"  {path.name}  {self._obs_cache[path].shape}  {gb:.2f} GB")
 
+        # Validate cadences: discard any where an observation has unexpected ntime.
+        # A malformed obs would corrupt the cadence structure (ON/OFF ordering),
+        # so the whole cadence is dropped rather than silently truncated.
+        valid_cadences = []
+        for cadence in cadence_paths:
+            n_obs = len(cadence)
+            if self.tchans % n_obs != 0:
+                names = [p.name for p in cadence]
+                print(f"  WARNING: skipping cadence — tchans={self.tchans} not divisible "
+                      f"by n_obs={n_obs}: {names}")
+                continue
+            expected_ntime = self.tchans // n_obs
+            bad = [p for p in cadence if self._obs_cache[p].shape[0] != expected_ntime]
+            if bad:
+                print(f"  WARNING: skipping cadence — unexpected ntime "
+                      f"(expected {expected_ntime}): {[p.name for p in bad]}")
+                continue
+            valid_cadences.append(cadence)
+        n_dropped = len(cadence_paths) - len(valid_cadences)
+        if n_dropped:
+            print(f"  Dropped {n_dropped}/{len(cadence_paths)} cadences with bad obs shapes.")
+        self.cadence_paths = valid_cadences
+
         # Build snippet index using nchans from the cached arrays.
         self.snippet_index: List[Tuple[int, int]] = []
-        for cad_idx, cadence in enumerate(cadence_paths):
+        for cad_idx, cadence in enumerate(self.cadence_paths):
             nchans = self._obs_cache[cadence[0]].shape[1]
             f_start = 0
             while f_start + fchans <= nchans:
@@ -188,28 +211,28 @@ class SpectrogramDataset(Dataset):
 
 class CachedDataset(Dataset):
     """
-    In-RAM dataset backed by a preprocessed NPZ cache (see scripts/preprocess_cache.py).
+    Memory-mapped dataset backed by per-split .npy files (see scripts/preprocess_cache.py).
 
-    Loads the entire split into a numpy array at init. Raw snippets have shape
-    (N, n_obs, tchans_per_obs, fchans). __getitem__ applies bandpass_correct +
-    core_transform per observation (fast — no I/O), concatenates along the time
-    axis, and returns a (1, tchans, fchans) float32 tensor.
+    Each split is a single .npy file inside a cache directory, loaded with
+    ``mmap_mode='r'`` so the OS pages data in on demand and forked DataLoader
+    workers share the same physical pages (no RAM duplication).
+
+    Raw snippets have shape (N, n_obs, tchans_per_obs, fchans). __getitem__
+    applies bandpass_correct + core_transform per observation, concatenates
+    along the time axis, and returns a (1, tchans, fchans) float32 tensor.
 
     Storing RAW data means preprocessing hyperparameters can be changed without
-    re-extracting the cache (same approach as RST background_extractor.py).
-
-    RAM cost: N × n_obs × tchans_per_obs × fchans × 4 bytes
-    (≈78 GB for 200k × 6 × 16 × 1024 float32).
+    re-extracting the cache.
     """
 
-    def __init__(self, npz_path: Path, split: str, cfg_preproc: Dict[str, Any]):
-        print(f"Loading {split} cache from {npz_path} into RAM...")
-        archive = np.load(str(npz_path))
-        self.data = archive[split]          # (N, n_obs, tchans_per_obs, fchans)
+    def __init__(self, cache_dir: Path, split: str, cfg_preproc: Dict[str, Any]):
+        npy_path = cache_dir / f"{split}.npy"
+        print(f"Memory-mapping {split} cache from {npy_path}...")
+        self.data = np.load(str(npy_path), mmap_mode="r")  # (N, n_obs, tchans_per_obs, fchans)
         self.cfg_preproc = cfg_preproc
         print(f"  {split}: {self.data.shape[0]} snippets  "
               f"shape={self.data.shape[1:]}  "
-              f"{self.data.nbytes / 1e9:.1f} GB in RAM")
+              f"~{self.data.nbytes / 1e9:.1f} GB on disk (mmap, not in RAM)")
 
     def __len__(self) -> int:
         return len(self.data)
@@ -248,12 +271,12 @@ def build_datasets(
 
     Returns:
         (train_dataset, val_dataset) pair of SpectrogramDatasets (lazy) or
-        CachedDatasets (if cfg_data["dataset"]["cache_file"] exists on disk).
+        CachedDatasets (if cfg_data["dataset"]["cache_dir"] exists on disk).
     """
-    cache_file = cfg_data.get("dataset", {}).get("cache_file")
-    if cache_file and Path(cache_file).exists():
+    cache_dir = cfg_data.get("dataset", {}).get("cache_dir")
+    if cache_dir and Path(cache_dir).is_dir():
         cfg_preproc = cfg_data["preprocessing"]
-        cache_path = Path(cache_file)
+        cache_path = Path(cache_dir)
         train_ds = CachedDataset(cache_path, "train", cfg_preproc)
         val_ds   = CachedDataset(cache_path, "val",   cfg_preproc)
         return train_ds, val_ds

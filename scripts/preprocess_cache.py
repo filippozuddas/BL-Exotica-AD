@@ -2,20 +2,25 @@
 Offline background extractor — BL Exotica Autoencoder.
 
 Scans a cadence manifest, splits cadences into train / inject-recovery pools,
-extracts RAW snippets from the train pool, and saves them to a compressed NPZ
-for fast in-RAM training.  The inject-recovery cadence list is written to a
-separate text file so Phase 2 (injection-recovery test) can use those cadences
-without any overlap with training data.
+extracts RAW snippets from the train pool, and saves them as per-split .npy
+files for memory-mapped training.  The inject-recovery cadence list is written
+to a separate text file so Phase 2 (injection-recovery test) can use those
+cadences without any overlap with training data.
 
-Output NPZ shape: (N, n_obs, tchans_per_obs, fchans) float32 — RAW, not
-normalized. Normalization (bandpass_correct + core_transform) happens in
+Output directory contains:
+  train.npy  — (N_train, n_obs, tchans_per_obs, fchans) float32 RAW
+  val.npy    — (N_val,   n_obs, tchans_per_obs, fchans) float32 RAW
+  meta.json  — extraction metadata
+
+Normalization (bandpass_correct + core_transform) happens in
 CachedDataset.__getitem__ so preprocessing hyperparameters can be changed
-without re-extracting the cache.
+without re-extracting the cache.  The .npy format enables np.load(mmap_mode='r')
+so DataLoader workers share physical memory pages instead of duplicating.
 
 Usage:
     PYTHONPATH=. python scripts/preprocess_cache.py \\
         --config    configs/training/srt_real.yaml \\
-        --output    data/processed/cache_gbt_fine.npz \\
+        --output    data/processed/cache_gbt_fine \\
         --snippets-per-cadence 3850 \\
         --max-snippets 200000 \\
         --train-fraction 0.7 \\
@@ -106,8 +111,8 @@ def _extract_cadence_snippets(
 def main():
     p = argparse.ArgumentParser(description="Extract and cache background snippets")
     p.add_argument("--config", type=Path, default=Path("configs/training/srt_real.yaml"))
-    p.add_argument("--output", type=Path, default=Path("data/processed/cache_gbt_fine.npz"),
-                   help="Output NPZ path (train snippets)")
+    p.add_argument("--output", type=Path, default=Path("data/processed/cache_gbt_fine"),
+                   help="Output directory (will contain train.npy, val.npy, meta.json)")
     p.add_argument("--snippets-per-cadence", type=int, default=3850,
                    help="Max snippets sampled per cadence (controls diversity)")
     p.add_argument("--max-snippets", type=int, default=200_000,
@@ -170,8 +175,8 @@ def main():
     print(f"Inject-recovery: {len(inject_recovery)}")
 
     # ----------------------------------- save inject-recovery cadence manifest
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    inj_path = args.output.parent / "inject_recovery_cadences.txt"
+    args.output.mkdir(parents=True, exist_ok=True)
+    inj_path = args.output / "inject_recovery_cadences.txt"
     with open(inj_path, "w") as f:
         for cad in inject_recovery:
             f.write(" ".join(str(p) for p in cad) + "\n")
@@ -234,17 +239,16 @@ def main():
     train_data = _extract_split(train_cadences, args.max_snippets, "train")
     val_data   = _extract_split(val_cadences,   n_val_target,      "val")
 
-    # --------------------------------------------------------------- save NPZ
+    # ---------------------------------------------------------- save .npy files
+    out_dir = args.output
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    train_path = out_dir / "train.npy"
+    val_path   = out_dir / "val.npy"
     size_gb = (train_data.nbytes + val_data.nbytes) / 1e9
-    print(f"\nSaving {args.output}  ({size_gb:.1f} GB uncompressed)...")
-    np.savez_compressed(
-        args.output,
-        train=train_data,
-        val=val_data,
-        tchans_per_obs=np.int32(tchans_per_obs),
-        n_obs=np.int32(n_obs),
-        fchans=np.int32(fchans),
-    )
+    print(f"\nSaving to {out_dir}/  ({size_gb:.1f} GB)...")
+    np.save(str(train_path), train_data)
+    np.save(str(val_path),   val_data)
 
     meta = {
         "n_train": int(len(train_data)),
@@ -258,16 +262,17 @@ def main():
         "val_fraction": args.val_fraction,
         "preprocessing": cfg_preproc,
     }
-    meta_path = args.output.with_suffix(".json")
+    meta_path = out_dir / "meta.json"
     meta_path.write_text(json.dumps(meta, indent=2))
 
     print(f"\nDone.")
-    print(f"  {args.output}  ({len(train_data)} train + {len(val_data)} val snippets)")
+    print(f"  {train_path}  ({len(train_data)} train snippets)")
+    print(f"  {val_path}  ({len(val_data)} val snippets)")
     print(f"  {meta_path}")
     print(f"  {inj_path}  ({len(inject_recovery)} cadences for inject-recovery)")
     print(f"\nAdd to configs/data/gbt_fine.yaml:")
     print(f"  dataset:")
-    print(f"    cache_file: {args.output}")
+    print(f"    cache_dir: {out_dir}")
 
 
 if __name__ == "__main__":
