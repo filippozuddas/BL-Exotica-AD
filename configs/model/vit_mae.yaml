@@ -30,7 +30,7 @@ num_heads: 4
 mlp_ratio: 4
 
 # --- Masking ---
-mask_ratio: 0.75           # fraction of patches masked during training
+mask_ratio: 0.60           # fraction of patches masked during training
 mask_mode: random          # cluster (SSAST MSPM) | random (He-style scattered)
 cluster_factor: [3, 5]     # C ~ unif{c_min, c_max} for cluster masking (ignored when mask_mode=random)
 
