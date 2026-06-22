@@ -35,7 +35,7 @@ mask_mode: random          # cluster (SSAST MSPM) | random (He-style scattered)
 cluster_factor: [3, 5]     # C ~ unif{c_min, c_max} for cluster masking (ignored when mask_mode=random)
 
 # --- Joint objective ---
-loss_mode: joint           # joint | generative | discriminative
+loss_mode: generative      # joint | generative | discriminative
 infonce_lambda: 10.0       # L = L_d + infonce_lambda * L_g  (SSAST λ=10)
 infonce_temperature: 0.07  # InfoNCE logit temperature. Embeddings are L2-normalised
                            # (cosine logits in [-1,1]); a low temp is required so the
