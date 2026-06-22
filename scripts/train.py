@@ -49,6 +49,18 @@ def _parse_args():
         default=None,
         help="Override model config path",
     )
+    p.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="Path to checkpoint to resume training from",
+    )
+    p.add_argument(
+        "--run_dir",
+        type=Path,
+        default=None,
+        help="Existing run directory to resume into (logs and checkpoints append)",
+    )
     return p.parse_args()
 
 
@@ -160,12 +172,15 @@ def main():
     # so without sharing the path each rank would create its own timestamped
     # run directory. Rank 0 picks the directory and exports it for the other
     # ranks via the environment, which the launcher copies at trainer.fit().
-    if "BL_EXOTICA_RUN_DIR" in os.environ:
+    if args.run_dir is not None:
+        run_dir = args.run_dir
+        run_dir.mkdir(parents=True, exist_ok=True)
+    elif "BL_EXOTICA_RUN_DIR" in os.environ:
         run_dir = Path(os.environ["BL_EXOTICA_RUN_DIR"])
         run_dir.mkdir(parents=True, exist_ok=True)
     else:
         run_dir = make_run_dir(cfg.get("output_dir", "outputs"))
-        os.environ["BL_EXOTICA_RUN_DIR"] = str(run_dir)
+    os.environ["BL_EXOTICA_RUN_DIR"] = str(run_dir)
     print(f"Run directory: {run_dir}")
 
     n_snap = min(4, len(val_ds))
@@ -186,7 +201,7 @@ def main():
     module = AELightningModule(model, cfg)
     trainer = build_trainer(cfg, run_dir, callbacks=callbacks)
 
-    trainer.fit(module, train_loader, val_loader)
+    trainer.fit(module, train_loader, val_loader, ckpt_path=args.resume)
     print(f"Training complete. Best checkpoint: {callbacks[1].best_model_path}")
 
 
