@@ -1,17 +1,15 @@
-# Full training run on real SRT 0000-equivalent cadence data (MAE backbone).
-# Run in background (nohup/tmux) — a multi-epoch DDP run will outlast a Colab
-# browser session.
+# Full training run on real SRT 0000-equivalent cadence data (ViT-MAE backbone).
 #
-#   PYTHONPATH=. nohup python scripts/train.py --config configs/training/srt_real.yaml \
-#       > train.log 2>&1 &
+#   CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. python scripts/train.py \
+#       --config configs/training/srt_real.yaml
 
 data: configs/data/gbt_fine.yaml
-model: configs/model/convae_mae.yaml
+model: configs/model/vit_mae.yaml
 
 training:
-  batch_size: 128
-  epochs: 100
-  warmup_epochs: 10
+  batch_size: 256
+  epochs: 200
+  warmup_epochs: 20
   learning_rate: 3.0e-4
   optimizer: adam
   loss: mse
@@ -25,6 +23,6 @@ training:
 hardware:
   num_gpus: 2
   mixed_precision: true
-  num_workers: 8    # workers per GPU for lazy I/O; tune up if GPUs are starved
+  num_workers: 16
 
 output_dir: outputs
