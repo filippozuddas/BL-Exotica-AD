@@ -137,20 +137,20 @@ def plot_candidate(original, reconstruction, score, sigma, method, cad_idx,
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-    im0 = axes[0].imshow(original, aspect="auto", origin="lower",
+    im0 = axes[0].imshow(original, aspect="auto", origin="upper",
                           vmin=vmin, vmax=vmax, cmap="viridis")
     axes[0].set_title("Original")
     axes[0].set_ylabel("Time bin")
     axes[0].set_xlabel("Freq channel")
     plt.colorbar(im0, ax=axes[0], fraction=0.046)
 
-    im1 = axes[1].imshow(reconstruction, aspect="auto", origin="lower",
+    im1 = axes[1].imshow(reconstruction, aspect="auto", origin="upper",
                           vmin=vmin, vmax=vmax, cmap="viridis")
     axes[1].set_title("Reconstruction")
     axes[1].set_xlabel("Freq channel")
     plt.colorbar(im1, ax=axes[1], fraction=0.046)
 
-    im2 = axes[2].imshow(error, aspect="auto", origin="lower", cmap="hot")
+    im2 = axes[2].imshow(error, aspect="auto", origin="upper", cmap="hot")
     axes[2].set_title("Residual |orig - recon|")
     axes[2].set_xlabel("Freq channel")
     plt.colorbar(im2, ax=axes[2], fraction=0.046)

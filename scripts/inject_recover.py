@@ -391,27 +391,27 @@ def main():
         vmin, vmax = np.percentile(snip_clean, [1, 99])
 
         # Top row: clean
-        axes[0, 0].imshow(snip_clean, aspect="auto", origin="lower",
+        axes[0, 0].imshow(snip_clean, aspect="auto", origin="upper",
                           vmin=vmin, vmax=vmax, cmap="viridis")
         axes[0, 0].set_title("Clean original")
         axes[0, 0].set_ylabel("Time bin")
 
         # Bottom row: injected
-        axes[1, 0].imshow(snip_inj, aspect="auto", origin="lower",
+        axes[1, 0].imshow(snip_inj, aspect="auto", origin="upper",
                           vmin=vmin, vmax=vmax, cmap="viridis")
         axes[1, 0].set_title(f"Injected SNR={snr}")
         axes[1, 0].set_ylabel("Time bin")
 
-        axes[1, 1].imshow(recon_arr, aspect="auto", origin="lower",
+        axes[1, 1].imshow(recon_arr, aspect="auto", origin="upper",
                           vmin=vmin, vmax=vmax, cmap="viridis")
         axes[1, 1].set_title("Reconstruction")
 
         error = np.abs(snip_inj - recon_arr)
-        axes[1, 2].imshow(error, aspect="auto", origin="lower", cmap="hot")
+        axes[1, 2].imshow(error, aspect="auto", origin="upper", cmap="hot")
         axes[1, 2].set_title("Residual")
 
         diff = np.abs(snip_inj - snip_clean)
-        axes[0, 1].imshow(diff, aspect="auto", origin="lower", cmap="hot")
+        axes[0, 1].imshow(diff, aspect="auto", origin="upper", cmap="hot")
         axes[0, 1].set_title("Injected - Clean (ground truth)")
 
         axes[0, 2].axis("off")
