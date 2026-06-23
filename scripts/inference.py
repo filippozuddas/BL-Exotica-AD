@@ -5,14 +5,11 @@ Loads each cadence's .h5 files fully into RAM, slides a (tchans, fchans)
 window across the frequency axis at stride_infer, preprocesses each snippet
 in parallel across CPU cores, and scores batches on GPU.
 
-Candidate snippets above the robust threshold (median + k*MAD) are saved
-with per-candidate plots showing original | reconstruction | error map.
+Each cadence gets its own output folder named:
+    cad{idx}_{target}_{fch1_MHz}MHz_{date}
 
-Outputs:
-  - inference_scores.csv: per-snippet scores
-  - inference_score_distributions.png: global histograms
-  - inference_cadence_scores_by_freq.png: per-cadence frequency profiles
-  - candidates/: per-candidate 3-panel plots
+Candidate snippets are saved with per-candidate plots showing
+original | reconstruction | error map.
 
 Usage (run on the server):
     CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
@@ -25,11 +22,13 @@ Usage (run on the server):
 
 import argparse
 import csv
+import heapq
 import multiprocessing as mp
 import sys
 import time
 from pathlib import Path
 
+import h5py
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -46,16 +45,14 @@ from src.data.torch_dataset import _load_full_obs
 
 INPUT_SHAPE = (96, 1024, 1)
 METHODS = ["recon", "cadence"]
-MAD_SCALE = 1.4826  # MAD-to-sigma conversion for Gaussian
+MAD_SCALE = 1.4826
 
-# Shared state for worker processes (inherited via fork COW)
 _shared_obs = None
 _shared_fchans = None
 _shared_preproc = None
 
 
 def _preprocess_at(f_start):
-    """Worker: slice snippet from shared obs arrays and preprocess."""
     frames = [obs[:, f_start:f_start + _shared_fchans] for obs in _shared_obs]
     stacked = np.concatenate(frames, axis=0)
     method = _shared_preproc.get("bandpass_method", "polynomial")
@@ -95,6 +92,41 @@ def robust_stats(scores: np.ndarray):
     mad = np.median(np.abs(scores - median))
     sigma = mad * MAD_SCALE
     return median, sigma
+
+
+def read_cadence_meta(h5_path: Path) -> dict:
+    """Read target name, start frequency and observation date from .h5 header."""
+    with h5py.File(str(h5_path), 'r') as f:
+        attrs = dict(f['data'].attrs) if 'data' in f and f['data'].attrs else {}
+        if not attrs:
+            for key in f.keys():
+                if hasattr(f[key], 'attrs') and len(f[key].attrs) > 0:
+                    attrs = dict(f[key].attrs)
+                    break
+            if not attrs and len(f.attrs) > 0:
+                attrs = dict(f.attrs)
+
+    source = attrs.get('source_name', b'unknown')
+    if isinstance(source, bytes):
+        source = source.decode('utf-8', errors='replace')
+    source = source.strip().replace(' ', '_')
+
+    fch1 = float(attrs.get('fch1', 0.0))
+
+    tstart_mjd = float(attrs.get('tstart', 0.0))
+    if tstart_mjd > 0:
+        from astropy.time import Time
+        t = Time(tstart_mjd, format='mjd')
+        date_str = t.iso[:10].replace('-', '')
+    else:
+        date_str = "nodate"
+
+    return {"source": source, "fch1_mhz": fch1, "date": date_str}
+
+
+def make_cadence_dirname(cad_idx: int, meta: dict) -> str:
+    fch1_str = f"{meta['fch1_mhz']:.1f}MHz"
+    return f"cad{cad_idx:02d}_{meta['source']}_{fch1_str}_{meta['date']}"
 
 
 def plot_candidate(original, reconstruction, score, sigma, method, cad_idx,
@@ -148,7 +180,7 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=512)
     p.add_argument("--num_workers", type=int, default=16)
     p.add_argument("--top_k", type=int, default=30,
-                   help="Number of top candidates to plot per method")
+                   help="Number of top candidates to plot per cadence per method")
     return p.parse_args()
 
 
@@ -189,26 +221,26 @@ def main():
     all_recon = []
     all_cadence = []
     all_rows = []
-    # Keep top-K candidate snippets for plotting (heap by negative score)
-    import heapq
-    top_recon_heap = []   # (score, global_idx, snippet_array)
-    top_cadence_heap = []
+    cadence_dirs = []
 
     for cad_idx, obs_paths in enumerate(cadence_lines):
         obs_paths = [Path(p) for p in obs_paths]
-        target_name = "unknown"
-        for p in obs_paths:
-            for part in p.stem.split("_"):
-                if part.startswith("TIC"):
-                    target_name = part
-                    break
-            if target_name != "unknown":
-                break
+
+        # Read metadata from first observation header
+        meta = read_cadence_meta(obs_paths[0])
+        target_name = meta["source"]
+        cad_dirname = make_cadence_dirname(cad_idx, meta)
+        cad_dir = args.out_dir / cad_dirname
+        cad_dir.mkdir(parents=True, exist_ok=True)
+        cadence_dirs.append(cad_dir)
 
         print(f"\n{'='*70}")
-        print(f"Cadence {cad_idx}: {target_name} ({len(obs_paths)} obs)")
+        print(f"Cadence {cad_idx}: {target_name}  fch1={meta['fch1_mhz']:.1f} MHz  "
+              f"date={meta['date']}")
+        print(f"  -> {cad_dir}")
         print(f"{'='*70}")
 
+        # Load all observations into RAM
         t_load = time.time()
         obs_arrays = []
         for i, obs_path in enumerate(obs_paths):
@@ -233,6 +265,13 @@ def main():
         batch_snippets = []
         batch_fstarts = []
         processed_count = 0
+        cad_recon_scores = []
+        cad_cadence_scores = []
+        cad_fstarts = []
+
+        # Per-cadence top-K heaps
+        top_recon = []
+        top_cadence = []
 
         chunksize = max(1, min(256, n_snippets // (args.num_workers * 4)))
         print(f"  Pool: {args.num_workers} workers, chunksize={chunksize}")
@@ -248,9 +287,11 @@ def main():
                     cadence_scores = score_batch(model, batch_snippets, "cadence", args.device)
 
                     for j in range(len(batch_snippets)):
-                        global_idx = len(all_recon)
                         r_score = float(recon_scores[j])
                         c_score = float(cadence_scores[j])
+                        cad_recon_scores.append(r_score)
+                        cad_cadence_scores.append(c_score)
+                        cad_fstarts.append(batch_fstarts[j])
                         all_recon.append(r_score)
                         all_cadence.append(c_score)
                         all_rows.append({
@@ -263,15 +304,16 @@ def main():
                         })
 
                         snip_copy = batch_snippets[j].copy()
-                        if len(top_recon_heap) < args.top_k:
-                            heapq.heappush(top_recon_heap, (r_score, global_idx, snip_copy))
-                        elif r_score > top_recon_heap[0][0]:
-                            heapq.heapreplace(top_recon_heap, (r_score, global_idx, snip_copy))
+                        local_idx = len(cad_recon_scores) - 1
+                        if len(top_recon) < args.top_k:
+                            heapq.heappush(top_recon, (r_score, local_idx, snip_copy))
+                        elif r_score > top_recon[0][0]:
+                            heapq.heapreplace(top_recon, (r_score, local_idx, snip_copy))
 
-                        if len(top_cadence_heap) < args.top_k:
-                            heapq.heappush(top_cadence_heap, (c_score, global_idx, snip_copy))
-                        elif c_score > top_cadence_heap[0][0]:
-                            heapq.heapreplace(top_cadence_heap, (c_score, global_idx, snip_copy))
+                        if len(top_cadence) < args.top_k:
+                            heapq.heappush(top_cadence, (c_score, local_idx, snip_copy))
+                        elif c_score > top_cadence[0][0]:
+                            heapq.heapreplace(top_cadence, (c_score, local_idx, snip_copy))
 
                     batch_snippets = []
                     batch_fstarts = []
@@ -288,10 +330,56 @@ def main():
         print(f"  Scored {n_snippets} snippets in {elapsed:.1f}s "
               f"({n_snippets/max(elapsed,1):.0f}/s)")
 
+        # ---- Per-cadence summary & plots ----
+        cad_recon_arr = np.array(cad_recon_scores)
+        cad_cadence_arr = np.array(cad_cadence_scores)
+
+        for method, scores, heap in [("recon", cad_recon_arr, top_recon),
+                                      ("cadence", cad_cadence_arr, top_cadence)]:
+            median, mad_sigma = robust_stats(scores)
+            thresh_3 = median + 3 * mad_sigma
+            thresh_5 = median + 5 * mad_sigma
+            n_3s = (scores > thresh_3).sum()
+            n_5s = (scores > thresh_5).sum()
+            print(f"  {method}: median={median:.4f}  MAD_s={mad_sigma:.4f}  "
+                  f"3s->{n_3s}  5s->{n_5s}")
+
+            candidates = sorted(heap, key=lambda x: -x[0])
+            for rank, (score, local_idx, snippet) in enumerate(candidates):
+                sigma = (score - median) / mad_sigma if mad_sigma > 0 else 0
+                recon = reconstruct_batch(model, [snippet], args.device)
+                fs = cad_fstarts[local_idx]
+                out_path = cad_dir / f"{method}_rank{rank:02d}_f{fs}.png"
+                plot_candidate(
+                    original=snippet,
+                    reconstruction=recon[0],
+                    score=score, sigma=sigma, method=method,
+                    cad_idx=cad_idx, target=target_name,
+                    f_start=fs, df=df, out_path=out_path,
+                )
+
+        # Per-cadence frequency profile
+        fig, ax = plt.subplots(figsize=(16, 4))
+        cad_med, cad_mad_s = robust_stats(cad_cadence_arr)
+        ax.plot(cad_fstarts, cad_cadence_arr, linewidth=0.3, alpha=0.7)
+        ax.axhline(cad_med + 3 * cad_mad_s, color="orange", ls="--", lw=1,
+                   label=f"3s = {cad_med + 3*cad_mad_s:.3f}")
+        ax.axhline(cad_med + 5 * cad_mad_s, color="red", ls="--", lw=1,
+                   label=f"5s = {cad_med + 5*cad_mad_s:.3f}")
+        ax.set_xlabel("Frequency channel (f_start)")
+        ax.set_ylabel("Cadence score")
+        ax.set_title(f"{target_name} — cadence score vs frequency")
+        ax.legend(fontsize=8)
+        plt.tight_layout()
+        plt.savefig(cad_dir / "cadence_score_vs_freq.png", dpi=150)
+        plt.close()
+
+        print(f"  Saved {len(top_recon) + len(top_cadence)} candidate plots -> {cad_dir}")
+
         del obs_arrays
         _shared_obs = None
 
-    # ---- Global analysis with robust statistics ----
+    # ---- Global summary ----
     all_recon = np.array(all_recon)
     all_cadence = np.array(all_cadence)
     n_total = len(all_recon)
@@ -305,7 +393,7 @@ def main():
     print(f"\nSaved scores -> {csv_path}")
 
     print(f"\n{'='*70}")
-    print(f"SUMMARY -- {n_total} snippets across {len(cadence_lines)} cadences")
+    print(f"GLOBAL SUMMARY -- {n_total} snippets across {len(cadence_lines)} cadences")
     print(f"{'='*70}")
 
     for name, scores in [("recon", all_recon), ("cadence", all_cadence)]:
@@ -323,49 +411,7 @@ def main():
         print(f"    3s (robust)={thresh_3s:.4f}  -> {n_3s} candidates ({n_3s/n_total*100:.3f}%)")
         print(f"    5s (robust)={thresh_5s:.4f}  -> {n_5s} candidates ({n_5s/n_total*100:.3f}%)")
 
-        if n_3s > 0 and n_3s <= 200:
-            idx_above = np.where(scores > thresh_3s)[0]
-            idx_sorted = idx_above[np.argsort(scores[idx_above])[::-1]]
-            print(f"    Top candidates (robust 3s):")
-            for idx in idx_sorted[:20]:
-                row = all_rows[idx]
-                sigma = (scores[idx] - median) / mad_sigma
-                print(f"      cad={row['cadence_idx']} ({row['target']})  "
-                      f"f_start={row['f_start']:>8d}  "
-                      f"score={scores[idx]:.4f} ({sigma:.1f}s)")
-
-    # ---- Plot candidate snippets ----
-    cand_dir = args.out_dir / "candidates"
-    cand_dir.mkdir(exist_ok=True)
-
-    for method, heap in [("recon", top_recon_heap), ("cadence", top_cadence_heap)]:
-        scores_arr = all_recon if method == "recon" else all_cadence
-        median, mad_sigma = robust_stats(scores_arr)
-        candidates = sorted(heap, key=lambda x: -x[0])
-
-        print(f"\nPlotting top {len(candidates)} {method} candidates...")
-        for rank, (score, global_idx, snippet) in enumerate(candidates):
-            row = all_rows[global_idx]
-            sigma = (score - median) / mad_sigma
-
-            recon = reconstruct_batch(model, [snippet], args.device)
-
-            out_path = cand_dir / f"{method}_rank{rank:02d}_cad{row['cadence_idx']}_f{row['f_start']}.png"
-            plot_candidate(
-                original=snippet,
-                reconstruction=recon[0],
-                score=score,
-                sigma=sigma,
-                method=method,
-                cad_idx=row["cadence_idx"],
-                target=row["target"],
-                f_start=row["f_start"],
-                df=df,
-                out_path=out_path,
-            )
-    print(f"Saved candidate plots -> {cand_dir}")
-
-    # ---- Plot histograms (robust thresholds) ----
+    # Global histograms
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     for ax, (name, scores) in zip(axes, [("recon", all_recon), ("cadence", all_cadence)]):
         median, mad_sigma = robust_stats(scores)
@@ -375,50 +421,19 @@ def main():
 
         clipped = scores[scores < np.percentile(scores, 99.5)]
         ax.hist(clipped, bins=200, alpha=0.7, edgecolor="black", linewidth=0.2)
-        ax.axvline(thresh_3, color="orange", ls="--", lw=1.5,
-                   label=f"3s = {thresh_3:.3f}")
-        ax.axvline(thresh_5, color="red", ls="--", lw=1.5,
-                   label=f"5s = {thresh_5:.3f}")
+        ax.axvline(thresh_3, color="orange", ls="--", lw=1.5, label=f"3s = {thresh_3:.3f}")
+        ax.axvline(thresh_5, color="red", ls="--", lw=1.5, label=f"5s = {thresh_5:.3f}")
         ax.set_xlabel("Anomaly score (MSE)")
         ax.set_ylabel("Count")
         ax.set_title(f"{name} -- {n_3s} candidates > 3s (robust)")
         ax.legend()
 
     plt.suptitle(f"Score distribution -- {n_total} snippets, {len(cadence_lines)} cadences\n"
-                 f"Thresholds: median + k * MAD * 1.4826",
-                 fontsize=11)
+                 f"Thresholds: median + k * MAD * 1.4826", fontsize=11)
     plt.tight_layout()
     plt.savefig(args.out_dir / "inference_score_distributions.png", dpi=150)
     plt.close()
     print(f"\nSaved -> {args.out_dir / 'inference_score_distributions.png'}")
-
-    # ---- Per-cadence frequency profile ----
-    fig, axes = plt.subplots(len(cadence_lines), 1,
-                             figsize=(16, 3 * len(cadence_lines)), squeeze=False)
-    cad_median, cad_mad_sigma = robust_stats(all_cadence)
-    offset = 0
-    for cad_idx in range(len(cadence_lines)):
-        cad_rows = [r for r in all_rows if r["cadence_idx"] == cad_idx]
-        n_cad = len(cad_rows)
-        cad_scores = all_cadence[offset:offset + n_cad]
-        fstarts = [r["f_start"] for r in cad_rows]
-
-        ax = axes[cad_idx, 0]
-        ax.plot(fstarts, cad_scores, linewidth=0.3, alpha=0.7)
-        ax.axhline(cad_median + 3 * cad_mad_sigma, color="orange", ls="--", lw=1,
-                   alpha=0.7, label="3s")
-        ax.axhline(cad_median + 5 * cad_mad_sigma, color="red", ls="--", lw=1,
-                   alpha=0.7, label="5s")
-        ax.set_ylabel("Cadence score")
-        ax.set_title(f"Cadence {cad_idx}: {cad_rows[0]['target']}")
-        ax.legend(fontsize=7)
-        offset += n_cad
-
-    axes[-1, 0].set_xlabel("Frequency channel (f_start)")
-    plt.tight_layout()
-    plt.savefig(args.out_dir / "inference_cadence_scores_by_freq.png", dpi=150)
-    plt.close()
-    print(f"Saved -> {args.out_dir / 'inference_cadence_scores_by_freq.png'}")
 
     print("\nDone.")
 
