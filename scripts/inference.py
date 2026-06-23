@@ -227,8 +227,17 @@ def main():
     for cad_idx, obs_paths in enumerate(cadence_lines):
         obs_paths = [Path(p) for p in obs_paths]
 
-        # Read metadata from first observation header
-        meta = read_cadence_meta(obs_paths[0])
+        # Read metadata — try each obs file until one opens
+        meta = None
+        for obs_path in obs_paths:
+            try:
+                meta = read_cadence_meta(obs_path)
+                break
+            except OSError:
+                continue
+        if meta is None:
+            print(f"\nCadence {cad_idx}: SKIPPING — all files corrupt")
+            continue
         target_name = meta["source"]
         cad_dirname = make_cadence_dirname(cad_idx, meta)
         cad_dir = args.out_dir / cad_dirname
