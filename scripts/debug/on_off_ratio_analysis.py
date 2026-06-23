@@ -66,10 +66,19 @@ def compute_residual(model, snippet, device):
     return residual
 
 
-def on_off_ratio(residual):
+def on_off_ratio_whole(residual):
     on_energy = np.mean([np.mean(residual[s, :] ** 2) for s in ON_SLICES])
     off_energy = np.mean([np.mean(residual[s, :] ** 2) for s in OFF_SLICES])
     return on_energy / max(off_energy, 1e-10)
+
+
+def on_off_ratio_peak(residual, n_cols=5):
+    """ON/OFF ratio on the top-n peak residual columns only."""
+    col_energy = np.mean(residual ** 2, axis=0)
+    peak_cols = np.argsort(col_energy)[-n_cols:]
+    on_vals = np.concatenate([residual[s, :][:, peak_cols] for s in ON_SLICES])
+    off_vals = np.concatenate([residual[s, :][:, peak_cols] for s in OFF_SLICES])
+    return np.mean(on_vals ** 2) / max(np.mean(off_vals ** 2), 1e-10)
 
 
 def preprocess_window(obs_arrays, f_start, fchans, preproc, tchans=96):
@@ -144,7 +153,8 @@ def main():
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Compute ON/OFF ratio for real candidates ----
-    ratios = []
+    ratios_whole = []
+    ratios_peak = []
     scores = []
 
     for cad_idx, cand_list in sorted(cad_groups.items()):
@@ -164,24 +174,29 @@ def main():
             f_start = int(c["f_start"])
             snip = preprocess_window(obs_arrays, f_start, fchans, preproc)
             residual = compute_residual(model, snip, args.device)
-            r = on_off_ratio(residual)
-            ratios.append(r)
+            r_whole = on_off_ratio_whole(residual)
+            r_peak = on_off_ratio_peak(residual, n_cols=5)
+            ratios_whole.append(r_whole)
+            ratios_peak.append(r_peak)
             scores.append(float(c["cadence_score"]))
 
         elapsed = time.time() - t0
         print(f"  Scored {len(cand_list)} candidates in {elapsed:.1f}s")
         del obs_arrays
 
-    ratios = np.array(ratios)
+    ratios_whole = np.array(ratios_whole)
+    ratios_peak = np.array(ratios_peak)
     scores = np.array(scores)
-    print(f"\n{'='*60}")
-    print(f"ON/OFF RATIO — {len(ratios)} candidates")
-    print(f"{'='*60}")
-    print(f"  median r = {np.median(ratios):.3f}")
-    print(f"  mean r   = {np.mean(ratios):.3f}")
-    print(f"  r < 1.5: {(ratios < 1.5).sum()} ({(ratios < 1.5).mean()*100:.1f}%) — likely RFI")
-    print(f"  r > 2.0: {(ratios > 2.0).sum()} ({(ratios > 2.0).mean()*100:.1f}%) — possible signal")
-    print(f"  r > 3.0: {(ratios > 3.0).sum()} ({(ratios > 3.0).mean()*100:.1f}%)")
+
+    for label, ratios in [("WHOLE-SNIPPET", ratios_whole), ("PEAK-COLUMN (top 5)", ratios_peak)]:
+        print(f"\n{'='*60}")
+        print(f"ON/OFF RATIO ({label}) — {len(ratios)} candidates")
+        print(f"{'='*60}")
+        print(f"  median r = {np.median(ratios):.3f}")
+        print(f"  mean r   = {np.mean(ratios):.3f}")
+        print(f"  r < 1.5: {(ratios < 1.5).sum()} ({(ratios < 1.5).mean()*100:.1f}%) — likely RFI")
+        print(f"  r > 2.0: {(ratios > 2.0).sum()} ({(ratios > 2.0).mean()*100:.1f}%) — possible signal")
+        print(f"  r > 3.0: {(ratios > 3.0).sum()} ({(ratios > 3.0).mean()*100:.1f}%)")
 
     # ---- Compute ON/OFF ratio for synthetic injections ----
     print(f"\nComputing injection ratios...")
@@ -193,10 +208,10 @@ def main():
         print("Cannot load first cadence for injections, skipping.")
         obs_arrays = None
 
-    inject_ratios = {}
+    inject_ratios_whole = {}
+    inject_ratios_peak = {}
     if obs_arrays is not None:
         nchans = obs_arrays[0].shape[1]
-        # Find quiet windows
         probe_fs = rng.choice(nchans - fchans, size=100, replace=False)
         probe_scores = []
         for fs in probe_fs:
@@ -206,7 +221,7 @@ def main():
         quiet_fs = probe_fs[np.argsort(probe_scores)[:args.n_injections]]
 
         for snr in [5, 10, 20, 50]:
-            snr_ratios = []
+            whole_rs, peak_rs = [], []
             for j, fs in enumerate(quiet_fs):
                 raw = np.stack([obs[:16, fs:fs + fchans] for obs in obs_arrays])
                 raw_inj = inject_narrowband_on_only(raw, snr=snr, drift_rate=0.3,
@@ -217,80 +232,95 @@ def main():
                                           poly_degree=preproc.get("poly_degree", 3))
                 frame = core_transform(frame, preproc.get("mad_epsilon", 1e-6))
                 residual = compute_residual(model, frame, args.device)
-                snr_ratios.append(on_off_ratio(residual))
-            inject_ratios[snr] = np.array(snr_ratios)
-            print(f"  SNR={snr:3d}: median r = {np.median(snr_ratios):.2f}  "
-                  f"mean r = {np.mean(snr_ratios):.2f}")
+                whole_rs.append(on_off_ratio_whole(residual))
+                peak_rs.append(on_off_ratio_peak(residual, n_cols=5))
+            inject_ratios_whole[snr] = np.array(whole_rs)
+            inject_ratios_peak[snr] = np.array(peak_rs)
+            print(f"  SNR={snr:3d}: whole median={np.median(whole_rs):.2f}  "
+                  f"peak median={np.median(peak_rs):.2f}")
         del obs_arrays
 
     # ---- Save CSV ----
     csv_path = args.out_dir / "on_off_ratios.csv"
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["type", "cadence_idx", "f_start", "cadence_score", "on_off_ratio"])
-        for i in range(len(ratios)):
+        writer.writerow(["type", "cadence_idx", "f_start", "cadence_score",
+                         "ratio_whole", "ratio_peak"])
+        for i in range(len(ratios_whole)):
             c = candidates[i]
             writer.writerow(["rfi_candidate", c["cadence_idx"], c["f_start"],
-                             c["cadence_score"], f"{ratios[i]:.4f}"])
-        for snr, rs in inject_ratios.items():
-            for r in rs:
-                writer.writerow([f"inject_snr{snr}", 0, 0, 0, f"{r:.4f}"])
+                             c["cadence_score"],
+                             f"{ratios_whole[i]:.4f}", f"{ratios_peak[i]:.4f}"])
+        for snr in inject_ratios_whole:
+            for w, p in zip(inject_ratios_whole[snr], inject_ratios_peak[snr]):
+                writer.writerow([f"inject_snr{snr}", 0, 0, 0, f"{w:.4f}", f"{p:.4f}"])
     print(f"\nSaved -> {csv_path}")
 
-    # ---- Plot 1: Histogram of ratios ----
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.hist(ratios, bins=100, alpha=0.7, color="gray", edgecolor="black",
-            linewidth=0.3, label=f"RFI candidates (n={len(ratios)})")
+    # ---- Plot: side-by-side histograms whole vs peak ----
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
 
-    for snr, rs in sorted(inject_ratios.items()):
-        ax.axvline(np.median(rs), ls="--", lw=2,
-                   label=f"Inject SNR={snr} (median r={np.median(rs):.1f})")
+    for ax, (label, rfi_r, inj_r) in zip(axes, [
+        ("Whole-snippet", ratios_whole, inject_ratios_whole),
+        ("Peak-column (top 5)", ratios_peak, inject_ratios_peak),
+    ]):
+        ax.hist(rfi_r, bins=100, alpha=0.7, color="gray", edgecolor="black",
+                linewidth=0.3, label=f"RFI candidates (n={len(rfi_r)})")
 
-    ax.axvline(1.0, color="black", ls=":", lw=1, alpha=0.5)
-    ax.set_xlabel("ON/OFF residual energy ratio (r)")
-    ax.set_ylabel("Count")
-    ax.set_title("ON/OFF ratio: RFI candidates vs ON-only injections")
-    ax.legend(fontsize=8)
-    ax.set_xlim(0, min(5, ratios.max() * 1.1) if len(inject_ratios) == 0
-                else max(5, max(np.median(v) for v in inject_ratios.values()) * 1.3))
+        for snr, rs in sorted(inj_r.items()):
+            ax.axvline(np.median(rs), ls="--", lw=2,
+                       label=f"Inject SNR={snr} (r={np.median(rs):.1f})")
+
+        ax.axvline(1.0, color="black", ls=":", lw=1, alpha=0.5)
+        ax.set_xlabel("ON/OFF residual energy ratio (r)")
+        ax.set_ylabel("Count")
+        ax.set_title(label)
+        ax.legend(fontsize=7)
+        max_inj = max((np.median(v) for v in inj_r.values()), default=5)
+        ax.set_xlim(0, max(5, max_inj * 1.3))
+
+    plt.suptitle("ON/OFF ratio: whole-snippet vs peak-column", fontsize=12)
     plt.tight_layout()
-    plt.savefig(args.out_dir / "on_off_ratio_histogram.png", dpi=150)
+    plt.savefig(args.out_dir / "on_off_ratio_comparison.png", dpi=150)
     plt.close()
-    print(f"Saved -> {args.out_dir / 'on_off_ratio_histogram.png'}")
+    print(f"Saved -> {args.out_dir / 'on_off_ratio_comparison.png'}")
 
-    # ---- Plot 2: Score vs ratio scatter ----
+    # ---- Plot 2: Score vs peak ratio scatter ----
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.scatter(ratios, scores, s=3, alpha=0.5, c="gray", label="RFI candidates")
+    ax.scatter(ratios_peak, scores, s=3, alpha=0.5, c="gray", label="RFI candidates")
 
-    for snr, rs in sorted(inject_ratios.items()):
+    for snr, rs in sorted(inject_ratios_peak.items()):
         ax.scatter(rs, np.full_like(rs, snr), s=20, marker="x",
                    label=f"Inject SNR={snr}")
 
-    ax.axvline(1.5, color="red", ls="--", lw=1, label="r=1.5 (proposed cutoff)")
-    ax.set_xlabel("ON/OFF residual energy ratio (r)")
+    ax.axvline(2.0, color="red", ls="--", lw=1, label="r=2.0 (proposed cutoff)")
+    ax.set_xlabel("ON/OFF peak-column ratio (r)")
     ax.set_ylabel("Cadence anomaly score")
-    ax.set_title("Can ON/OFF ratio separate RFI from signals?")
+    ax.set_title("Peak-column ON/OFF ratio: RFI vs injections")
     ax.legend(fontsize=8)
     plt.tight_layout()
-    plt.savefig(args.out_dir / "score_vs_ratio.png", dpi=150)
+    plt.savefig(args.out_dir / "score_vs_peak_ratio.png", dpi=150)
     plt.close()
-    print(f"Saved -> {args.out_dir / 'score_vs_ratio.png'}")
+    print(f"Saved -> {args.out_dir / 'score_vs_peak_ratio.png'}")
 
-    # ---- Summary ----
-    if len(inject_ratios) > 0:
-        rfi_median = np.median(ratios)
-        inj_median_5 = np.median(inject_ratios.get(5, [0]))
+    # ---- Verdict ----
+    if len(inject_ratios_peak) > 0:
+        rfi_med_peak = np.median(ratios_peak)
+        inj5_peak = np.median(inject_ratios_peak.get(5, [0]))
+        inj10_peak = np.median(inject_ratios_peak.get(10, [0]))
         print(f"\n{'='*60}")
-        print(f"VERDICT")
+        print(f"VERDICT (peak-column)")
         print(f"{'='*60}")
-        print(f"  RFI candidates median r = {rfi_median:.3f}")
-        print(f"  Injection SNR=5 median r = {inj_median_5:.2f}")
-        if inj_median_5 > rfi_median * 2:
-            print(f"  -> GOOD SEPARATION. r cutoff at ~1.5 should reject most RFI")
-            reject_pct = (ratios < 1.5).mean() * 100
-            print(f"     Estimated rejection: {reject_pct:.1f}% of RFI candidates")
+        print(f"  RFI candidates median r_peak = {rfi_med_peak:.3f}")
+        print(f"  Injection SNR=5  median r_peak = {inj5_peak:.2f}")
+        print(f"  Injection SNR=10 median r_peak = {inj10_peak:.2f}")
+        if inj5_peak > rfi_med_peak * 1.5:
+            print(f"  -> GOOD SEPARATION at SNR=5")
+            reject_pct = (ratios_peak < 2.0).mean() * 100
+            print(f"     r_peak < 2.0 rejects {reject_pct:.1f}% of RFI candidates")
+        elif inj10_peak > rfi_med_peak * 1.5:
+            print(f"  -> MODERATE: separates at SNR>=10 but not SNR=5")
         else:
-            print(f"  -> POOR SEPARATION. ON/OFF ratio alone may not suffice.")
+            print(f"  -> POOR SEPARATION even with peak-column")
 
     print("\nDone.")
 
