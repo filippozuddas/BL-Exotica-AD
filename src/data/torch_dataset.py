@@ -225,14 +225,21 @@ class CachedDataset(Dataset):
     re-extracting the cache.
     """
 
-    def __init__(self, cache_dir: Path, split: str, cfg_preproc: Dict[str, Any]):
+    def __init__(self, cache_dir: Path, split: str, cfg_preproc: Dict[str, Any],
+                 mmap: bool = True):
         npy_path = cache_dir / f"{split}.npy"
-        print(f"Memory-mapping {split} cache from {npy_path}...")
-        self.data = np.load(str(npy_path), mmap_mode="r")  # (N, n_obs, tchans_per_obs, fchans)
+        if mmap:
+            print(f"Memory-mapping {split} cache from {npy_path}...")
+            self.data = np.load(str(npy_path), mmap_mode="r")
+        else:
+            print(f"Loading {split} cache into RAM from {npy_path}...")
+            self.data = np.load(str(npy_path))
         self.cfg_preproc = cfg_preproc
+        gb = self.data.nbytes / 1e9
+        mode = "mmap" if mmap else "RAM"
         print(f"  {split}: {self.data.shape[0]} snippets  "
               f"shape={self.data.shape[1:]}  "
-              f"~{self.data.nbytes / 1e9:.1f} GB on disk (mmap, not in RAM)")
+              f"~{gb:.1f} GB ({mode})")
 
     def __len__(self) -> int:
         return len(self.data)
@@ -277,8 +284,9 @@ def build_datasets(
     if cache_dir and Path(cache_dir).is_dir():
         cfg_preproc = cfg_data["preprocessing"]
         cache_path = Path(cache_dir)
-        train_ds = CachedDataset(cache_path, "train", cfg_preproc)
-        val_ds   = CachedDataset(cache_path, "val",   cfg_preproc)
+        use_mmap = cfg_data.get("dataset", {}).get("mmap", True)
+        train_ds = CachedDataset(cache_path, "train", cfg_preproc, mmap=use_mmap)
+        val_ds   = CachedDataset(cache_path, "val",   cfg_preproc, mmap=use_mmap)
         return train_ds, val_ds
 
     rng = np.random.default_rng(seed)
