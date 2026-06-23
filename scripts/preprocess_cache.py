@@ -17,12 +17,16 @@ CachedDataset.__getitem__ so preprocessing hyperparameters can be changed
 without re-extracting the cache.  The .npy format enables np.load(mmap_mode='r')
 so DataLoader workers share physical memory pages instead of duplicating.
 
+Two-pass extraction: pass 1 validates all file headers and computes exact
+snippet counts; pass 2 allocates the .npy via memmap and writes directly to
+disk, keeping RAM usage bounded to one cadence buffer at a time.
+
 Usage:
     PYTHONPATH=. python scripts/preprocess_cache.py \\
         --config    configs/training/srt_real.yaml \\
         --output    data/processed/cache_gbt_fine \\
-        --snippets-per-cadence 3850 \\
-        --max-snippets 200000 \\
+        --snippets-per-cadence 18000 \\
+        --max-snippets 1100000 \\
         --train-fraction 0.7 \\
         --seed 42
 """
@@ -56,20 +60,22 @@ def _read_header(path: Path):
     return ntime, nchans
 
 
-def _read_window(path: Path, f_start: int, fchans: int, tchans_per_obs: int) -> np.ndarray:
-    """Read a (tchans_per_obs, fchans) window from an HDF5 file."""
-    with h5py.File(str(path), "r", rdcc_nbytes=128 * 1024 * 1024) as f:
-        dset = f["data"]
-        if dset.ndim == 3:
-            raw = dset[:tchans_per_obs, 0, f_start : f_start + fchans]
-        else:
-            raw = dset[:tchans_per_obs, f_start : f_start + fchans]
-    return np.asarray(raw, dtype=np.float32)
+def _validate_cadence(cadence_paths: list[Path]) -> int | None:
+    """Check all files in a cadence are readable. Return nchans or None."""
+    nchans = None
+    for path in cadence_paths:
+        try:
+            _, nc = _read_header(path)
+        except Exception as e:
+            print(f"  skip cadence (corrupt {path.name}): {e}")
+            return None
+        if nchans is None:
+            nchans = nc
+        elif nc != nchans:
+            print(f"  skip cadence (nchans mismatch: {path.name} has {nc}, expected {nchans})")
+            return None
+    return nchans
 
-
-# ---------------------------------------------------------------------------
-# Per-cadence extraction
-# ---------------------------------------------------------------------------
 
 def _extract_cadence_snippets(
     cadence_paths: list[Path],
@@ -81,16 +87,13 @@ def _extract_cadence_snippets(
     Extract snippets at the given frequency indices from all obs in a cadence.
 
     Returns (n_snippets, n_obs, tchans_per_obs, fchans) float32 RAW array.
-    Each file is opened once and all snippets are read in a single pass —
-    avoids the overhead of 3850 × 6 = 23k file open/close per cadence.
+    Each file is opened once and all snippets are read in a single pass.
     """
     n_obs = len(cadence_paths)
     n_snip = len(indices)
     out = np.empty((n_snip, n_obs, tchans_per_obs, fchans), dtype=np.float32)
 
     for oi, path in enumerate(cadence_paths):
-        # 256 MB chunk cache: sorted indices let adjacent windows reuse
-        # already-decompressed chunks (same pattern as RST background_extractor).
         with h5py.File(str(path), "r", rdcc_nbytes=256 * 1024 * 1024) as hf:
             dset = hf["data"]
             three_d = dset.ndim == 3
@@ -113,9 +116,9 @@ def main():
     p.add_argument("--config", type=Path, default=Path("configs/training/srt_real.yaml"))
     p.add_argument("--output", type=Path, default=Path("data/processed/cache_gbt_fine"),
                    help="Output directory (will contain train.npy, val.npy, meta.json)")
-    p.add_argument("--snippets-per-cadence", type=int, default=3850,
+    p.add_argument("--snippets-per-cadence", type=int, default=18000,
                    help="Max snippets sampled per cadence (controls diversity)")
-    p.add_argument("--max-snippets", type=int, default=200_000,
+    p.add_argument("--max-snippets", type=int, default=1_100_000,
                    help="Global cap on total train snippets")
     p.add_argument("--train-fraction", type=float, default=0.7,
                    help="Fraction of cadences used for training; rest → inject-recovery pool")
@@ -182,81 +185,109 @@ def main():
             f.write(" ".join(str(p) for p in cad) + "\n")
     print(f"Inject-recovery cadences saved to: {inj_path}")
 
-    # Check nchans and tchans_per_obs from first cadence
-    sample_path = (train_cadences or val_cadences)[0][0]
-    ntime_file, nchans_file = _read_header(sample_path)
-    n_obs = len((train_cadences or val_cadences)[0])
+    # Determine n_obs and tchans_per_obs from first available cadence
+    sample_cad = (train_cadences or val_cadences)[0]
+    n_obs = len(sample_cad)
     tchans_per_obs = tchans // n_obs   # e.g. 96 // 6 = 16
 
-    print(f"\nData geometry:")
-    print(f"  nchans per file : {nchans_file:,}")
-    print(f"  tchans per obs  : {tchans_per_obs} (file has {ntime_file})")
-    print(f"  n_obs per cadence: {n_obs}")
-    print(f"  snippets available per cadence: {nchans_file // fchans:,}")
-
-    # --------------------------------------------------------- extract helper
-    def _extract_split(split_cadences, n_target, label):
-        print(f"\n=== {label}: {len(split_cadences)} cadences, target {n_target} snippets ===")
-
-        all_snippets = []
+    # ====================================================================
+    # Pass 1: validate all cadences and compute exact snippet counts
+    # ====================================================================
+    def _plan_split(split_cadences, n_target, label):
+        """Validate headers, compute per-cadence n_take. Returns [(cadence, n_take, n_avail)]."""
+        print(f"\n--- Pre-scan {label}: {len(split_cadences)} cadences, target {n_target} ---")
+        plan = []
         total = 0
-
-        for cad in tqdm(split_cadences, desc=label):
+        for cad in split_cadences:
             if total >= n_target:
                 break
-            try:
-                _, nchans = _read_header(cad[0])
-            except Exception as e:
-                print(f"  skip {cad[0].name}: {e}")
+            nchans = _validate_cadence(cad)
+            if nchans is None:
                 continue
-
             n_avail = nchans // fchans
             n_take = min(args.snippets_per_cadence, n_avail, n_target - total)
             if n_take == 0:
                 continue
+            plan.append((cad, n_take, n_avail))
+            total += n_take
 
+        print(f"  {label}: {len(plan)} valid cadences, {total} snippets planned")
+        return plan, total
+
+    n_val_target = max(1000, int(args.max_snippets * args.val_fraction / (1 - args.val_fraction)))
+
+    train_plan, n_train = _plan_split(train_cadences, args.max_snippets, "train")
+    val_plan, n_val = _plan_split(val_cadences, n_val_target, "val")
+
+    if n_train == 0:
+        print("ERROR: no valid train snippets. Aborting.")
+        return
+    if n_val == 0:
+        print("ERROR: no valid val snippets. Aborting.")
+        return
+
+    snippet_shape = (n_obs, tchans_per_obs, fchans)
+    snippet_bytes = np.dtype(np.float32).itemsize * n_obs * tchans_per_obs * fchans
+    train_gb = n_train * snippet_bytes / 1e9
+    val_gb = n_val * snippet_bytes / 1e9
+    print(f"\nData geometry:")
+    print(f"  tchans per obs  : {tchans_per_obs}")
+    print(f"  n_obs per cadence: {n_obs}")
+    print(f"  snippet shape   : {snippet_shape}")
+    print(f"  train: {n_train:,} snippets ({train_gb:.1f} GB)")
+    print(f"  val  : {n_val:,} snippets ({val_gb:.1f} GB)")
+    print(f"  total: {train_gb + val_gb:.1f} GB")
+
+    # ====================================================================
+    # Pass 2: allocate memmap files and extract directly to disk
+    # ====================================================================
+    out_dir = args.output
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _extract_to_memmap(plan, n_total, label, out_path):
+        """Allocate a .npy memmap and fill it cadence by cadence."""
+        shape = (n_total, *snippet_shape)
+        print(f"\n=== {label}: allocating {out_path.name} {shape} ===")
+        mm = np.lib.format.open_memmap(
+            str(out_path), mode="w+", dtype=np.float32, shape=shape,
+        )
+
+        cursor = 0
+        for cad, n_take, n_avail in tqdm(plan, desc=label):
             indices = np_rng.choice(n_avail, size=n_take, replace=False)
             indices.sort()
 
             try:
                 snippets = _extract_cadence_snippets(cad, indices, fchans, tchans_per_obs)
             except Exception as e:
-                print(f"  error {cad[0].name}: {e}")
-                continue
+                print(f"\nFATAL: extraction failed for {cad[0].name} "
+                      f"(passed header check but failed on data read): {e}")
+                print("Aborting — partial file may exist. Re-run after fixing the corrupt file.")
+                raise
 
-            all_snippets.append(snippets)
-            total += len(snippets)
+            mm[cursor : cursor + n_take] = snippets
+            cursor += n_take
+            mm.flush()
 
-        if not all_snippets:
-            return np.empty((0, n_obs, tchans_per_obs, fchans), dtype=np.float32)
-
-        out = np.concatenate(all_snippets, axis=0)
-        print(f"  Extracted {len(out)} snippets → shape {out.shape}")
-        return out
-
-    n_val_target = max(1000, int(args.max_snippets * args.val_fraction / (1 - args.val_fraction)))
-
-    train_data = _extract_split(train_cadences, args.max_snippets, "train")
-    val_data   = _extract_split(val_cadences,   n_val_target,      "val")
-
-    # ---------------------------------------------------------- save .npy files
-    out_dir = args.output
-    out_dir.mkdir(parents=True, exist_ok=True)
+        assert cursor == n_total, f"BUG: wrote {cursor} but allocated {n_total}"
+        del mm
+        print(f"  {label}: {cursor:,} snippets written to {out_path}")
 
     train_path = out_dir / "train.npy"
-    val_path   = out_dir / "val.npy"
-    size_gb = (train_data.nbytes + val_data.nbytes) / 1e9
-    print(f"\nSaving to {out_dir}/  ({size_gb:.1f} GB)...")
-    np.save(str(train_path), train_data)
-    np.save(str(val_path),   val_data)
+    val_path = out_dir / "val.npy"
 
+    _extract_to_memmap(train_plan, n_train, "train", train_path)
+    _extract_to_memmap(val_plan, n_val, "val", val_path)
+
+    # ---------------------------------------------------------- metadata
     meta = {
-        "n_train": int(len(train_data)),
-        "n_val": int(len(val_data)),
-        "shape_per_snippet": [int(n_obs), int(tchans_per_obs), int(fchans)],
-        "n_train_cadences": len(train_cadences),
-        "n_val_cadences": len(val_cadences),
+        "n_train": n_train,
+        "n_val": n_val,
+        "shape_per_snippet": list(snippet_shape),
+        "n_train_cadences": len(train_plan),
+        "n_val_cadences": len(val_plan),
         "n_inject_recovery_cadences": len(inject_recovery),
+        "snippets_per_cadence": args.snippets_per_cadence,
         "seed": args.seed,
         "train_fraction": args.train_fraction,
         "val_fraction": args.val_fraction,
@@ -266,8 +297,8 @@ def main():
     meta_path.write_text(json.dumps(meta, indent=2))
 
     print(f"\nDone.")
-    print(f"  {train_path}  ({len(train_data)} train snippets)")
-    print(f"  {val_path}  ({len(val_data)} val snippets)")
+    print(f"  {train_path}  ({n_train:,} train snippets)")
+    print(f"  {val_path}  ({n_val:,} val snippets)")
     print(f"  {meta_path}")
     print(f"  {inj_path}  ({len(inject_recovery)} cadences for inject-recovery)")
     print(f"\nAdd to configs/data/gbt_fine.yaml:")
