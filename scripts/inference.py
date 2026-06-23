@@ -49,12 +49,13 @@ MAD_SCALE = 1.4826
 
 _shared_obs = None
 _shared_fchans = None
+_shared_tchans = None
 _shared_preproc = None
 
 
 def _preprocess_at(f_start):
     frames = [obs[:, f_start:f_start + _shared_fchans] for obs in _shared_obs]
-    stacked = np.concatenate(frames, axis=0)
+    stacked = np.concatenate(frames, axis=0)[:_shared_tchans, :]
     method = _shared_preproc.get("bandpass_method", "polynomial")
     poly_degree = _shared_preproc.get("poly_degree", 3)
     mad_epsilon = _shared_preproc.get("mad_epsilon", 1e-6)
@@ -185,7 +186,7 @@ def parse_args():
 
 
 def main():
-    global _shared_obs, _shared_fchans, _shared_preproc
+    global _shared_obs, _shared_fchans, _shared_tchans, _shared_preproc
     args = parse_args()
 
     with open(args.data_config) as f:
@@ -257,6 +258,7 @@ def main():
 
         _shared_obs = obs_arrays
         _shared_fchans = fchans
+        _shared_tchans = tchans
         _shared_preproc = preproc
 
         f_starts = [i * stride for i in range(n_snippets)]

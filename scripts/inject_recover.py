@@ -77,10 +77,10 @@ def reconstruct_snippet(model, snippet, device):
     return recon.squeeze().cpu().numpy()
 
 
-def preprocess_raw_window(obs_arrays, f_start, fchans, preproc):
-    """Slice a (96, fchans) window from loaded obs arrays and preprocess."""
+def preprocess_raw_window(obs_arrays, f_start, fchans, preproc, tchans=96):
+    """Slice a (tchans, fchans) window from loaded obs arrays and preprocess."""
     frames = [obs[:, f_start:f_start + fchans] for obs in obs_arrays]
-    stacked = np.concatenate(frames, axis=0)
+    stacked = np.concatenate(frames, axis=0)[:tchans, :]
     method = preproc.get("bandpass_method", "polynomial")
     poly_degree = preproc.get("poly_degree", 3)
     mad_epsilon = preproc.get("mad_epsilon", 1e-6)
@@ -89,20 +89,18 @@ def preprocess_raw_window(obs_arrays, f_start, fchans, preproc):
     return stacked
 
 
-def inject_into_obs(obs_arrays, f_start, fchans, snr, drift_rate, seed):
+def inject_into_obs(obs_arrays, f_start, fchans, snr, drift_rate, seed, tchans_per_obs=16):
     """Extract raw window from obs arrays, inject ON-only signal, return raw snippet."""
-    n_obs = len(obs_arrays)
-    tchans_per_obs = obs_arrays[0].shape[0]
-    raw = np.stack([obs[:, f_start:f_start + fchans] for obs in obs_arrays])
+    raw = np.stack([obs[:tchans_per_obs, f_start:f_start + fchans] for obs in obs_arrays])
     return inject_narrowband_on_only(raw, snr=snr, drift_rate=drift_rate, seed=seed)
 
 
-def preprocess_injected(raw_snippet, preproc):
+def preprocess_injected(raw_snippet, preproc, tchans=96):
     """Preprocess an injected raw snippet (n_obs, tchans_per_obs, fchans)."""
     method = preproc.get("bandpass_method", "polynomial")
     poly_degree = preproc.get("poly_degree", 3)
     mad_epsilon = preproc.get("mad_epsilon", 1e-6)
-    frame = np.concatenate(raw_snippet, axis=0)
+    frame = np.concatenate(raw_snippet, axis=0)[:tchans, :]
     frame = bandpass_correct(frame, method=method, poly_degree=poly_degree)
     frame = core_transform(frame, mad_epsilon)
     return frame.astype(np.float32)
