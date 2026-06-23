@@ -244,10 +244,18 @@ def main():
         # Load all observations into RAM
         t_load = time.time()
         obs_arrays = []
+        corrupt = False
         for i, obs_path in enumerate(obs_paths):
-            arr = _load_full_obs(obs_path, downsample_factor)
+            try:
+                arr = _load_full_obs(obs_path, downsample_factor)
+            except OSError as e:
+                print(f"  SKIPPING cadence — corrupt file obs {i}: {obs_path.name} — {e}")
+                corrupt = True
+                break
             obs_arrays.append(arr)
             print(f"  Loaded obs {i}: {obs_path.name} -> {arr.shape}")
+        if corrupt:
+            continue
         load_time = time.time() - t_load
 
         nchans = obs_arrays[0].shape[1]
