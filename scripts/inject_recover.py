@@ -190,9 +190,14 @@ def main():
         print(f"{'='*70}")
 
         obs_arrays = []
-        for obs_path in obs_paths:
-            arr = _load_full_obs(obs_path, downsample_factor)
-            obs_arrays.append(arr)
+        try:
+            for obs_path in obs_paths:
+                arr = _load_full_obs(obs_path, downsample_factor)
+                obs_arrays.append(arr)
+        except OSError as e:
+            print(f"  SKIPPING — corrupt file: {e}")
+            del obs_arrays
+            continue
         nchans = obs_arrays[0].shape[1]
         print(f"  Loaded {len(obs_arrays)} obs, nchans={nchans}")
 
