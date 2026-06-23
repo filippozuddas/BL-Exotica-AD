@@ -2,11 +2,8 @@
 Run inference on real cadences from a cadence list file.
 
 Loads each cadence's .h5 files fully into RAM, slides a (tchans, fchans)
-window across the frequency axis at stride_infer, preprocesses each snippet,
-computes cadence + recon anomaly scores, and reports candidates above threshold.
-
-Each cadence's 6 observations are loaded once (~4 GB/obs for 67M channels);
-snippets are sliced from the in-memory arrays (no per-snippet I/O).
+window across the frequency axis at stride_infer, preprocesses each snippet
+in parallel across CPU cores, and scores batches on GPU.
 
 Outputs:
   - inference_scores.csv: per-snippet scores
@@ -14,15 +11,17 @@ Outputs:
   - inference_cadence_scores_by_freq.png: per-cadence frequency profiles
 
 Usage (run on the server):
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/home/acabras/data/filippo/BL-Exotica-AD \
+    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
     python scripts/inference.py \
         --checkpoint outputs/training/<run>/checkpoints/best.ckpt \
         --cadence_list data/processed/inference_cadences.txt \
-        --out_dir outputs/inference/run_name
+        --out_dir outputs/inference/run_name \
+        --num_workers 32
 """
 
 import argparse
 import csv
+import multiprocessing as mp
 import sys
 import time
 from pathlib import Path
@@ -39,10 +38,27 @@ sys.path.insert(0, str(ROOT))
 
 from src.models.autoencoder import build_autoencoder
 from src.data.preprocessing import bandpass_correct, core_transform
-from src.data.torch_dataset import _load_full_obs, _read_nchans
+from src.data.torch_dataset import _load_full_obs
 
 INPUT_SHAPE = (96, 1024, 1)
 METHODS = ["recon", "cadence"]
+
+# Shared state for worker processes (inherited via fork COW)
+_shared_obs = None
+_shared_fchans = None
+_shared_preproc = None
+
+
+def _preprocess_at(f_start):
+    """Worker: slice snippet from shared obs arrays and preprocess."""
+    frames = [obs[:, f_start:f_start + _shared_fchans] for obs in _shared_obs]
+    stacked = np.concatenate(frames, axis=0)
+    method = _shared_preproc.get("bandpass_method", "polynomial")
+    poly_degree = _shared_preproc.get("poly_degree", 3)
+    mad_epsilon = _shared_preproc.get("mad_epsilon", 1e-6)
+    stacked = bandpass_correct(stacked, method=method, poly_degree=poly_degree)
+    stacked = core_transform(stacked, mad_epsilon)
+    return stacked
 
 
 def load_model(checkpoint_path: Path, model_config: dict, device: str):
@@ -53,15 +69,6 @@ def load_model(checkpoint_path: Path, model_config: dict, device: str):
     model.load_state_dict(state)
     model.eval().to(device)
     return model
-
-
-def preprocess_snippet(stacked: np.ndarray, preproc_cfg: dict) -> np.ndarray:
-    method = preproc_cfg.get("bandpass_method", "polynomial")
-    poly_degree = preproc_cfg.get("poly_degree", 3)
-    mad_epsilon = preproc_cfg.get("mad_epsilon", 1e-6)
-    stacked = bandpass_correct(stacked, method=method, poly_degree=poly_degree)
-    stacked = core_transform(stacked, mad_epsilon)
-    return stacked
 
 
 def score_batch(model, snippets: list, method: str, device: str) -> np.ndarray:
@@ -81,14 +88,14 @@ def parse_args():
     p.add_argument("--model_config", type=Path, default=ROOT / "configs/model/vit_mae.yaml")
     p.add_argument("--out_dir", type=Path, default=ROOT / "outputs/inference")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--max_cadences", type=int, default=None,
-                   help="Limit number of cadences to process (default: all)")
-    p.add_argument("--batch_size", type=int, default=64,
-                   help="Number of snippets to batch for GPU scoring")
+    p.add_argument("--max_cadences", type=int, default=None)
+    p.add_argument("--batch_size", type=int, default=512)
+    p.add_argument("--num_workers", type=int, default=16)
     return p.parse_args()
 
 
 def main():
+    global _shared_obs, _shared_fchans, _shared_preproc
     args = parse_args()
 
     with open(args.data_config) as f:
@@ -116,7 +123,7 @@ def main():
 
     print(f"Cadences: {len(cadence_lines)}")
     print(f"Frame: {tchans}x{fchans}, stride={stride}, downsample={downsample_factor}")
-    print(f"Batch size: {args.batch_size}")
+    print(f"Batch size: {args.batch_size}, workers: {args.num_workers}")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -128,8 +135,7 @@ def main():
         obs_paths = [Path(p) for p in obs_paths]
         target_name = "unknown"
         for p in obs_paths:
-            parts = p.stem.split("_")
-            for part in parts:
+            for part in p.stem.split("_"):
                 if part.startswith("TIC"):
                     target_name = part
                     break
@@ -140,13 +146,13 @@ def main():
         print(f"Cadence {cad_idx}: {target_name} ({len(obs_paths)} obs)")
         print(f"{'='*70}")
 
-        # Load all observations into RAM once
+        # Load all observations into RAM
         t_load = time.time()
         obs_arrays = []
         for i, obs_path in enumerate(obs_paths):
             arr = _load_full_obs(obs_path, downsample_factor)
             obs_arrays.append(arr)
-            print(f"  Loaded obs {i}: {obs_path.name} → {arr.shape}")
+            print(f"  Loaded obs {i}: {obs_path.name} -> {arr.shape}")
         load_time = time.time() - t_load
 
         nchans = obs_arrays[0].shape[1]
@@ -155,60 +161,65 @@ def main():
         print(f"  {mem_gb:.1f} GB in RAM, loaded in {load_time:.1f}s")
         print(f"  nchans={nchans} -> {n_snippets} snippets (stride={stride})")
 
+        # Set shared state for workers
+        _shared_obs = obs_arrays
+        _shared_fchans = fchans
+        _shared_preproc = preproc
+
+        f_starts = [i * stride for i in range(n_snippets)]
+
         t0 = time.time()
         batch_snippets = []
         batch_fstarts = []
+        processed_count = 0
 
-        for snip_idx in range(n_snippets):
-            f_start = snip_idx * stride
-            f_end = f_start + fchans
+        chunksize = max(1, min(256, n_snippets // (args.num_workers * 4)))
+        print(f"  Pool: {args.num_workers} workers, chunksize={chunksize}")
 
-            # Slice from in-memory arrays and stack
-            frames = [obs[:, f_start:f_end] for obs in obs_arrays]
-            stacked = np.concatenate(frames, axis=0)
-            snip = preprocess_snippet(stacked, preproc)
+        with mp.Pool(args.num_workers) as pool:
+            for f_start, snippet in zip(f_starts, pool.imap(_preprocess_at, f_starts,
+                                                             chunksize=chunksize)):
+                batch_snippets.append(snippet)
+                batch_fstarts.append(f_start)
 
-            batch_snippets.append(snip)
-            batch_fstarts.append(f_start)
+                if len(batch_snippets) == args.batch_size or processed_count == n_snippets - 1:
+                    recon_scores = score_batch(model, batch_snippets, "recon", args.device)
+                    cadence_scores = score_batch(model, batch_snippets, "cadence", args.device)
 
-            if len(batch_snippets) == args.batch_size or snip_idx == n_snippets - 1:
-                recon_scores = score_batch(model, batch_snippets, "recon", args.device)
-                cadence_scores = score_batch(model, batch_snippets, "cadence", args.device)
+                    for j in range(len(batch_snippets)):
+                        all_recon.append(recon_scores[j])
+                        all_cadence.append(cadence_scores[j])
+                        all_rows.append({
+                            "cadence_idx": cad_idx,
+                            "target": target_name,
+                            "f_start": batch_fstarts[j],
+                            "f_center_mhz": batch_fstarts[j] * data_cfg["raw"]["df"] / 1e6,
+                            "recon_score": float(recon_scores[j]),
+                            "cadence_score": float(cadence_scores[j]),
+                        })
+                    batch_snippets = []
+                    batch_fstarts = []
 
-                for j in range(len(batch_snippets)):
-                    all_recon.append(recon_scores[j])
-                    all_cadence.append(cadence_scores[j])
-                    all_rows.append({
-                        "cadence_idx": cad_idx,
-                        "target": target_name,
-                        "f_start": batch_fstarts[j],
-                        "f_center_mhz": batch_fstarts[j] * data_cfg["raw"]["df"] / 1e6,
-                        "recon_score": float(recon_scores[j]),
-                        "cadence_score": float(cadence_scores[j]),
-                    })
-                batch_snippets = []
-                batch_fstarts = []
-
-            if (snip_idx + 1) % 5000 == 0:
-                elapsed = time.time() - t0
-                rate = (snip_idx + 1) / elapsed
-                eta = (n_snippets - snip_idx - 1) / rate
-                print(f"  {snip_idx+1}/{n_snippets} snippets  "
-                      f"({rate:.0f}/s, ETA {eta:.0f}s)")
+                processed_count += 1
+                if processed_count % 5000 == 0:
+                    elapsed = time.time() - t0
+                    rate = processed_count / elapsed
+                    eta = (n_snippets - processed_count) / rate
+                    print(f"  {processed_count}/{n_snippets} snippets  "
+                          f"({rate:.0f}/s, ETA {eta:.0f}s)")
 
         elapsed = time.time() - t0
         print(f"  Scored {n_snippets} snippets in {elapsed:.1f}s "
               f"({n_snippets/max(elapsed,1):.0f}/s)")
 
-        # Free memory before next cadence
         del obs_arrays
+        _shared_obs = None
 
     # Global analysis
     all_recon = np.array(all_recon)
     all_cadence = np.array(all_cadence)
     n_total = len(all_recon)
 
-    # Save CSV
     csv_path = args.out_dir / "inference_scores.csv"
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["cadence_idx", "target", "f_start",
@@ -217,7 +228,6 @@ def main():
         writer.writerows(all_rows)
     print(f"\nSaved scores -> {csv_path}")
 
-    # Summary
     print(f"\n{'='*70}")
     print(f"SUMMARY -- {n_total} snippets across {len(cadence_lines)} cadences")
     print(f"{'='*70}")
@@ -270,7 +280,6 @@ def main():
     plt.close()
     print(f"\nSaved -> {args.out_dir / 'inference_score_distributions.png'}")
 
-    # Per-cadence frequency profile
     fig, axes = plt.subplots(len(cadence_lines), 1,
                              figsize=(16, 3 * len(cadence_lines)), squeeze=False)
     offset = 0
