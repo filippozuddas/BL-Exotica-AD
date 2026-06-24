@@ -4,7 +4,7 @@ Unsupervised anomaly detection pipeline for searching technosignatures in Green 
 
 **Author:** Filippo Simone Zuddas (Uni. Cagliari)
 **Mentors:** Maura Pilia, Vishal Gajjar
-**Program:** Breakthrough Listen / SRT Summer 2026
+**Program:** Breakthrough Listen Summer Internship 2026
 
 ## Motivation
 
