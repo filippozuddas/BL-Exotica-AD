@@ -23,12 +23,19 @@ dependencies = [
     "pandas>=2.0",
 ]
 
+[project.scripts]
+bl-train = "scripts.train:main"
+bl-inference = "scripts.inference:main"
+bl-inject = "scripts.inject_recover:main"
+bl-preprocess = "scripts.preprocess_cache:main"
+bl-manifest = "scripts.build_cadence_manifest:main"
+
 [project.optional-dependencies]
 dev = ["pytest>=7.4", "ruff>=0.4", "mypy>=1.8"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src*"]
+include = ["src*", "scripts*"]
 
 [tool.ruff]
 line-length = 100
