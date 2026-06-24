@@ -50,6 +50,6 @@ loader:
   overlap: 16               # Overlapping bins between chunks
 
 dataset:
-  cadence_list: data/raw/gbt_fine_cadences.txt  # one cadence per line, 6 space-separated paths
+  cadence_list: data/raw/srt_0000_cadences.txt  # one cadence per line, 6 space-separated paths
   cache_dir: /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine  # directory with train.npy, val.npy, meta.json
   seed: 42
