@@ -61,6 +61,12 @@ class Autoencoder(nn.Module):
         """Scalar training loss: mean per-sample reconstruction error."""
         return self.loss_fn(x, self(x)).mean()
 
+    def anomaly_score(self, x: torch.Tensor, method: str = "recon", **kwargs) -> torch.Tensor:
+        if method != "recon":
+            raise ValueError(f"Autoencoder only supports method='recon', got '{method}'.")
+        recon = self.forward(x)
+        return ((x - recon) ** 2).mean(dim=(1, 2, 3))
+
 
 class MAE(nn.Module):
     """CNN Masked Autoencoder.
@@ -120,6 +126,12 @@ class MAE(nn.Module):
         reconstruction = self(x * (1.0 - mask))
         return self._masked_mse(x, reconstruction, mask)
 
+    def anomaly_score(self, x: torch.Tensor, method: str = "recon", **kwargs) -> torch.Tensor:
+        if method != "recon":
+            raise ValueError(f"MAE only supports method='recon', got '{method}'.")
+        recon = self.forward(x)
+        return ((x - recon) ** 2).mean(dim=(1, 2, 3))
+
 
 class VAE(nn.Module):
     """Variational autoencoder: reconstruction + ``beta`` * KL."""
@@ -156,6 +168,12 @@ class VAE(nn.Module):
             "reconstruction_loss": recon_loss.detach(),
             "kl_loss": kl_loss.detach(),
         }
+
+    def anomaly_score(self, x: torch.Tensor, method: str = "recon", **kwargs) -> torch.Tensor:
+        if method != "recon":
+            raise ValueError(f"VAE only supports method='recon', got '{method}'.")
+        recon = self.forward(x)
+        return ((x - recon) ** 2).mean(dim=(1, 2, 3))
 
 
 def build_autoencoder(

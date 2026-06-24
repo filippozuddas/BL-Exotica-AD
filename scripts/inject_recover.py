@@ -43,7 +43,7 @@ from src.data.torch_dataset import _load_full_obs
 from scripts.debug.injection_vs_rfi_test import inject_narrowband_on_only
 
 INPUT_SHAPE = (96, 1024, 1)
-METHODS = ["recon", "cadence"]
+DEFAULT_METHODS = ["recon", "cadence"]
 MAD_SCALE = 1.4826
 
 
@@ -136,6 +136,8 @@ def parse_args():
                    default=[3, 5, 7, 10, 15, 20, 30, 50])
     p.add_argument("--drift_rate", type=float, default=0.3)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--methods", nargs="+", default=None,
+                   help="Scoring methods to test (default: all supported by model)")
     return p.parse_args()
 
 
@@ -157,8 +159,9 @@ def main():
     # Load background distribution from inference run
     print(f"Loading background from {args.inference_csv}")
     bg_recon, bg_cadence = load_background(args.inference_csv)
+    bg_all = {"recon": bg_recon, "cadence": bg_cadence}
     bg = {}
-    for name, scores in [("recon", bg_recon), ("cadence", bg_cadence)]:
+    for name, scores in bg_all.items():
         median, mad_sigma = robust_stats(scores)
         bg[name] = {"median": median, "mad_sigma": mad_sigma, "scores": scores,
                     "thresh_3s": median + 3 * mad_sigma,
@@ -178,10 +181,23 @@ def main():
     print(f"\nLoading model from {args.checkpoint}")
     model = load_model(args.checkpoint, model_cfg, args.device)
 
+    if args.methods is not None:
+        methods = args.methods
+    else:
+        methods = []
+        dummy = torch.zeros(1, 1, *INPUT_SHAPE[:2], device=args.device)
+        for m in DEFAULT_METHODS:
+            try:
+                model.anomaly_score(dummy, method=m)
+                methods.append(m)
+            except (ValueError, AttributeError):
+                print(f"  (skipping unsupported method '{m}' for this model)")
+    print(f"  Methods: {methods}")
+
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     # Collect results across all cadences
-    all_results = {m: {snr: [] for snr in args.snr_list} for m in METHODS}
+    all_results = {m: {snr: [] for snr in args.snr_list} for m in methods}
 
     for cad_idx, obs_paths in enumerate(cadence_lines):
         obs_paths = [Path(p) for p in obs_paths]
@@ -221,8 +237,7 @@ def main():
                                         replace=False)
 
         for snr in args.snr_list:
-            recon_scores = []
-            cadence_scores = []
+            method_scores = {m: [] for m in methods}
 
             for j, fs in enumerate(injection_fstarts):
                 raw_inj = inject_into_obs(obs_arrays, fs, fchans,
@@ -230,15 +245,12 @@ def main():
                                            seed=args.seed + cad_idx * 1000 + j)
                 snip_inj = preprocess_injected(raw_inj, preproc)
 
-                r = score_snippet(model, snip_inj, "recon", args.device)
-                c = score_snippet(model, snip_inj, "cadence", args.device)
-                recon_scores.append(r)
-                cadence_scores.append(c)
+                for m in methods:
+                    s = score_snippet(model, snip_inj, m, args.device)
+                    method_scores[m].append(s)
 
-            recon_scores = np.array(recon_scores)
-            cadence_scores = np.array(cadence_scores)
-            all_results["recon"][snr].extend(recon_scores.tolist())
-            all_results["cadence"][snr].extend(cadence_scores.tolist())
+            for m in methods:
+                all_results[m][snr].extend(method_scores[m])
 
         del obs_arrays
         print(f"  Done cadence {cad_idx}")
@@ -250,7 +262,7 @@ def main():
 
     csv_rows = []
 
-    for method in METHODS:
+    for method in methods:
         b = bg[method]
         median, mad_sigma = b["median"], b["mad_sigma"]
         thresh_3 = b["thresh_3s"]
@@ -298,7 +310,7 @@ def main():
     snrs = sorted(args.snr_list)
 
     # Left: score vs SNR
-    for method in METHODS:
+    for method in methods:
         b = bg[method]
         means = [np.mean(all_results[method][s]) for s in snrs]
         stds = [np.std(all_results[method][s]) for s in snrs]
@@ -313,7 +325,7 @@ def main():
     axes[0].legend(fontsize=7)
 
     # Right: detection rate
-    for method in METHODS:
+    for method in methods:
         b = bg[method]
         for n_sigma, ls in [(3, "-"), (5, "--")]:
             thresh = b["median"] + n_sigma * b["mad_sigma"]
@@ -327,7 +339,8 @@ def main():
     axes[1].set_ylim(-5, 105)
     axes[1].legend(fontsize=7)
 
-    plt.suptitle(f"Injection Recovery — {sum(len(all_results['recon'][s]) for s in snrs)} "
+    m0 = methods[0]
+    plt.suptitle(f"Injection Recovery — {sum(len(all_results[m0][s]) for s in snrs)} "
                  f"injections across {len(cadence_lines)} cadences", fontsize=11)
     plt.tight_layout()
     plt.savefig(args.out_dir / "inject_recovery_detection.png", dpi=150)
@@ -335,8 +348,9 @@ def main():
     print(f"Saved -> {args.out_dir / 'inject_recovery_detection.png'}")
 
     # ---- Plot 2: Injection scores overlaid on background distribution ----
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    for ax, method in zip(axes, METHODS):
+    fig, axes = plt.subplots(1, max(len(methods), 2), figsize=(7 * max(len(methods), 2), 5),
+                             squeeze=False)
+    for ax, method in zip(axes.flat, methods):
         b = bg[method]
         clipped = b["scores"][b["scores"] < np.percentile(b["scores"], 99.5)]
         ax.hist(clipped, bins=200, alpha=0.5, color="gray", label="Background (real)",
@@ -384,8 +398,9 @@ def main():
         snip_clean = preprocess_raw_window(obs_arrays, quiet_fs, fchans, preproc)
         recon_arr = reconstruct_snippet(model, snip_inj, args.device)
 
-        r_score = score_snippet(model, snip_inj, "recon", args.device)
-        c_score = score_snippet(model, snip_inj, "cadence", args.device)
+        method_scores = {}
+        for m in methods:
+            method_scores[m] = score_snippet(model, snip_inj, m, args.device)
 
         fig, axes = plt.subplots(2, 3, figsize=(18, 10))
         vmin, vmax = np.percentile(snip_clean, [1, 99])
@@ -415,13 +430,19 @@ def main():
         axes[0, 1].set_title("Injected - Clean (ground truth)")
 
         axes[0, 2].axis("off")
-        axes[0, 2].text(0.1, 0.7, f"SNR = {snr}\n"
-                        f"recon score = {r_score:.4f}\n"
-                        f"cadence score = {c_score:.4f}\n\n"
-                        f"recon 3s threshold = {bg['recon']['thresh_3s']:.4f}\n"
-                        f"cadence 3s threshold = {bg['cadence']['thresh_3s']:.4f}\n\n"
-                        f"recon detected: {'YES' if r_score > bg['recon']['thresh_3s'] else 'NO'}\n"
-                        f"cadence detected: {'YES' if c_score > bg['cadence']['thresh_3s'] else 'NO'}",
+        info_lines = [f"SNR = {snr}"]
+        for m in methods:
+            info_lines.append(f"{m} score = {method_scores[m]:.4f}")
+        info_lines.append("")
+        for m in methods:
+            if m in bg:
+                info_lines.append(f"{m} 3s threshold = {bg[m]['thresh_3s']:.4f}")
+        info_lines.append("")
+        for m in methods:
+            if m in bg:
+                det = "YES" if method_scores[m] > bg[m]["thresh_3s"] else "NO"
+                info_lines.append(f"{m} detected: {det}")
+        axes[0, 2].text(0.1, 0.7, "\n".join(info_lines),
                         transform=axes[0, 2].transAxes, fontsize=12,
                         verticalalignment="top", fontfamily="monospace")
 

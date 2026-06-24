@@ -39,7 +39,7 @@ from scripts.debug.injection_vs_rfi_test import (
 )
 
 INPUT_SHAPE = (96, 1024, 1)
-METHODS = ["recon", "cadence"]
+DEFAULT_METHODS = ["recon", "cadence"]
 
 
 def load_model(checkpoint_path: Path, model_config: dict, device: str):
@@ -74,6 +74,8 @@ def parse_args():
     p.add_argument("--out_dir", type=Path, default=ROOT / "outputs/cadence_snr_sweep")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--methods", nargs="+", default=None,
+                   help="Scoring methods to test (default: all supported by model)")
     return p.parse_args()
 
 
@@ -88,6 +90,22 @@ def main():
 
     print(f"Loading model from {args.checkpoint}")
     model = load_model(args.checkpoint, model_cfg, args.device)
+
+    if args.methods is not None:
+        methods = args.methods
+    else:
+        methods = list(DEFAULT_METHODS)
+        # Auto-detect: drop unsupported methods for this model
+        supported = []
+        for m in methods:
+            try:
+                dummy = torch.zeros(1, 1, *INPUT_SHAPE[:2], device=args.device)
+                model.anomaly_score(dummy, method=m)
+                supported.append(m)
+            except (ValueError, AttributeError):
+                print(f"  (skipping unsupported method '{m}' for this model)")
+        methods = supported
+    print(f"  Methods: {methods}")
 
     npy_path = Path(args.cache) / f"{args.split}.npy"
     print(f"Loading cache: {npy_path}")
@@ -110,9 +128,9 @@ def main():
     q75 = np.percentile(hot_fracs, 75)
     rfi_idx = np.where(hot_fracs >= q75)[0]
 
-    # ---- Baseline scores for both methods ----
+    # ---- Baseline scores for each method ----
     results = {}
-    for method in METHODS:
+    for method in methods:
         print(f"\n{'='*60}")
         print(f"Method: {method}")
         print(f"{'='*60}")
@@ -158,8 +176,8 @@ def main():
 
     # ---- Save raw results ----
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    save_dict = {"snr_list": np.array(args.snr_list)}
-    for method in METHODS:
+    save_dict = {"snr_list": np.array(args.snr_list), "methods": np.array(methods)}
+    for method in methods:
         r = results[method]
         save_dict[f"{method}_baseline"] = r["baseline"]
         save_dict[f"{method}_rfi"] = r["rfi"]
@@ -167,21 +185,22 @@ def main():
             save_dict[f"{method}_inject_snr_{int(snr)}"] = v
     np.savez(args.out_dir / "cadence_snr_sweep_results.npz", **save_dict)
 
-    # ---- Plot 1: Sensitivity curves (side-by-side) ----
+    # ---- Plot 1: Sensitivity curves ----
     snrs = sorted(args.snr_list)
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    fig.suptitle("Cadence vs Recon scoring — SNR sensitivity (ON-only injection)", fontsize=12)
+    method_label = " vs ".join(methods)
+    fig.suptitle(f"{method_label} scoring — SNR sensitivity (ON-only injection)", fontsize=12)
 
     colors = {"recon": "steelblue", "cadence": "crimson"}
-    for method in METHODS:
+    for method in methods:
         r = results[method]
         means = [r["inject"][s].mean() for s in snrs]
         stds = [r["inject"][s].std() for s in snrs]
 
         ax = axes[0]
-        ax.errorbar(snrs, means, yerr=stds, marker="o", color=colors[method],
+        ax.errorbar(snrs, means, yerr=stds, marker="o", color=colors.get(method, "gray"),
                      capsize=3, label=f"{method} inject-ON")
-        ax.axhline(r["b_mean"], ls="--", color=colors[method], alpha=0.5,
+        ax.axhline(r["b_mean"], ls="--", color=colors.get(method, "gray"), alpha=0.5,
                     label=f"{method} quiet ({r['b_mean']:.2f})")
 
     axes[0].set_xlabel("Injection SNR")
@@ -189,12 +208,12 @@ def main():
     axes[0].set_title("Mean score vs SNR")
     axes[0].legend(fontsize=7)
 
-    for method in METHODS:
+    for method in methods:
         r = results[method]
         for n_sigma, ls in [(3, "-"), (5, "--")]:
             thresh = r["b_mean"] + n_sigma * r["b_std"]
             det_rates = [(r["inject"][s] > thresh).mean() * 100 for s in snrs]
-            axes[1].plot(snrs, det_rates, ls, color=colors[method], marker="o",
+            axes[1].plot(snrs, det_rates, ls, color=colors.get(method, "gray"), marker="o",
                          label=f"{method} @ {n_sigma}σ", markersize=4)
 
     axes[1].set_xlabel("Injection SNR")
@@ -204,20 +223,21 @@ def main():
     axes[1].legend(fontsize=7)
 
     plt.tight_layout()
-    plt.savefig(args.out_dir / "cadence_vs_recon_sensitivity.png", dpi=150)
+    plt.savefig(args.out_dir / "snr_sensitivity.png", dpi=150)
     plt.close()
-    print(f"\nSaved → {args.out_dir / 'cadence_vs_recon_sensitivity.png'}")
+    print(f"\nSaved → {args.out_dir / 'snr_sensitivity.png'}")
 
-    # ---- Plot 2: Score distributions (box plot, both methods) ----
-    fig, axes = plt.subplots(len(METHODS), 1, figsize=(max(12, len(snrs) + 4), 5 * len(METHODS)),
-                             sharex=True)
-    for ax, method in zip(axes, METHODS):
+    # ---- Plot 2: Score distributions (box plot) ----
+    fig, axes = plt.subplots(len(methods), 1,
+                             figsize=(max(12, len(snrs) + 4), 5 * len(methods)),
+                             sharex=True, squeeze=False)
+    for ax, method in zip(axes.flat, methods):
         r = results[method]
         box_data = [r["baseline"], r["rfi"]] + [r["inject"][s] for s in snrs]
         box_labels = ["Quiet", "RFI"] + [f"SNR={int(s)}" for s in snrs]
         bp = ax.boxplot(box_data, labels=box_labels, patch_artist=True, widths=0.6)
         for patch in bp["boxes"]:
-            patch.set_facecolor(colors[method])
+            patch.set_facecolor(colors.get(method, "gray"))
             patch.set_alpha(0.7)
         ax.axhline(r["b_mean"] + 3 * r["b_std"], ls="--", color="gray", alpha=0.5,
                     label=f"3σ ({r['b_mean'] + 3 * r['b_std']:.2f})")
@@ -227,25 +247,46 @@ def main():
 
     plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
-    plt.savefig(args.out_dir / "cadence_vs_recon_distributions.png", dpi=150)
+    plt.savefig(args.out_dir / "score_distributions.png", dpi=150)
     plt.close()
-    print(f"Saved → {args.out_dir / 'cadence_vs_recon_distributions.png'}")
+    print(f"Saved → {args.out_dir / 'score_distributions.png'}")
 
-    # ---- Summary comparison ----
+    # ---- Summary ----
     print(f"\n{'='*60}")
-    print("SUMMARY: cadence vs recon at key SNR thresholds")
-    print(f"{'='*60}")
-    print(f"  {'SNR':>5s}  {'recon σ':>8s}  {'recon 3σ%':>9s}  "
-          f"{'cadence σ':>10s}  {'cadence 3σ%':>11s}  {'winner':>8s}")
-    for snr in snrs:
-        r_r, r_c = results["recon"], results["cadence"]
-        sig_r = (r_r["inject"][snr].mean() - r_r["b_mean"]) / r_r["b_std"] if r_r["b_std"] > 0 else 0
-        sig_c = (r_c["inject"][snr].mean() - r_c["b_mean"]) / r_c["b_std"] if r_c["b_std"] > 0 else 0
-        det_r = (r_r["inject"][snr] > r_r["b_mean"] + 3 * r_r["b_std"]).mean() * 100
-        det_c = (r_c["inject"][snr] > r_c["b_mean"] + 3 * r_c["b_std"]).mean() * 100
-        winner = "cadence" if sig_c > sig_r else "recon" if sig_r > sig_c else "tie"
-        print(f"  {snr:5.0f}  {sig_r:8.2f}σ  {det_r:8.1f}%  "
-              f"{sig_c:10.2f}σ  {det_c:10.1f}%  {winner:>8s}")
+    if len(methods) > 1:
+        print(f"SUMMARY: {' vs '.join(methods)} at key SNR thresholds")
+        print(f"{'='*60}")
+        header = f"  {'SNR':>5s}"
+        for m in methods:
+            header += f"  {m + ' σ':>10s}  {m + ' 3σ%':>11s}"
+        if len(methods) == 2:
+            header += f"  {'winner':>8s}"
+        print(header)
+        for snr in snrs:
+            line = f"  {snr:5.0f}"
+            sigs = {}
+            for m in methods:
+                r = results[m]
+                sig = (r["inject"][snr].mean() - r["b_mean"]) / r["b_std"] if r["b_std"] > 0 else 0
+                det = (r["inject"][snr] > r["b_mean"] + 3 * r["b_std"]).mean() * 100
+                sigs[m] = sig
+                line += f"  {sig:10.2f}σ  {det:10.1f}%"
+            if len(methods) == 2:
+                m0, m1 = methods
+                winner = m1 if sigs[m1] > sigs[m0] else m0 if sigs[m0] > sigs[m1] else "tie"
+                line += f"  {winner:>8s}"
+            print(line)
+    else:
+        m = methods[0]
+        print(f"SUMMARY: {m} at key SNR thresholds")
+        print(f"{'='*60}")
+        print(f"  {'SNR':>5s}  {'sigma':>8s}  {'det@3σ':>8s}  {'det@5σ':>8s}")
+        for snr in snrs:
+            r = results[m]
+            sig = (r["inject"][snr].mean() - r["b_mean"]) / r["b_std"] if r["b_std"] > 0 else 0
+            det3 = (r["inject"][snr] > r["b_mean"] + 3 * r["b_std"]).mean() * 100
+            det5 = (r["inject"][snr] > r["b_mean"] + 5 * r["b_std"]).mean() * 100
+            print(f"  {snr:5.0f}  {sig:8.2f}σ  {det3:7.1f}%  {det5:7.1f}%")
 
     print("\nDone.")
 
