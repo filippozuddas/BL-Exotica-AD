@@ -196,6 +196,8 @@ def main():
     else:
         snap_indices = list(range(n_snap))
     val_samples = torch.stack([val_ds[i] for i in snap_indices])
+    if hasattr(val_ds, "close"):
+        val_ds.close()
     callbacks = build_callbacks(cfg, run_dir, val_sample=val_samples)
 
     module = AELightningModule(model, cfg)

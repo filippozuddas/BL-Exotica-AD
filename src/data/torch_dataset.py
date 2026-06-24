@@ -227,24 +227,43 @@ class CachedDataset(Dataset):
 
     def __init__(self, cache_dir: Path, split: str, cfg_preproc: Dict[str, Any],
                  mmap: bool = True):
-        npy_path = cache_dir / f"{split}.npy"
-        if mmap:
-            print(f"Memory-mapping {split} cache from {npy_path}...")
-            self.data = np.load(str(npy_path), mmap_mode="r")
-        else:
-            print(f"Loading {split} cache into RAM from {npy_path}...")
-            self.data = np.load(str(npy_path))
+        self._npy_path = str(cache_dir / f"{split}.npy")
+        self._mmap = mmap
+        self._split = split
         self.cfg_preproc = cfg_preproc
-        gb = self.data.nbytes / 1e9
+        self.data: np.ndarray | None = None
+
+        # Read header to get shape/length without loading data into this process.
+        # Each DataLoader worker will open its own mmap in _ensure_loaded().
+        tmp = np.load(self._npy_path, mmap_mode="r")
+        self._len = tmp.shape[0]
+        self._shape = tmp.shape[1:]
+        self._nbytes = tmp.nbytes
+        del tmp
+
+        gb = self._nbytes / 1e9
         mode = "mmap" if mmap else "RAM"
-        print(f"  {split}: {self.data.shape[0]} snippets  "
-              f"shape={self.data.shape[1:]}  "
+        print(f"Memory-mapping {split} cache from {self._npy_path}...")
+        print(f"  {split}: {self._len} snippets  "
+              f"shape={self._shape}  "
               f"~{gb:.1f} GB ({mode})")
 
+    def _ensure_loaded(self):
+        if self.data is None:
+            if self._mmap:
+                self.data = np.load(self._npy_path, mmap_mode="r")
+            else:
+                self.data = np.load(self._npy_path)
+
+    def close(self):
+        """Release the mmap so forked workers don't inherit it."""
+        self.data = None
+
     def __len__(self) -> int:
-        return len(self.data)
+        return self._len
 
     def __getitem__(self, idx: int) -> torch.Tensor:
+        self._ensure_loaded()
         method = self.cfg_preproc.get("bandpass_method", "polynomial")
         poly_degree = self.cfg_preproc.get("poly_degree", 3)
         mad_epsilon = self.cfg_preproc.get("mad_epsilon", 1e-6)
