@@ -86,47 +86,58 @@ def frame_energy(frames: np.ndarray) -> np.ndarray:
     return (frames.astype(np.float64) ** 2).mean(axis=(1, 2))
 
 
-def morphology_beyond_energy(emb_inj, en_inj, emb_rfi, en_rfi, seed=0):
-    """Upper-bound test: can a LINEAR readout tell injected-narrowband (anomaly)
-    from RFI (normal-but-energetic) using the embedding *beyond* input energy?
+def morphology_matched_energy(emb_inj, en_inj, emb_rfi, en_rfi, seed=0, nbins=8):
+    """Deciding test: at MATCHED input energy, does the embedding separate
+    injected-narrowband (anomaly) from RFI (normal-but-energetic)?
 
-    Both classes are energy-confounded (a signal IS energy), so we compare three
-    5-fold-CV AUCs of a logistic readout, on balanced subsamples:
-      - energy-only   : AUC reachable from the scalar energy alone (the confound).
-      - embedding     : AUC from the raw embedding (energy + morphology mixed).
-      - emb | energy  : AUC from the embedding with energy regressed out per-dim
-                        (OLS residuals) — morphology sensitivity with energy removed.
+    Energy is the confound (a signal IS energy), and injected-narrowband barely
+    raises energy while RFI is genuinely energetic — so the two classes are nearly
+    energy-disjoint and *any* scorer separates them trivially by energy. To remove
+    that, we energy-stratify: split the energy-overlap band into ``nbins`` and draw
+    equal counts per class per bin, giving two sets with the SAME energy histogram.
 
-    If 'emb | energy' >> 0.5 there is a morphology axis -> feature scoring is
-    viable. If it collapses to ~0.5 (and only energy-only/embedding separate), the
-    embedding encodes ~only energy -> recon and feature scoring are the same thing.
+    Returns 5-fold-CV logistic AUCs on the matched sets:
+      - energy_only : sanity check — should be ~0.5 if matching worked.
+      - embedding   : AUC from the embedding. If >>0.5 with energy_only~0.5, a real
+                      MORPHOLOGY axis exists -> feature scoring is viable. If ~0.5,
+                      the embedding is ~pure energy -> recon == feature scoring.
     """
     try:
         from sklearn.linear_model import LogisticRegression
         from sklearn.model_selection import cross_val_score
         from sklearn.preprocessing import StandardScaler
     except ImportError:
-        print("  (scikit-learn not available — skipping morphology-vs-energy test)")
+        print("  (scikit-learn not available — skipping matched-energy test)")
         return None
 
     rng = np.random.default_rng(seed)
-    n = min(len(emb_inj), len(emb_rfi))
-    ia = rng.choice(len(emb_inj), n, replace=False)
-    ib = rng.choice(len(emb_rfi), n, replace=False)
-    X = np.concatenate([emb_inj[ia], emb_rfi[ib]], 0)
-    e = np.concatenate([en_inj[ia], en_rfi[ib]], 0)[:, None]
-    y = np.concatenate([np.ones(n), np.zeros(n)])
+    lo, hi = max(en_inj.min(), en_rfi.min()), min(en_inj.max(), en_rfi.max())
+    if hi <= lo:
+        return {"error": "no energy overlap between injected and RFI"}
+    edges = np.linspace(lo, hi, nbins + 1)
+    ii, jj = [], []
+    for k in range(nbins):
+        hi_inc = k == nbins - 1  # include right edge in last bin
+        a = np.where((en_inj >= edges[k]) & ((en_inj <= edges[k + 1]) if hi_inc else (en_inj < edges[k + 1])))[0]
+        b = np.where((en_rfi >= edges[k]) & ((en_rfi <= edges[k + 1]) if hi_inc else (en_rfi < edges[k + 1])))[0]
+        m = min(len(a), len(b))
+        if m:
+            ii.append(rng.choice(a, m, replace=False))
+            jj.append(rng.choice(b, m, replace=False))
+    if not ii:
+        return {"error": "no overlapping energy bins with both classes populated"}
+    ii, jj = np.concatenate(ii), np.concatenate(jj)
+    X = np.concatenate([emb_inj[ii], emb_rfi[jj]], 0)
+    e = np.concatenate([en_inj[ii], en_rfi[jj]], 0)[:, None]
+    y = np.concatenate([np.ones(len(ii)), np.zeros(len(jj))])
 
     def auc(feats):
-        clf = LogisticRegression(max_iter=2000)
-        return float(cross_val_score(clf, StandardScaler().fit_transform(feats),
+        return float(cross_val_score(LogisticRegression(max_iter=2000),
+                                     StandardScaler().fit_transform(feats),
                                      y, cv=5, scoring="roc_auc").mean())
 
-    A = np.concatenate([e, np.ones_like(e)], 1)          # (N, 2): [energy, 1]
-    coef, *_ = np.linalg.lstsq(A, X, rcond=None)         # per-dim OLS on energy
-    X_resid = X - A @ coef                               # embedding with energy removed
-    return {"n_per_class": n, "energy_only": auc(e),
-            "embedding": auc(X), "emb_given_energy": auc(X_resid)}
+    return {"n_per_class": len(ii), "band": (float(lo), float(hi)),
+            "energy_only": auc(e), "embedding": auc(X)}
 
 
 def parse_args():
@@ -238,29 +249,34 @@ def main():
         print(f"  {snr:5.0f}  {s.mean():8.4f}  {sigma:8.2f}σ  {cohens_d(s, base):8.2f}  "
               f"{det3:7.1f}%  {det5:7.1f}%")
 
-    # ---- 3. MORPHOLOGY BEYOND ENERGY (the deciding test) ----
-    # Pool injected snippets whose energy overlaps the RFI range (SNR>=15), so the
-    # separation can't be a trivial low-vs-high energy split.
-    pool_snr = [s for s in args.snr_list if s >= 15]
-    emb_pool = np.concatenate([inj_emb[s] for s in pool_snr], 0)
-    en_pool = np.concatenate([inj_en[s] for s in pool_snr], 0)
-    print(f"\n{'='*64}\n3. MORPHOLOGY BEYOND ENERGY  (injected SNR>={int(min(pool_snr))} vs RFI)\n{'='*64}")
-    print(f"  energy overlap: injected {en_pool.min():.2f}–{en_pool.max():.2f} | "
+    # ---- 3. MORPHOLOGY AT MATCHED ENERGY (the deciding test) ----
+    # Pool ALL injected SNRs (narrowband adds little energy, so even SNR=50 sits low)
+    # to maximise low-energy samples that overlap the RFI energy band.
+    emb_pool = np.concatenate([inj_emb[s] for s in args.snr_list], 0)
+    en_pool = np.concatenate([inj_en[s] for s in args.snr_list], 0)
+    print(f"\n{'='*64}\n3. MORPHOLOGY AT MATCHED ENERGY  (injected vs RFI, energy-stratified)\n{'='*64}")
+    print(f"  raw energy range: injected {en_pool.min():.2f}–{en_pool.max():.2f} | "
           f"RFI {en_rfi.min():.2f}–{en_rfi.max():.2f}")
-    m = morphology_beyond_energy(emb_pool, en_pool, emb_rfi, en_rfi, seed=args.seed)
-    if m is not None:
-        print(f"  balanced n/class : {m['n_per_class']}")
-        print(f"  AUC energy-only        : {m['energy_only']:.3f}")
-        print(f"  AUC embedding (raw)    : {m['embedding']:.3f}")
-        print(f"  AUC embedding | energy : {m['emb_given_energy']:.3f}   "
-              f"<-- morphology axis with energy regressed out")
-        if m["emb_given_energy"] > 0.65:
-            print("  VERDICT: a MORPHOLOGY axis survives energy removal -> feature scoring "
-                  "is viable; build a better one-class than naive distance.")
+    m = morphology_matched_energy(emb_pool, en_pool, emb_rfi, en_rfi, seed=args.seed)
+    if m is not None and "error" in m:
+        print(f"  SKIPPED: {m['error']}")
+    elif m is not None:
+        print(f"  matched band     : {m['band'][0]:.2f}–{m['band'][1]:.2f}  "
+              f"(n/class = {m['n_per_class']})")
+        print(f"  AUC energy-only  : {m['energy_only']:.3f}   (sanity: ~0.5 means matching worked)")
+        print(f"  AUC embedding    : {m['embedding']:.3f}   <-- morphology at matched energy")
+        if m["n_per_class"] < 25:
+            print("  WARNING: few matched samples — AUC is underpowered; treat as indicative only.")
+        if m["energy_only"] > 0.65:
+            print("  WARNING: energy still separates after matching — band too wide / classes "
+                  "energy-disjoint; the embedding AUC may be energy, not morphology.")
+        elif m["embedding"] > 0.70:
+            print("  VERDICT: MORPHOLOGY axis exists at matched energy -> feature scoring is "
+                  "viable; build a better one-class than naive distance.")
         else:
-            print("  VERDICT: embedding separates injected/RFI ~only via energy -> recon and "
-                  "feature scoring are the same energy detector; faint-narrowband AD is a "
-                  "dead end here (decision needed: change objective, or change target/product).")
+            print("  VERDICT: embedding ~cannot separate injected from RFI at matched energy "
+                  "-> it encodes ~only energy; recon == feature scoring. Decision needed: "
+                  "change objective, or change target/product.")
 
     # ---- save + plot ----
     args.out_dir.mkdir(parents=True, exist_ok=True)
