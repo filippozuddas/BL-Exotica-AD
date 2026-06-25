@@ -81,6 +81,54 @@ def cohens_d(a: np.ndarray, b: np.ndarray) -> float:
     return float((a.mean() - b.mean()) / pooled)
 
 
+def frame_energy(frames: np.ndarray) -> np.ndarray:
+    """Per-snippet input energy = mean(x^2) over the preprocessed frame. (N,)"""
+    return (frames.astype(np.float64) ** 2).mean(axis=(1, 2))
+
+
+def morphology_beyond_energy(emb_inj, en_inj, emb_rfi, en_rfi, seed=0):
+    """Upper-bound test: can a LINEAR readout tell injected-narrowband (anomaly)
+    from RFI (normal-but-energetic) using the embedding *beyond* input energy?
+
+    Both classes are energy-confounded (a signal IS energy), so we compare three
+    5-fold-CV AUCs of a logistic readout, on balanced subsamples:
+      - energy-only   : AUC reachable from the scalar energy alone (the confound).
+      - embedding     : AUC from the raw embedding (energy + morphology mixed).
+      - emb | energy  : AUC from the embedding with energy regressed out per-dim
+                        (OLS residuals) — morphology sensitivity with energy removed.
+
+    If 'emb | energy' >> 0.5 there is a morphology axis -> feature scoring is
+    viable. If it collapses to ~0.5 (and only energy-only/embedding separate), the
+    embedding encodes ~only energy -> recon and feature scoring are the same thing.
+    """
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.model_selection import cross_val_score
+        from sklearn.preprocessing import StandardScaler
+    except ImportError:
+        print("  (scikit-learn not available — skipping morphology-vs-energy test)")
+        return None
+
+    rng = np.random.default_rng(seed)
+    n = min(len(emb_inj), len(emb_rfi))
+    ia = rng.choice(len(emb_inj), n, replace=False)
+    ib = rng.choice(len(emb_rfi), n, replace=False)
+    X = np.concatenate([emb_inj[ia], emb_rfi[ib]], 0)
+    e = np.concatenate([en_inj[ia], en_rfi[ib]], 0)[:, None]
+    y = np.concatenate([np.ones(n), np.zeros(n)])
+
+    def auc(feats):
+        clf = LogisticRegression(max_iter=2000)
+        return float(cross_val_score(clf, StandardScaler().fit_transform(feats),
+                                     y, cv=5, scoring="roc_auc").mean())
+
+    A = np.concatenate([e, np.ones_like(e)], 1)          # (N, 2): [energy, 1]
+    coef, *_ = np.linalg.lstsq(A, X, rcond=None)         # per-dim OLS on energy
+    X_resid = X - A @ coef                               # embedding with energy removed
+    return {"n_per_class": n, "energy_only": auc(e),
+            "embedding": auc(X), "emb_given_energy": auc(X_resid)}
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -133,6 +181,7 @@ def main():
 
     emb_quiet = embed(model, preprocessed[quiet_idx], args.device)
     emb_rfi = embed(model, preprocessed[rfi_idx], args.device)
+    en_rfi = frame_energy(preprocessed[rfi_idx])
     D = emb_quiet.shape[1]
 
     # ---- 1. COLLAPSE CHECK ----
@@ -172,13 +221,16 @@ def main():
     print(f"  {'-'*5}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}")
 
     t3, t5 = b_mean + 3 * b_std, b_mean + 5 * b_std
-    inj_scores, results = {}, []
+    inj_scores, inj_emb, inj_en, results = {}, {}, {}, []
     for snr in args.snr_list:
         inj = np.array([preprocess_raw(
             inject_narrowband_on_only(raw_snippets[i], snr=snr, drift_rate=args.drift_rate,
                                       seed=args.seed + j), preproc)
             for j, i in enumerate(quiet_idx)])
-        s = score(embed(model, inj, args.device))
+        e_inj = embed(model, inj, args.device)
+        inj_emb[snr] = e_inj
+        inj_en[snr] = frame_energy(inj)
+        s = score(e_inj)
         inj_scores[snr] = s
         sigma = (s.mean() - b_mean) / b_std if b_std > 0 else 0.0
         det3, det5 = (s > t3).mean() * 100, (s > t5).mean() * 100
@@ -186,12 +238,38 @@ def main():
         print(f"  {snr:5.0f}  {s.mean():8.4f}  {sigma:8.2f}σ  {cohens_d(s, base):8.2f}  "
               f"{det3:7.1f}%  {det5:7.1f}%")
 
+    # ---- 3. MORPHOLOGY BEYOND ENERGY (the deciding test) ----
+    # Pool injected snippets whose energy overlaps the RFI range (SNR>=15), so the
+    # separation can't be a trivial low-vs-high energy split.
+    pool_snr = [s for s in args.snr_list if s >= 15]
+    emb_pool = np.concatenate([inj_emb[s] for s in pool_snr], 0)
+    en_pool = np.concatenate([inj_en[s] for s in pool_snr], 0)
+    print(f"\n{'='*64}\n3. MORPHOLOGY BEYOND ENERGY  (injected SNR>={int(min(pool_snr))} vs RFI)\n{'='*64}")
+    print(f"  energy overlap: injected {en_pool.min():.2f}–{en_pool.max():.2f} | "
+          f"RFI {en_rfi.min():.2f}–{en_rfi.max():.2f}")
+    m = morphology_beyond_energy(emb_pool, en_pool, emb_rfi, en_rfi, seed=args.seed)
+    if m is not None:
+        print(f"  balanced n/class : {m['n_per_class']}")
+        print(f"  AUC energy-only        : {m['energy_only']:.3f}")
+        print(f"  AUC embedding (raw)    : {m['embedding']:.3f}")
+        print(f"  AUC embedding | energy : {m['emb_given_energy']:.3f}   "
+              f"<-- morphology axis with energy regressed out")
+        if m["emb_given_energy"] > 0.65:
+            print("  VERDICT: a MORPHOLOGY axis survives energy removal -> feature scoring "
+                  "is viable; build a better one-class than naive distance.")
+        else:
+            print("  VERDICT: embedding separates injected/RFI ~only via energy -> recon and "
+                  "feature scoring are the same energy detector; faint-narrowband AD is a "
+                  "dead end here (decision needed: change objective, or change target/product).")
+
     # ---- save + plot ----
     args.out_dir.mkdir(parents=True, exist_ok=True)
     np.savez(args.out_dir / "encode_separation_results.npz",
              snr_list=np.array(args.snr_list), embed_quiet=emb_quiet, embed_rfi=emb_rfi,
-             quiet_score=base, rfi_score=rfi, per_dim_std=sd,
-             **{f"inject_snr_{int(s)}": v for s, v in inj_scores.items()})
+             en_rfi=en_rfi, quiet_score=base, rfi_score=rfi, per_dim_std=sd,
+             **{f"inject_score_snr_{int(s)}": v for s, v in inj_scores.items()},
+             **{f"inject_emb_snr_{int(s)}": v for s, v in inj_emb.items()},
+             **{f"inject_en_snr_{int(s)}": v for s, v in inj_en.items()})
 
     snrs = sorted(args.snr_list)
     fig, ax = plt.subplots(1, 2, figsize=(13, 4.5))
