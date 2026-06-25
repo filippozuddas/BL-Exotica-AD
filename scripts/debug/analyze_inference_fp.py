@@ -64,17 +64,22 @@ def load_csv(csv_path):
     return rows
 
 
-def per_cadence_breakdown(rows, out_dir):
+def _score_key(method: str) -> str:
+    return f"{method}_score"
+
+
+def per_cadence_breakdown(rows, out_dir, method="cadence"):
+    score_key = _score_key(method)
     print("\n" + "=" * 70)
-    print("1. PER-CADENCE FALSE-POSITIVE BREAKDOWN")
+    print(f"1. PER-CADENCE FALSE-POSITIVE BREAKDOWN  (method={method})")
     print("=" * 70)
 
     by_cad = defaultdict(list)
     for r in rows:
         by_cad[r["cadence_idx"]].append(r)
 
-    all_cadence_scores = np.array([r["cadence_score"] for r in rows])
-    global_med, global_sigma = robust_stats(all_cadence_scores)
+    all_scores = np.array([r[score_key] for r in rows])
+    global_med, global_sigma = robust_stats(all_scores)
 
     print(f"\nGlobal: median={global_med:.4f}  MAD_σ={global_sigma:.4f}")
     print(f"{'Cad':>4} {'Target':>20} {'N':>8} {'Med':>8} {'MAD_σ':>8} "
@@ -85,7 +90,7 @@ def per_cadence_breakdown(rows, out_dir):
     for cad_idx in sorted(by_cad.keys()):
         cad_rows = by_cad[cad_idx]
         target = cad_rows[0]["target"]
-        scores = np.array([r["cadence_score"] for r in cad_rows])
+        scores = np.array([r[score_key] for r in cad_rows])
         med, sig = robust_stats(scores)
 
         n_3s_local = (scores > med + 3 * sig).sum()
@@ -101,12 +106,13 @@ def per_cadence_breakdown(rows, out_dir):
     return by_cad, cad_stats
 
 
-def sigma_threshold_sweep(rows, out_dir):
+def sigma_threshold_sweep(rows, out_dir, method="cadence"):
+    score_key = _score_key(method)
     print("\n" + "=" * 70)
-    print("2. CANDIDATE COUNTS AT INCREASING SIGMA THRESHOLDS")
+    print(f"2. CANDIDATE COUNTS AT INCREASING SIGMA THRESHOLDS  (method={method})")
     print("=" * 70)
 
-    scores = np.array([r["cadence_score"] for r in rows])
+    scores = np.array([r[score_key] for r in rows])
     med, sig = robust_stats(scores)
     n_total = len(scores)
 
@@ -127,7 +133,7 @@ def sigma_threshold_sweep(rows, out_dir):
     ax.semilogy(ks, ns)
     ax.set_xlabel("Sigma threshold (k)")
     ax.set_ylabel("Number of candidates")
-    ax.set_title(f"Candidates vs sigma threshold (N_total={n_total})")
+    ax.set_title(f"Candidates vs sigma threshold — {method} (N_total={n_total})")
     ax.axhline(100, color="green", ls="--", alpha=0.5, label="100 candidates")
     ax.axhline(1000, color="orange", ls="--", alpha=0.5, label="1000 candidates")
     ax.legend()
@@ -138,9 +144,10 @@ def sigma_threshold_sweep(rows, out_dir):
     print(f"\nSaved -> {out_dir / 'candidates_vs_sigma.png'}")
 
 
-def per_cadence_distributions(rows, by_cad, out_dir):
+def per_cadence_distributions(rows, by_cad, out_dir, method="cadence"):
+    score_key = _score_key(method)
     print("\n" + "=" * 70)
-    print("3. PER-CADENCE SCORE DISTRIBUTIONS")
+    print(f"3. PER-CADENCE SCORE DISTRIBUTIONS  (method={method})")
     print("=" * 70)
 
     n_cads = len(by_cad)
@@ -149,7 +156,7 @@ def per_cadence_distributions(rows, by_cad, out_dir):
 
     for i, cad_idx in enumerate(sorted(by_cad.keys())):
         cad_rows = by_cad[cad_idx]
-        scores = np.array([r["cadence_score"] for r in cad_rows])
+        scores = np.array([r[score_key] for r in cad_rows])
         target = cad_rows[0]["target"]
         med, sig = robust_stats(scores)
 
@@ -163,7 +170,7 @@ def per_cadence_distributions(rows, by_cad, out_dir):
     for j in range(i + 1, len(axes)):
         axes[j].set_visible(False)
 
-    plt.suptitle("Cadence score distributions per cadence", fontsize=12)
+    plt.suptitle(f"{method} score distributions per cadence", fontsize=12)
     plt.tight_layout()
     plt.savefig(out_dir / "per_cadence_distributions.png", dpi=150)
     plt.close()
@@ -171,9 +178,10 @@ def per_cadence_distributions(rows, by_cad, out_dir):
 
 
 def onoff_ratio_analysis(rows, model, cadence_lines, data_cfg, device, out_dir,
-                         n_top=500, top_k_cols=5):
+                         n_top=500, top_k_cols=5, method="cadence"):
+    score_key = _score_key(method)
     print("\n" + "=" * 70)
-    print("4. ON/OFF PEAK-COLUMN RATIO ON TOP CANDIDATES")
+    print(f"4. ON/OFF PEAK-COLUMN RATIO ON TOP CANDIDATES  (method={method})")
     print("=" * 70)
 
     preproc = data_cfg["preprocessing"]
@@ -184,10 +192,9 @@ def onoff_ratio_analysis(rows, model, cadence_lines, data_cfg, device, out_dir,
     n_obs = 6
     rows_per_obs = tchans // n_obs  # 16
 
-    scores = np.array([r["cadence_score"] for r in rows])
+    scores = np.array([r[score_key] for r in rows])
     med, sig = robust_stats(scores)
 
-    # Get top N candidates by cadence score
     sorted_idx = np.argsort(scores)[::-1][:n_top]
     top_rows = [rows[i] for i in sorted_idx]
 
@@ -263,8 +270,8 @@ def onoff_ratio_analysis(rows, model, cadence_lines, data_cfg, device, out_dir,
                 "cadence_idx": r["cadence_idx"],
                 "target": r["target"],
                 "f_start": r["f_start"],
-                "cadence_score": r["cadence_score"],
-                "sigma": (r["cadence_score"] - med) / sig,
+                "score": r[score_key],
+                "sigma": (r[score_key] - med) / sig,
                 "ratio": ratio,
             })
 
@@ -292,9 +299,9 @@ def onoff_ratio_analysis(rows, model, cadence_lines, data_cfg, device, out_dir,
     ax.scatter(sigmas_arr, ratios_arr, s=8, alpha=0.5)
     ax.axhline(4.0, color="red", ls="--", lw=1, label="r=4 cut")
     ax.axhline(2.0, color="orange", ls="--", lw=1, label="r=2 cut")
-    ax.set_xlabel("Cadence score (σ above median)")
+    ax.set_xlabel(f"{method} score (σ above median)")
     ax.set_ylabel("ON/OFF peak-column ratio")
-    ax.set_title(f"Top {len(ratios)} candidates: sigma vs ON/OFF ratio")
+    ax.set_title(f"Top {len(ratios)} candidates ({method}): sigma vs ON/OFF ratio")
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -320,7 +327,7 @@ def onoff_ratio_analysis(rows, model, cadence_lines, data_cfg, device, out_dir,
     csv_path = out_dir / "top_candidates_with_ratio.csv"
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["cadence_idx", "target", "f_start",
-                                                "cadence_score", "sigma", "ratio"])
+                                                "score", "sigma", "ratio"])
         writer.writeheader()
         writer.writerows(ratios)
     print(f"Saved -> {csv_path}")
@@ -341,6 +348,8 @@ def parse_args():
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--n_top", type=int, default=500,
                    help="Number of top candidates to analyze for ON/OFF ratio")
+    p.add_argument("--method", default="cadence", choices=["recon", "cadence"],
+                   help="Which score column to analyze (default: cadence)")
     return p.parse_args()
 
 
@@ -348,18 +357,20 @@ def main():
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
+    method = args.method
     print(f"Loading scores from {args.csv}")
+    print(f"Scoring method: {method}")
     rows = load_csv(args.csv)
     print(f"Loaded {len(rows)} snippets")
 
     # 1. Per-cadence breakdown
-    by_cad, cad_stats = per_cadence_breakdown(rows, args.out_dir)
+    by_cad, cad_stats = per_cadence_breakdown(rows, args.out_dir, method=method)
 
     # 2. Sigma threshold sweep
-    sigma_threshold_sweep(rows, args.out_dir)
+    sigma_threshold_sweep(rows, args.out_dir, method=method)
 
     # 3. Per-cadence distributions
-    per_cadence_distributions(rows, by_cad, args.out_dir)
+    per_cadence_distributions(rows, by_cad, args.out_dir, method=method)
 
     # 4. ON/OFF ratio analysis (if checkpoint + cadence_list provided)
     if args.checkpoint and args.cadence_list:
@@ -383,7 +394,7 @@ def main():
         ]
 
         onoff_ratio_analysis(rows, model, cadence_lines, data_cfg, args.device,
-                             args.out_dir, n_top=args.n_top)
+                             args.out_dir, n_top=args.n_top, method=method)
     else:
         print("\nSkipping ON/OFF ratio analysis (no --checkpoint / --cadence_list)")
 
