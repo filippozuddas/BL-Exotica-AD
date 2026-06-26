@@ -376,7 +376,10 @@ class ViTMAE(nn.Module):
 
         if self.loss_mode == "denoising":
             x_noisy = x + torch.randn_like(x) * self.noise_sigma
-            O = self._encode(x_noisy, mask_bool=None)
+            # All-False mask keeps mask_token in the computation graph (× 0) so
+            # DDP never sees it as an unused parameter across any loss_mode.
+            mask_bool = torch.zeros(x.shape[0], self.num_patches, dtype=torch.bool, device=x.device)
+            O = self._encode(x_noisy, mask_bool=mask_bool)
             pred_patches = self._reconstruct(O)
             target_patches = patchify(x, self.patch_size)
             return F.mse_loss(pred_patches, target_patches)
