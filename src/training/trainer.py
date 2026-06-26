@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
-from torch.optim import Adam
+from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import CSVLogger
@@ -60,7 +60,12 @@ class AELightningModule(pl.LightningModule):
 
     def configure_optimizers(self):
         train_cfg = self.cfg["training"]
-        opt = Adam(self.parameters(), lr=self.model.learning_rate)
+        opt_name = str(train_cfg.get("optimizer", "adam")).lower()
+        wd = float(train_cfg.get("weight_decay", 0.0))
+        if opt_name == "adamw":
+            opt = AdamW(self.parameters(), lr=self.model.learning_rate, weight_decay=wd)
+        else:
+            opt = Adam(self.parameters(), lr=self.model.learning_rate, weight_decay=wd)
 
         total_epochs = train_cfg["epochs"]
         warmup_epochs = train_cfg.get("warmup_epochs", 0)

@@ -15,11 +15,12 @@ training:
   epochs: 200
   warmup_epochs: 20
   learning_rate: 3.0e-4
-  optimizer: adam
+  optimizer: adamw
+  weight_decay: 1.0e-4
   loss: mse
   gradient_clip_val: 1.0
   seed: 42
-  patience: 30
+  patience: 15
   min_delta: 1.0e-5
   monitor: val_loss
   snapshot_every: 2
