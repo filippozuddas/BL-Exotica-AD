@@ -4,18 +4,17 @@ clean / naturally-RFI-contaminated / ETI-injected snippets from the real cache.
 
 Produces one PNG per model backbone (AE, ViT-MAE).
 
+ETI injection is ON-only: the signal is injected in observations 0, 2, 4
+(the A observations of the ABACAD cadence) with drift continuity preserved
+across the full time axis.  OFF observations (1, 3, 5) are left untouched.
+
 Usage:
     python scripts/slides/recon_grid.py \\
         --cache     /path/to/cache_gbt_fine \\
         --ae_checkpoint     outputs/<run>/checkpoints/best.ckpt \\
         --vitmae_checkpoint outputs/<run>/checkpoints/best.ckpt \\
-        --snr_eti 25 --drift_rate 0.3 \\
+        --snr_eti 20 --drift_rate 0.3 --width_chans 1.0 \\
         --out_dir outputs/slides
-
-Snippet selection:
-  clean  — quietest snippet found (lowest fraction of pixels > 5 sigma)
-  rfi    — most RFI-contaminated snippet (highest hot_frac), no injection
-  eti    — second-quietest snippet + injected narrowband drifting signal
 """
 
 import argparse
@@ -33,7 +32,6 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from src.data.preprocessing import bandpass_correct, core_transform
-from src.data.synthetic import NarrowbandDriftingGenerator, NarrowbandParams
 from src.models.autoencoder import build_autoencoder
 
 
@@ -51,16 +49,15 @@ def _load_model(ckpt_path: Path, model_cfg: dict, device: str) -> torch.nn.Modul
 
 
 # --------------------------------------------------------------------------- #
-# Cache I/O and preprocessing
+# Cache I/O and snippet selection
 # --------------------------------------------------------------------------- #
 
 def _preprocess(raw_obs: np.ndarray, preproc_cfg: dict) -> np.ndarray:
     """(n_obs, tchans_per_obs, fchans) → preprocessed (tchans, fchans) float32.
 
-    Mirrors CachedDataset.__getitem__: concatenate observations, then apply
-    bandpass_correct + core_transform on the full cadence frame.
+    Mirrors CachedDataset.__getitem__: concatenate obs, bandpass + core_transform.
     """
-    frame = np.concatenate(raw_obs, axis=0)   # (tchans, fchans)
+    frame = np.concatenate(raw_obs, axis=0).astype(np.float32)
     frame = bandpass_correct(frame,
                              method=preproc_cfg.get("bandpass_method", "polynomial"),
                              poly_degree=preproc_cfg.get("poly_degree", 3))
@@ -68,7 +65,6 @@ def _preprocess(raw_obs: np.ndarray, preproc_cfg: dict) -> np.ndarray:
 
 
 def _hot_frac(snippet: np.ndarray, sigma: float = 5.0) -> float:
-    """Fraction of pixels exceeding sigma in a preprocessed (tchans, fchans) frame."""
     return float((snippet > sigma).sum()) / snippet.size
 
 
@@ -79,14 +75,11 @@ def select_snippets(
     n_scan: int = 500,
     seed: int = 42,
 ) -> dict:
-    """Scan n_scan random snippets and return raw arrays for three roles.
+    """Return raw arrays for three roles by scanning n_scan random snippets.
 
-    Returns:
-        {
-          "clean":  (n_obs, tchans_per_obs, fchans) raw — lowest hot_frac
-          "clean2": same shape — second-lowest hot_frac (used for ETI injection)
-          "rfi":    same shape — highest hot_frac
-        }
+    clean  — lowest hot_frac (quietest)
+    clean2 — second-lowest (used as ETI injection base)
+    rfi    — highest hot_frac (most naturally contaminated)
     """
     npy = cache_path / f"{split}.npy"
     arr = np.load(str(npy), mmap_mode="r")
@@ -98,17 +91,16 @@ def select_snippets(
     print(f"  Scanning {len(idx)} snippets from {npy.name} …")
     hot_fracs = []
     for i in idx:
-        snippet = _preprocess(arr[i], preproc_cfg)
-        hot_fracs.append(_hot_frac(snippet))
+        hot_fracs.append(_hot_frac(_preprocess(arr[i], preproc_cfg)))
 
     order = np.argsort(hot_fracs)
     clean_i  = int(idx[order[0]])
     clean2_i = int(idx[order[1]])
     rfi_i    = int(idx[order[-1]])
 
-    print(f"  clean  [{clean_i}]  hot_frac={hot_fracs[order[0]]:.4f}")
-    print(f"  clean2 [{clean2_i}]  hot_frac={hot_fracs[order[1]]:.4f}  (→ ETI base)")
-    print(f"  rfi    [{rfi_i}]  hot_frac={hot_fracs[order[-1]]:.4f}")
+    print(f"  clean  [{clean_i}]   hot_frac = {hot_fracs[order[0]]:.4f}")
+    print(f"  clean2 [{clean2_i}]  hot_frac = {hot_fracs[order[1]]:.4f}  (ETI base)")
+    print(f"  rfi    [{rfi_i}]   hot_frac = {hot_fracs[order[-1]]:.4f}")
 
     return {
         "clean":  np.array(arr[clean_i]),
@@ -118,32 +110,57 @@ def select_snippets(
 
 
 # --------------------------------------------------------------------------- #
-# ETI injection on raw concatenated frame
+# ETI injection — ON observations only, narrow Gaussian profile
 # --------------------------------------------------------------------------- #
 
-def _inject_eti(
+def _inject_narrowband_on_only(
     raw_obs: np.ndarray,
-    params: NarrowbandParams,
     preproc_cfg: dict,
+    raw_cfg: dict,
     snr: float,
     drift_rate: float,
+    width_chans: float,
+    on_obs: tuple,
     seed: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Inject a narrowband drifting signal, return (raw_injected, snippet_injected).
+) -> np.ndarray:
+    """Inject a drifting narrowband signal in ON observations only.
 
-    Injection is done on the concatenated raw cadence frame so the signal
-    drifts continuously across all observations.
+    raw_obs : (n_obs, tchans_per_obs, fchans) — raw un-preprocessed
+    Returns  : preprocessed (tchans, fchans) float32 with signal injected
+
+    The signal drifts continuously (global time index) so the track is coherent
+    across ON observations even though OFF observations carry no signal.
     """
-    raw_cat = np.concatenate(raw_obs, axis=0).astype(float)   # (tchans, fchans)
-    gen = NarrowbandDriftingGenerator(params, seed=seed)
-    raw_inj, info = gen.inject_signal(raw_cat, snr=snr, drift_rate=drift_rate)
-    print(f"  ETI injection: snr={info['snr']:.1f}  drift={info['drift_rate']:.3f} Hz/s  "
-          f"chan={info['start_channel']}  f_profile={info['f_profile']}")
-    snippet = bandpass_correct(raw_inj.astype(np.float32),
-                               method=preproc_cfg.get("bandpass_method", "polynomial"),
-                               poly_degree=preproc_cfg.get("poly_degree", 3))
-    snippet = core_transform(snippet, preproc_cfg.get("mad_epsilon", 1e-6)).astype(np.float32)
-    return raw_inj, snippet
+    rng  = np.random.default_rng(seed)
+    raw  = raw_obs.copy().astype(float)
+    n_obs, tchans_per_obs, fchans = raw.shape
+
+    noise_std        = np.median(np.abs(raw - np.median(raw))) * 1.4826
+    signal_amplitude = snr * noise_std
+
+    margin     = max(50, int(fchans * 0.10))
+    start_chan = float(rng.integers(margin, fchans - margin))
+
+    dt = raw_cfg["dt"]   # s / time-bin
+    df = raw_cfg["df"]   # Hz / channel
+    drift_chans_per_bin = (drift_rate * dt) / df
+    chans = np.arange(fchans, dtype=float)
+
+    for obs_idx in on_obs:
+        global_t0 = obs_idx * tchans_per_obs
+        for t in range(tchans_per_obs):
+            center  = start_chan + (global_t0 + t) * drift_chans_per_bin
+            profile = signal_amplitude * np.exp(
+                -0.5 * ((chans - center) / width_chans) ** 2
+            )
+            raw[obs_idx, t] += profile
+
+    # Preprocess after injection
+    frame = np.concatenate(raw, axis=0).astype(np.float32)
+    frame = bandpass_correct(frame,
+                             method=preproc_cfg.get("bandpass_method", "polynomial"),
+                             poly_degree=preproc_cfg.get("poly_degree", 3))
+    return core_transform(frame, preproc_cfg.get("mad_epsilon", 1e-6)).astype(np.float32)
 
 
 # --------------------------------------------------------------------------- #
@@ -151,7 +168,7 @@ def _inject_eti(
 # --------------------------------------------------------------------------- #
 
 def _reconstruct(model: torch.nn.Module, snippet: np.ndarray, device: str) -> np.ndarray:
-    x = torch.from_numpy(snippet[None, None]).to(device)   # (1,1,H,W)
+    x = torch.from_numpy(snippet[None, None]).to(device)
     with torch.no_grad():
         recon = model(x)
     return recon.squeeze().cpu().numpy()
@@ -160,30 +177,31 @@ def _reconstruct(model: torch.nn.Module, snippet: np.ndarray, device: str) -> np
 def make_examples(
     model: torch.nn.Module,
     raw_snippets: dict,
-    params: NarrowbandParams,
     preproc_cfg: dict,
+    raw_cfg: dict,
     device: str,
     snr_eti: float,
     drift_rate: float,
+    width_chans: float,
+    on_obs: tuple,
     seed: int,
 ) -> list:
-    """Build (label, snippet, recon, error) triples for [clean, rfi, eti]."""
+    """Return (label, snippet, recon, error) triples for [clean, rfi, eti]."""
     examples = []
 
     for label, role in [("Clean noise", "clean"), ("RFI (real)", "rfi")]:
         snippet = _preprocess(raw_snippets[role], preproc_cfg)
         recon   = _reconstruct(model, snippet, device)
-        error   = (snippet - recon) ** 2
-        examples.append((label, snippet, recon, error))
+        examples.append((label, snippet, recon, (snippet - recon) ** 2))
 
-    # ETI: inject on raw, preprocess
-    _, snippet_eti = _inject_eti(
-        raw_snippets["clean2"], params, preproc_cfg,
-        snr=snr_eti, drift_rate=drift_rate, seed=seed,
+    snippet_eti = _inject_narrowband_on_only(
+        raw_snippets["clean2"], preproc_cfg, raw_cfg,
+        snr=snr_eti, drift_rate=drift_rate, width_chans=width_chans,
+        on_obs=on_obs, seed=seed,
     )
     recon_eti = _reconstruct(model, snippet_eti, device)
-    error_eti = (snippet_eti - recon_eti) ** 2
-    examples.append(("ETI-injected", snippet_eti, recon_eti, error_eti))
+    examples.append(("ETI-injected\n(ON obs only)", snippet_eti, recon_eti,
+                     (snippet_eti - recon_eti) ** 2))
 
     return examples
 
@@ -193,40 +211,34 @@ def make_examples(
 # --------------------------------------------------------------------------- #
 
 def plot_grid(examples: list, model_name: str, out_path: Path) -> None:
-    """3 rows × 3 cols: rows = clean / rfi / eti, cols = input / recon / error."""
     col_labels = ["Input", "Reconstruction", "Reconstruction error"]
 
-    # Shared intensity range across all input and reconstruction panels
     spec_vals = np.concatenate(
         [e[1].ravel() for e in examples] + [e[2].ravel() for e in examples]
     )
     vmin, vmax = np.percentile(spec_vals, [2, 98])
-
-    # Shared error scale: 99th-percentile across all three error maps
-    err_vmax = max(float(np.percentile(e[3], 99)) for e in examples)
+    err_vmax   = max(float(np.percentile(e[3], 99)) for e in examples)
 
     fig, axes = plt.subplots(3, 3, figsize=(18, 6))
     fig.suptitle(f"{model_name}  —  input / reconstruction / error",
-                 fontsize=13, y=1.01)
+                 fontsize=13, y=0.98)
 
+    last_im_err = None
     for row, (label, snippet, recon, error) in enumerate(examples):
-        mse = float(error.mean())
-
         axes[row, 0].imshow(snippet, aspect="auto", origin="lower",
                             cmap="viridis", vmin=vmin, vmax=vmax)
-        axes[row, 1].imshow(recon, aspect="auto", origin="lower",
+        axes[row, 1].imshow(recon,   aspect="auto", origin="lower",
                             cmap="viridis", vmin=vmin, vmax=vmax)
-        im_err = axes[row, 2].imshow(error, aspect="auto", origin="lower",
-                                     cmap="hot", vmin=0, vmax=err_vmax)
+        last_im_err = axes[row, 2].imshow(error, aspect="auto", origin="lower",
+                                          cmap="hot", vmin=0, vmax=err_vmax)
 
-        # Row label on left
-        axes[row, 0].set_ylabel(label, fontsize=11, labelpad=8)
-
-        # MSE in the top-left corner of the error panel
-        axes[row, 2].text(0.02, 0.96, f"MSE = {mse:.4f}",
-                          transform=axes[row, 2].transAxes,
-                          va="top", fontsize=8, color="white",
-                          bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.5))
+        axes[row, 0].set_ylabel(label, fontsize=10, labelpad=8)
+        axes[row, 2].text(
+            0.02, 0.96, f"MSE = {error.mean():.4f}",
+            transform=axes[row, 2].transAxes,
+            va="top", fontsize=8, color="white",
+            bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.5),
+        )
 
         for col in range(3):
             axes[row, col].set_xticks([])
@@ -234,15 +246,25 @@ def plot_grid(examples: list, model_name: str, out_path: Path) -> None:
             if row == 0:
                 axes[row, col].set_title(col_labels[col], fontsize=11, pad=5)
 
-    # Single colorbar for the error column
-    cbar = fig.colorbar(im_err, ax=axes[:, 2].tolist(), shrink=0.85, pad=0.02)
-    cbar.set_label("squared error", fontsize=9)
-
-    # Frequency-axis label on bottom row only
     for col in range(3):
         axes[2, col].set_xlabel("frequency channel", fontsize=9)
 
-    plt.tight_layout()
+    # Reserve right margin, then place colorbar anchored to the error column
+    fig.subplots_adjust(
+        left=0.07, right=0.88, top=0.92, bottom=0.10,
+        wspace=0.03, hspace=0.04,
+    )
+    pos_top = axes[0, 2].get_position()
+    pos_bot = axes[2, 2].get_position()
+    cbar_ax = fig.add_axes([
+        pos_top.x1 + 0.01,          # left edge: just right of error column
+        pos_bot.y0,                  # bottom: aligned with bottom row
+        0.012,                       # width
+        pos_top.y1 - pos_bot.y0,     # height: full span of three rows
+    ])
+    cb = fig.colorbar(last_im_err, cax=cbar_ax)
+    cb.set_label("squared error", fontsize=9)
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -257,20 +279,21 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--cache", type=Path, required=True,
-                   help="Cache directory containing train.npy / val.npy")
-    p.add_argument("--split", default="train",
-                   help="Which split to sample from (default: train)")
-    p.add_argument("--n_scan", type=int, default=500,
-                   help="Number of snippets to scan when selecting examples")
+                   help="Cache directory (contains train.npy / val.npy)")
+    p.add_argument("--split",  default="train")
+    p.add_argument("--n_scan", type=int, default=500)
     p.add_argument("--ae_checkpoint",     type=Path, default=None)
     p.add_argument("--vitmae_checkpoint", type=Path, default=None)
     p.add_argument("--ae_config",     type=Path, default=ROOT / "configs/model/convae.yaml")
     p.add_argument("--vitmae_config", type=Path, default=ROOT / "configs/model/vit_mae.yaml")
     p.add_argument("--data_config",   type=Path, default=ROOT / "configs/data/gbt_fine.yaml")
-    p.add_argument("--snr_eti",    type=float, default=25.0,
-                   help="Injected ETI SNR (setigen frame-integrated)")
-    p.add_argument("--drift_rate", type=float, default=0.3,
+    p.add_argument("--snr_eti",     type=float, default=20.0)
+    p.add_argument("--drift_rate",  type=float, default=0.3,
                    help="ETI drift rate in Hz/s")
+    p.add_argument("--width_chans", type=float, default=1.0,
+                   help="ETI Gaussian half-width in channels (default: 1.0)")
+    p.add_argument("--on_obs",  default="0,2,4",
+                   help="Comma-separated ON observation indices (default: 0,2,4)")
     p.add_argument("--out_dir", type=Path, default=ROOT / "outputs/slides")
     p.add_argument("--device",  default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed",    type=int, default=42)
@@ -280,25 +303,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.ae_checkpoint is None and args.vitmae_checkpoint is None:
-        raise SystemExit(
-            "Provide at least one of --ae_checkpoint / --vitmae_checkpoint."
-        )
+        raise SystemExit("Provide --ae_checkpoint and/or --vitmae_checkpoint.")
 
     with open(args.data_config) as f:
         data_cfg = yaml.safe_load(f)
     preproc_cfg = data_cfg["preprocessing"]
-
-    # NarrowbandParams for ETI injection — geometry matches gbt_fine product
-    raw_cfg = data_cfg["raw"]
-    frm_cfg = data_cfg["frame"]
-    params = NarrowbandParams(
-        df=raw_cfg["df"],
-        dt=raw_cfg["dt"],
-        fch1=1500.0,          # L-band centre approximation; only affects setigen geometry
-        fchans=frm_cfg["fchans"],
-        tchans=frm_cfg["tchans"],
-        ascending=False,
-    )
+    raw_cfg     = data_cfg["raw"]
+    on_obs      = tuple(int(x) for x in args.on_obs.split(","))
 
     print(f"\nSelecting snippets from {args.cache} ({args.split}) …")
     raw_snippets = select_snippets(
@@ -319,8 +330,9 @@ def main() -> None:
         model = _load_model(ckpt_path, model_cfg, args.device)
         print(f"[{name}] building examples …")
         examples = make_examples(
-            model, raw_snippets, params, preproc_cfg, args.device,
-            snr_eti=args.snr_eti, drift_rate=args.drift_rate, seed=args.seed,
+            model, raw_snippets, preproc_cfg, raw_cfg, args.device,
+            snr_eti=args.snr_eti, drift_rate=args.drift_rate,
+            width_chans=args.width_chans, on_obs=on_obs, seed=args.seed,
         )
         plot_grid(examples, name, args.out_dir / f"recon_grid_{tag}.png")
 
