@@ -65,7 +65,16 @@ def _preprocess(raw_obs: np.ndarray, preproc_cfg: dict) -> np.ndarray:
 
 
 def _hot_frac(snippet: np.ndarray, sigma: float = 5.0) -> float:
-    return float((snippet > sigma).sum()) / snippet.size
+    return float((snippet > sigma).mean())
+
+
+def _chan_frac(snippet: np.ndarray, sigma: float = 5.0) -> float:
+    """Fraction of channels that have at least one pixel above sigma.
+
+    Large value (>~10%) means the bright energy spans most of the band —
+    likely a broadband artifact, not narrowband RFI.
+    """
+    return float((snippet > sigma).any(axis=0).mean())
 
 
 def select_snippets(
@@ -74,12 +83,14 @@ def select_snippets(
     preproc_cfg: dict,
     n_scan: int = 500,
     seed: int = 42,
+    rfi_chan_frac_max: float = 0.10,
 ) -> dict:
     """Return raw arrays for three roles by scanning n_scan random snippets.
 
     clean  — lowest hot_frac (quietest)
     clean2 — second-lowest (used as ETI injection base)
-    rfi    — highest hot_frac (most naturally contaminated)
+    rfi    — highest hot_frac among snippets where chan_frac <= rfi_chan_frac_max
+             (excludes broadband artifacts where most channels are affected)
     """
     npy = cache_path / f"{split}.npy"
     arr = np.load(str(npy), mmap_mode="r")
@@ -89,18 +100,38 @@ def select_snippets(
     idx = rng.choice(n_total, size=min(n_scan, n_total), replace=False)
 
     print(f"  Scanning {len(idx)} snippets from {npy.name} …")
-    hot_fracs = []
+    hot_fracs  = []
+    chan_fracs  = []
     for i in idx:
-        hot_fracs.append(_hot_frac(_preprocess(arr[i], preproc_cfg)))
+        s = _preprocess(arr[i], preproc_cfg)
+        hot_fracs.append(_hot_frac(s))
+        chan_fracs.append(_chan_frac(s))
 
-    order = np.argsort(hot_fracs)
-    clean_i  = int(idx[order[0]])
-    clean2_i = int(idx[order[1]])
-    rfi_i    = int(idx[order[-1]])
+    hot_fracs  = np.array(hot_fracs)
+    chan_fracs  = np.array(chan_fracs)
+
+    order      = np.argsort(hot_fracs)
+    clean_i    = int(idx[order[0]])
+    clean2_i   = int(idx[order[1]])
+
+    # RFI: highest hot_frac where energy is still narrowband (few channels involved)
+    narrowband_mask = chan_fracs <= rfi_chan_frac_max
+    if narrowband_mask.any():
+        rfi_candidates = np.where(narrowband_mask)[0]
+        best = rfi_candidates[np.argmax(hot_fracs[rfi_candidates])]
+        rfi_i = int(idx[best])
+        print(f"  {narrowband_mask.sum()}/{len(idx)} snippets pass chan_frac <= {rfi_chan_frac_max}")
+    else:
+        # All snippets are broadband; fall back to max hot_frac with a warning
+        rfi_i = int(idx[order[-1]])
+        print(f"  WARNING: no narrowband RFI found (all chan_frac > {rfi_chan_frac_max}); "
+              f"using max hot_frac fallback — try --rfi_chan_frac_max 1.0 or a larger --n_scan")
 
     print(f"  clean  [{clean_i}]   hot_frac = {hot_fracs[order[0]]:.4f}")
     print(f"  clean2 [{clean2_i}]  hot_frac = {hot_fracs[order[1]]:.4f}  (ETI base)")
-    print(f"  rfi    [{rfi_i}]   hot_frac = {hot_fracs[order[-1]]:.4f}")
+    rfi_pos = list(idx).index(rfi_i)
+    print(f"  rfi    [{rfi_i}]   hot_frac = {hot_fracs[rfi_pos]:.4f}  "
+          f"chan_frac = {chan_fracs[rfi_pos]:.4f}")
 
     return {
         "clean":  np.array(arr[clean_i]),
@@ -282,6 +313,9 @@ def parse_args() -> argparse.Namespace:
                    help="Cache directory (contains train.npy / val.npy)")
     p.add_argument("--split",  default="train")
     p.add_argument("--n_scan", type=int, default=500)
+    p.add_argument("--rfi_chan_frac_max", type=float, default=0.10,
+                   help="Max fraction of channels allowed to be hot for RFI selection "
+                        "(excludes broadband artifacts; default: 0.10)")
     p.add_argument("--ae_checkpoint",     type=Path, default=None)
     p.add_argument("--vitmae_checkpoint", type=Path, default=None)
     p.add_argument("--ae_config",     type=Path, default=ROOT / "configs/model/convae.yaml")
@@ -296,7 +330,9 @@ def parse_args() -> argparse.Namespace:
                    help="Comma-separated ON observation indices (default: 0,2,4)")
     p.add_argument("--out_dir", type=Path, default=ROOT / "outputs/slides")
     p.add_argument("--device",  default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--seed",    type=int, default=42)
+    p.add_argument("--seed",    type=lambda x: None if x.lower() == "none" else int(x),
+                   default=42, metavar="INT|None",
+                   help="RNG seed (default: 42). Pass 'None' for a random seed each run.")
     return p.parse_args()
 
 
@@ -315,6 +351,7 @@ def main() -> None:
     raw_snippets = select_snippets(
         args.cache, args.split, preproc_cfg,
         n_scan=args.n_scan, seed=args.seed,
+        rfi_chan_frac_max=args.rfi_chan_frac_max,
     )
 
     jobs = []
