@@ -8,6 +8,7 @@ from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import CSVLogger
+from pytorch_lightning.strategies import DDPStrategy
 
 
 class AELightningModule(pl.LightningModule):
@@ -135,9 +136,14 @@ def build_trainer(
     if num_gpus == 0:
         accelerator = "cpu"
         devices = 1
+        strategy = "auto"
     else:
         accelerator = "gpu"
         devices = num_gpus
+        # find_unused_parameters=True: some loss modes (e.g. denoising) don't use
+        # mask_token in the forward pass; DDP requires this flag when parameters are
+        # conditionally unused across loss modes in the same ViTMAE class.
+        strategy = DDPStrategy(find_unused_parameters=True) if num_gpus > 1 else "auto"
 
     precision = "bf16-mixed" if (mixed_precision and num_gpus > 0) else "32-true"
 
@@ -149,7 +155,7 @@ def build_trainer(
         max_epochs=cfg["training"]["epochs"],
         accelerator=accelerator,
         devices=devices,
-        strategy="auto",
+        strategy=strategy,
         precision=precision,
         callbacks=callbacks or [],
         logger=logger,
