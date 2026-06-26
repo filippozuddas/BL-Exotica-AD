@@ -1,0 +1,58 @@
+# ViT-DAE — Denoising Autoencoder variant of the ViT-MAE backbone.
+#
+# Same architecture as vit_mae.yaml (PatchEmbed → TransformerEncoder → MLP head).
+# Training objective replaces masked prediction with dense denoising:
+#   x_noisy = x + Gaussian(0, noise_sigma)  →  encoder (NO mask)  →  MSE on all pixels, target = x
+# This gives a dense gradient every step and forces the encoder to learn the noise manifold
+# (cf. Alain & Bengio 2014: the DAE loss estimates ∇ log p(x) pointwise).
+#
+# The inference path is identical to vit_mae.yaml:
+#   encode(x)  →  mean-pool encoder output  →  Mahalanobis distance on embeddings.
+# mask_ratio is kept for forward() partitioned inference (the recon anomaly score path).
+#
+# Experiment naming: vit_mae.yaml = masked objective (T-1/T-2);
+#                    vit_dae.yaml = denoising objective (T-3+).
+
+architecture: vit_mae
+
+patch_size: [16, 16]
+
+# --- Transformer encoder (pre-norm) ---
+embed_dim: 128
+depth: 6
+num_heads: 4
+mlp_ratio: 4
+
+# --- Masking (ignored at training time for loss_mode: denoising) ---
+mask_ratio: 0.75           # used only by forward() partitioned inference (recon score path)
+mask_mode: random
+cluster_factor: [3, 5]
+
+# --- Reconstruction head ---
+decoder_depth: 0           # per-token MLP head (same as T-1 baseline for fair comparison)
+decoder_dim: 64
+decoder_num_heads: 4
+
+# --- Loss weighting (N/A for denoising: no mask_bool, all pixels weighted equally) ---
+loss_weighting: none
+
+# --- Denoising objective ---
+loss_mode: denoising       # add Gaussian noise to input, reconstruct clean; MSE on ALL pixels
+noise_sigma: 0.1           # corruption level. After log1p+median/MAD norm, signal std ≈ 1.0:
+                           #   0.05 → SNR_corruption ≈ 20 dB (easy)
+                           #   0.10 → SNR_corruption ≈ 14 dB  (default, start here)
+                           #   0.20 → SNR_corruption ≈  8 dB  (aggressive)
+                           # Tune via block-3 morphology AUC at n=500 before full n=1000 run.
+
+# (infonce params unused for loss_mode: denoising)
+infonce_lambda: 10.0
+infonce_temperature: 0.07
+
+# --- Inference anomaly score ---
+scoring: embedding         # Mahalanobis on encode(x) — the validated scorer (AUC 0.93 @ SNR 10)
+
+# --- Cadence-aware scoring ---
+cadence_n_obs: 6
+cadence_on_obs: [0, 2, 4]
+
+norm_pix_loss: false

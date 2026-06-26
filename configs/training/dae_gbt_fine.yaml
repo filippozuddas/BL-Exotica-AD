@@ -1,0 +1,32 @@
+# ViT-DAE training run on real SRT/GBT 0000-equivalent cadence data.
+#
+# Denoising AE variant — same architecture as srt_real.yaml (T-1) but with
+# loss_mode: denoising (see configs/model/vit_dae.yaml). Train this to compare
+# encoder quality vs the masked objective via encode_separation_test.py blocks 3+5.
+#
+#   CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH=. python scripts/train.py \
+#       --config configs/training/dae_gbt_fine.yaml
+
+data: configs/data/gbt_fine.yaml
+model: configs/model/vit_dae.yaml
+
+training:
+  batch_size: 1024
+  epochs: 200
+  warmup_epochs: 20
+  learning_rate: 3.0e-4
+  optimizer: adam
+  loss: mse
+  gradient_clip_val: 1.0
+  seed: 42
+  patience: 30
+  min_delta: 1.0e-5
+  monitor: val_loss
+  snapshot_every: 2
+
+hardware:
+  num_gpus: 2
+  mixed_precision: true
+  num_workers: 16
+
+output_dir: outputs

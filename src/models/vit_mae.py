@@ -8,11 +8,20 @@ SSAST (Gong et al. 2022, arXiv:2110.09784) rather than He et al.'s MAE:
 - **In-place (BERT-style) masking, single transformer.** Every patch token is
   fed to one ``nn.TransformerEncoder``; masked positions have their patch
   embedding replaced by a shared learnable ``mask_token`` (then positional
-  embedding is added to all). There is no separate decoder. This keeps the full
+  embedding is added to all). There is no separate *encoder*-side decoder (the
+  reconstruction head reads the encoder output directly). This keeps the full
   encoder representation available at masked positions — required by the
   discriminative head — and means ``encode(x)`` (no masking) is the *same* token
   regime as training, so the encoder embeddings are meaningful (the embedding
   scoring path depends on this).
+
+- **Optional cross-attention decoder** (``decoder_depth > 0``). The default
+  reconstruction head is a per-token MLP that reconstructs each patch
+  independently; setting ``decoder_depth`` swaps it for a lightweight transformer
+  decoder over *all* tokens, adding cross-token attention so adjacent patches
+  coordinate their reconstructions. It refines the (already full) encoder output
+  ``O`` — no decoder-side mask token is needed. ``loss_weighting: variance``
+  independently upweights high-variance (RFI) patches in the generative loss.
 
 - **Joint discriminative + generative objective** (SSAST Algorithm 1). Two
   2-layer MLP heads read the encoder output ``O_i`` at masked positions:
@@ -169,6 +178,11 @@ class ViTMAE(nn.Module):
         norm_pix_loss: bool = False,
         cadence_n_obs: int = 6,
         cadence_on_obs: Tuple[int, ...] = (0, 2, 4),
+        decoder_depth: int = 0,
+        decoder_dim: int = 64,
+        decoder_num_heads: int = 4,
+        loss_weighting: str = "none",
+        noise_sigma: float = 0.1,
     ):
         super().__init__()
         h, w, c = input_shape
@@ -178,10 +192,12 @@ class ViTMAE(nn.Module):
                 f"Input spatial dims {(h, w)} must be divisible by patch_size "
                 f"{patch_size} for ViT-MAE patch tokenisation."
             )
-        if loss_mode not in ("generative", "discriminative", "joint"):
+        if loss_mode not in ("generative", "discriminative", "joint", "denoising"):
             raise ValueError(f"Unknown loss_mode '{loss_mode}'.")
         if mask_mode not in ("random", "cluster"):
             raise ValueError(f"Unknown mask_mode '{mask_mode}'.")
+        if loss_weighting not in ("none", "variance"):
+            raise ValueError(f"Unknown loss_weighting '{loss_weighting}'.")
 
         self.input_shape = (c, h, w)
         self.patch_size = patch_size
@@ -200,6 +216,9 @@ class ViTMAE(nn.Module):
         self._discriminative = loss_mode in ("discriminative", "joint")
         self.cadence_n_obs = cadence_n_obs
         self.cadence_on_obs = tuple(cadence_on_obs)
+        self.decoder_depth = int(decoder_depth)
+        self.loss_weighting = loss_weighting
+        self.noise_sigma = float(noise_sigma)
 
         self.patch_embed = PatchEmbed(patch_size, in_chans=c, embed_dim=embed_dim)
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
@@ -216,9 +235,30 @@ class ViTMAE(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth, norm=nn.LayerNorm(embed_dim), enable_nested_tensor=False)
 
-        self.reconstruction_head = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Linear(embed_dim, self.patch_dim)
-        )
+        # Reconstruction path: per-token MLP head (decoder_depth=0, default) or a
+        # lightweight transformer decoder (decoder_depth>0) that adds cross-token
+        # attention so adjacent patches coordinate their reconstructions. The two
+        # are mutually exclusive; _reconstruct() dispatches on decoder_depth.
+        if self.decoder_depth == 0:
+            self.reconstruction_head = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Linear(embed_dim, self.patch_dim)
+            )
+        else:
+            self.decoder_embed = nn.Linear(embed_dim, decoder_dim)
+            self.decoder_pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, decoder_dim))
+            decoder_layer = nn.TransformerEncoderLayer(
+                d_model=decoder_dim,
+                nhead=decoder_num_heads,
+                dim_feedforward=decoder_dim * mlp_ratio,
+                dropout=0.0,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.decoder_blocks = nn.TransformerEncoder(
+                decoder_layer, num_layers=self.decoder_depth,
+                norm=nn.LayerNorm(decoder_dim), enable_nested_tensor=False)
+            self.decoder_pred = nn.Linear(decoder_dim, self.patch_dim)
         if self._discriminative:
             self.classification_head = nn.Sequential(
                 nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Linear(embed_dim, self.patch_dim)
@@ -229,6 +269,8 @@ class ViTMAE(nn.Module):
     def _init_weights(self) -> None:
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.mask_token, std=0.02)
+        if self.decoder_depth > 0:
+            nn.init.trunc_normal_(self.decoder_pos_embed, std=0.02)
 
     @property
     def n_masked(self) -> int:
@@ -270,10 +312,32 @@ class ViTMAE(nn.Module):
 
     def _generative_loss(self, pred_patches: torch.Tensor, target_patches: torch.Tensor,
                          mask_bool: torch.Tensor) -> torch.Tensor:
-        """Masked per-patch MSE (mean over masked patches). ``mask_bool`` is ``(B,N)``."""
+        """Masked per-patch MSE (mean over masked patches). ``mask_bool`` is ``(B,N)``.
+
+        With ``loss_weighting='variance'`` each masked patch's error is weighted by
+        its *target* variance (no gradient through the weight — it only redistributes
+        gradient across patches), upweighting high-variance structured RFI patches so
+        the model learns to reconstruct them instead of predicting the noise mean.
+        Normalised by the weight sum (weighted mean) to keep the loss scale stable.
+        """
         per_patch = ((pred_patches - target_patches) ** 2).mean(dim=-1)  # (B,N)
         m = mask_bool.to(per_patch.dtype)
+        if self.loss_weighting == "variance":
+            m = m * target_patches.var(dim=-1)  # (B,N) — upweight high-variance (RFI) patches
         return (per_patch * m).sum() / (m.sum() + 1e-8)
+
+    def _reconstruct(self, O: torch.Tensor) -> torch.Tensor:
+        """``(B,N,De) -> (B,N,patch_dim)``: per-token MLP head or transformer decoder.
+
+        ``O`` is the encoder output at *every* position (SSAST in-place masking
+        already substituted ``mask_token`` pre-encoding), so the decoder needs no
+        mask-token of its own — it just refines all tokens with cross-token attention.
+        """
+        if self.decoder_depth == 0:
+            return self.reconstruction_head(O)
+        z = self.decoder_embed(O) + self.decoder_pos_embed
+        z = self.decoder_blocks(z)
+        return self.decoder_pred(z)
 
     def _infonce_loss(self, O: torch.Tensor, target_patches: torch.Tensor,
                       ids_masked: torch.Tensor) -> torch.Tensor:
@@ -309,6 +373,14 @@ class ViTMAE(nn.Module):
         """
         if self.norm_pix_loss:
             raise NotImplementedError("norm_pix_loss=True is not yet implemented")
+
+        if self.loss_mode == "denoising":
+            x_noisy = x + torch.randn_like(x) * self.noise_sigma
+            O = self._encode(x_noisy, mask_bool=None)
+            pred_patches = self._reconstruct(O)
+            target_patches = patchify(x, self.patch_size)
+            return F.mse_loss(pred_patches, target_patches)
+
         b = x.shape[0]
         ids_masked = self._sample_masked_ids(b, x.device)
         mask_bool = self._mask_from_ids(ids_masked)
@@ -318,7 +390,7 @@ class ViTMAE(nn.Module):
         if self.loss_mode == "discriminative":
             return self._infonce_loss(O, target_patches, ids_masked)
 
-        pred_patches = self.reconstruction_head(O)
+        pred_patches = self._reconstruct(O)
         recon = self._generative_loss(pred_patches, target_patches, mask_bool)
         if self.loss_mode == "generative":
             return recon
@@ -358,7 +430,7 @@ class ViTMAE(nn.Module):
             mask_bool = torch.ones(b, self.num_patches, dtype=torch.bool, device=x.device)
             mask_bool[:, visible] = False
             O = self._encode(x, mask_bool)
-            pred_patches = self.reconstruction_head(O)
+            pred_patches = self._reconstruct(O)
             masked_f = mask_bool[0].to(x.dtype)  # same group structure across batch
             accum += pred_patches * masked_f.view(1, -1, 1)
             counts += masked_f
@@ -391,7 +463,7 @@ class ViTMAE(nn.Module):
         b = x.shape[0]
         mask_bool = self._cadence_on_mask(b, x.device)
         O = self._encode(x, mask_bool)
-        pred_patches = self.reconstruction_head(O)
+        pred_patches = self._reconstruct(O)
         target_patches = patchify(x, self.patch_size)
         on_mask = mask_bool[0].float()
         diff_sq = (pred_patches - target_patches).pow(2).mean(dim=-1)
@@ -483,4 +555,9 @@ def build_vit_mae(
         norm_pix_loss=bool(model_config.get("norm_pix_loss", False)),
         cadence_n_obs=int(model_config.get("cadence_n_obs", 6)),
         cadence_on_obs=tuple(model_config.get("cadence_on_obs", (0, 2, 4))),
+        decoder_depth=int(model_config.get("decoder_depth", 0)),
+        decoder_dim=int(model_config.get("decoder_dim", 64)),
+        decoder_num_heads=int(model_config.get("decoder_num_heads", 4)),
+        loss_weighting=str(model_config.get("loss_weighting", "none")),
+        noise_sigma=float(model_config.get("noise_sigma", 0.1)),
     )
