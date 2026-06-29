@@ -414,18 +414,33 @@ class ViTMAE(nn.Module):
         O = self._encode(x, mask_bool=None)
         return O.mean(dim=1)
 
+    def encode_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        """All token embeddings ``(B, num_patches, embed_dim)`` (no masking, no mean-pool).
+
+        Used by per-token max Mahalanobis scoring to avoid the 9/384 dilution
+        that mean-pooling causes for localised anomalies (narrowband signals).
+        """
+        return self._encode(x, mask_bool=None)
+
     def _n_groups(self) -> int:
         """Partition group count whose mask ratio ``(G-1)/G`` matches ``mask_ratio``."""
         return max(2, int(round(1.0 / (1.0 - self.mask_ratio))))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Deterministic partitioned reconstruction ``(B,C,H,W)``.
+        """Deterministic reconstruction ``(B,C,H,W)``.
 
-        Each of ``G`` passes keeps one round-robin group visible and masks the
-        rest; a patch's reconstruction is averaged over the passes where it was
-        masked. Used by the ``recon`` anomaly score.
+        For ``denoising`` loss_mode: clean unmasked forward pass (matches
+        training; mask_token was never trained so partitioned masking is
+        meaningless).
+
+        For all other modes: partitioned masking inference — each of ``G``
+        passes keeps one round-robin group visible and masks the rest; a
+        patch's reconstruction is averaged over the passes where it was masked.
         """
         b = x.shape[0]
+        if self.loss_mode == "denoising":
+            O = self._encode(x, mask_bool=None)
+            return unpatchify(self._reconstruct(O), self.patch_size, (b, *self.input_shape))
         groups = _partition_groups(self.num_patches, self._n_groups(), x.device)
         accum = torch.zeros(b, self.num_patches, self.patch_dim, device=x.device, dtype=x.dtype)
         counts = torch.zeros(self.num_patches, device=x.device, dtype=x.dtype)

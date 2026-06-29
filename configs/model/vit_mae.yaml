@@ -34,6 +34,22 @@ mask_ratio: 0.75           # fraction of patches masked during training
 mask_mode: random          # cluster (SSAST MSPM) | random (He-style scattered)
 cluster_factor: [3, 5]     # C ~ unif{c_min, c_max} for cluster masking (ignored when mask_mode=random)
 
+# --- Reconstruction head ---
+decoder_depth: 0           # 0 = per-token MLP head, reconstructs each patch independently
+                           #     (default; matches the trained checkpoints). >0 = lightweight
+                           #     transformer decoder with cross-token attention over all tokens
+                           #     (decoder_depth layers), so adjacent patches coordinate their
+                           #     reconstructions (e.g. continuity of narrowband RFI across patch
+                           #     boundaries). Mutually exclusive with the MLP head.
+decoder_dim: 64            # transformer decoder width (ignored when decoder_depth=0)
+decoder_num_heads: 4       # decoder attention heads (ignored when decoder_depth=0)
+
+# --- Loss weighting ---
+loss_weighting: none       # none = uniform per-patch MSE (default). variance = weight each
+                           # masked patch's MSE by its target variance (no grad through the
+                           # weight; redistributes gradient toward high-variance structured RFI
+                           # patches so the model reconstructs RFI instead of the noise mean).
+
 # --- Joint objective ---
 loss_mode: generative      # joint | generative | discriminative
 infonce_lambda: 10.0       # L = L_d + infonce_lambda * L_g  (SSAST λ=10)
