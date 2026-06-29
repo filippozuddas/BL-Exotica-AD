@@ -1,0 +1,22 @@
+architecture: convae
+
+mae: false
+variational: true
+beta: 4.0   # starting point; also try 1.0, 8.0, 16.0
+
+encoder:
+  filters: [32, 64, 128, 256]
+  convs_per_block: 2
+  kernel_size: [3, 3]
+  activation: relu
+  use_batchnorm: true
+
+bottleneck:
+  latent_dim: 64
+
+decoder:
+  filters: [256, 128, 64, 32]
+  kernel_size: [3, 3]
+  activation: relu
+  use_batchnorm: true
+  output_activation: null

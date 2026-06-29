@@ -1,0 +1,38 @@
+# β-VAE training on GBT 0000.fil data (16×1024 snippets, gbt_fine preprocessing).
+#
+# β=4.0 (starting point). The KL term forces a compact latent, preventing the
+# identity-mapping collapse that killed the plain AE. val_loss should plateau
+# ABOVE the "predict 0" floor (~2.17); if it drops near 2.17, increase beta.
+#
+#   CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH=. python scripts/train.py \
+#       --config configs/training/bvae_gbt_fine.yaml
+#
+# Evaluate with:
+#   python scripts/debug/encode_separation_test.py \
+#       --checkpoint outputs/<run_id>/checkpoints/<best>.ckpt \
+#       --cache /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine \
+#       --model_config configs/model/convae_vae.yaml \
+#       --n_samples 1000
+
+data: configs/data/gbt_fine.yaml
+model: configs/model/convae_vae.yaml
+
+training:
+  batch_size: 256
+  epochs: 100
+  warmup_epochs: 5
+  learning_rate: 3.0e-4
+  optimizer: adamw
+  weight_decay: 1.0e-4
+  loss: mse
+  seed: 42
+  patience: 20
+  min_delta: 1.0e-5
+  monitor: val_loss
+
+hardware:
+  num_gpus: 2
+  mixed_precision: true
+  num_workers: 4
+
+output_dir: outputs

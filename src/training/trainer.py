@@ -117,7 +117,7 @@ def build_trainer(
     Hardware selection is fully config-driven:
     - ``hardware.num_gpus: 0``  → CPU training
     - ``hardware.num_gpus: 1``  → single GPU
-    - ``hardware.num_gpus: 2``  → DDP across 2 GPUs (strategy="auto")
+    - ``hardware.num_gpus: 2``  → DDP across 2 GPUs (DDPStrategy, find_unused_parameters=True)
     - ``hardware.mixed_precision: true``  → bf16-mixed (native on Ada/4090)
     - ``hardware.mixed_precision: false`` → 32-true
 
@@ -140,9 +140,8 @@ def build_trainer(
     else:
         accelerator = "gpu"
         devices = num_gpus
-        # find_unused_parameters=True: some loss modes (e.g. denoising) don't use
-        # mask_token in the forward pass; DDP requires this flag when parameters are
-        # conditionally unused across loss modes in the same ViTMAE class.
+        # find_unused_parameters=True: safety net for loss modes where some parameters
+        # don't participate in every forward pass (e.g. mask_token in denoising mode).
         strategy = DDPStrategy(find_unused_parameters=True) if num_gpus > 1 else "auto"
 
     precision = "bf16-mixed" if (mixed_precision and num_gpus > 0) else "32-true"

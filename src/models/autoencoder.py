@@ -169,6 +169,11 @@ class VAE(nn.Module):
             "kl_loss": kl_loss.detach(),
         }
 
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Return z_mean (B, latent_dim) — deterministic embedding for one-class scoring."""
+        z_mean, _, _ = self.encoder(x)
+        return z_mean
+
     def anomaly_score(self, x: torch.Tensor, method: str = "recon", **kwargs) -> torch.Tensor:
         if method != "recon":
             raise ValueError(f"VAE only supports method='recon', got '{method}'.")
