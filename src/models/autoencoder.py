@@ -148,6 +148,7 @@ class VAE(nn.Module):
         self.decoder = decoder
         self.loss_fn = loss_fn
         self.beta = beta
+        self.beta_target = beta  # annealing endpoint; beta is mutated by the trainer
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _, _, z = self.encoder(x)

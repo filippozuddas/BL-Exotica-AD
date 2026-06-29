@@ -53,6 +53,17 @@ class AELightningModule(pl.LightningModule):
         )
         return loss
 
+    def on_train_epoch_start(self) -> None:
+        # KL annealing: linearly ramp model.beta from 0 to its target value over
+        # kl_anneal_epochs epochs. Prevents posterior collapse at the start of
+        # training when the KL weight is high (β > 1). No-op for AE/MAE (no beta).
+        anneal_epochs = self.cfg["training"].get("kl_anneal_epochs", 0)
+        if anneal_epochs > 0 and hasattr(self.model, "beta"):
+            beta_target = self.model.beta_target
+            current_beta = min(beta_target, beta_target * self.current_epoch / anneal_epochs)
+            self.model.beta = current_beta
+            self.log("beta", current_beta, on_step=False, on_epoch=True, prog_bar=False)
+
     def training_step(self, batch: torch.Tensor, batch_idx: int) -> torch.Tensor:
         return self._step(batch, "train")
 

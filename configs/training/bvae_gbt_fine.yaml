@@ -18,21 +18,24 @@ data: configs/data/gbt_fine.yaml
 model: configs/model/convae_vae.yaml
 
 training:
-  batch_size: 256
-  epochs: 100
+  batch_size: 1024
+  epochs: 200
   warmup_epochs: 5
   learning_rate: 3.0e-4
   optimizer: adamw
   weight_decay: 1.0e-4
   loss: mse
+  gradient_clip_val: 1.0
+  kl_anneal_epochs: 20   # ramp beta 0→4.0 over first 20 epochs; prevents posterior collapse
   seed: 42
-  patience: 20
+  patience: 15
   min_delta: 1.0e-5
   monitor: val_loss
+  snapshot_every: 2
 
 hardware:
   num_gpus: 2
   mixed_precision: true
-  num_workers: 4
+  num_workers: 16
 
 output_dir: outputs
