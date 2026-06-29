@@ -165,6 +165,7 @@ def main():
         model_config=cfg["model"],
         loss=cfg["training"]["loss"],
         learning_rate=cfg["training"]["learning_rate"],
+        beta=float(cfg["model"].get("beta", 1.0)),
     )
 
     # --------------------------------------------------------- output / train

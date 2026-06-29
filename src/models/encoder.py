@@ -133,7 +133,8 @@ class Encoder(nn.Module):
             return self.z(x)  # (B, latent_dim, H', W')
         x = torch.flatten(x, 1)
         z_mean = self.z_mean(x)
-        z_log_var = self.z_log_var(x)
+        # Clamp prevents z_log_var from diverging when beta=0 (KL annealing).
+        z_log_var = self.z_log_var(x).clamp(-4.0, 4.0)
         # Reparameterisation trick: z = z_mean + exp(0.5 * z_log_var) * eps.
         z = z_mean + torch.exp(0.5 * z_log_var) * torch.randn_like(z_mean)
         return z_mean, z_log_var, z
