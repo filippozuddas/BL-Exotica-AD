@@ -196,6 +196,61 @@ def morphology_matched_energy(emb_inj, en_inj, st_inj, emb_rfi, en_rfi, st_rfi, 
             "embedding": auc(X_emb, y)}
 
 
+def morphology_matched_energy_recon(rec_inj, en_inj, st_inj, rec_rfi, en_rfi, st_rfi, seed=0):
+    """Recon analogue of ``morphology_matched_energy``: at MATCHED input energy, does
+    the model's RECONSTRUCTION ERROR separate injected-narrowband from RFI beyond a
+    trivial shape statistic — i.e. is the recon 'win' morphology or just energy?
+
+    ``rec_*`` are per-sample reconstruction MSE scalars. We caliper-match RFI to
+    injected snippets of near-identical mean(x^2), then on the matched pairs report:
+      - energy_only : roc_auc of mean(x^2) — sanity, ~0.5 means matching worked.
+      - trivial     : 5-fold-CV logistic AUC of frame_stats (peakiness/kurtosis/top).
+      - recon       : roc_auc of the recon-MSE scalar.
+    recon ~ energy_only (~0.5) => the recon-B5 'win' is pure energy/contrast. recon
+    >> trivial and >> 0.5 => recon error carries genuine morphology.
+    """
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.model_selection import cross_val_score
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.metrics import roc_auc_score
+    except ImportError:
+        print("  (scikit-learn not available — skipping matched-energy recon test)")
+        return None
+
+    def cv_auc(feats, y):
+        return float(cross_val_score(LogisticRegression(max_iter=2000),
+                                     StandardScaler().fit_transform(feats),
+                                     y, cv=5, scoring="roc_auc").mean())
+
+    rng = np.random.default_rng(seed)
+    best = None
+    for caliper in [0.10, 0.05, 0.03, 0.02, 0.01, 0.005]:
+        ps, pb = _caliper_match(en_rfi, en_inj, caliper, rng)
+        if len(ps) < 20:
+            continue
+        e = np.concatenate([en_inj[pb], en_rfi[ps]], 0)
+        y = np.concatenate([np.ones(len(pb)), np.zeros(len(ps))])
+        ea = float(roc_auc_score(y, e))
+        ea = max(ea, 1 - ea)  # energy AUC is orientation-free here (sanity only)
+        cand = {"caliper": caliper, "n_per_class": len(ps), "energy_only": ea, "ps": ps, "pb": pb}
+        if ea <= 0.58:
+            best = cand
+            break
+        if best is None or ea < best["energy_only"]:
+            best = cand
+    if best is None:
+        return {"error": "too few energy-matched pairs (injected/RFI energy ranges barely overlap)"}
+
+    ps, pb = best["ps"], best["pb"]
+    y = np.concatenate([np.ones(len(pb)), np.zeros(len(ps))])
+    rec = np.concatenate([rec_inj[pb], rec_rfi[ps]], 0)
+    X_triv = np.concatenate([st_inj[pb], st_rfi[ps]], 0)
+    return {"n_per_class": int(best["n_per_class"]), "caliper": best["caliper"],
+            "energy_only": best["energy_only"], "trivial": cv_auc(X_triv, y),
+            "recon": float(roc_auc_score(y, rec))}
+
+
 def unsupervised_occ(emb_quiet, emb_rfi, inj_emb, snr_list, seed=0):
     """Fully-unsupervised one-class detectors on the frozen embedding (NO labels).
 
@@ -281,6 +336,7 @@ def operational_signal_vs_rfi(model, preprocessed, raw_snippets, quiet_idx, rfi_
         def score(frames):
             return recon_score(model, frames, device)
         neg = score(preprocessed[ev_rfi])
+        en_neg = frame_energy(preprocessed[ev_rfi])  # energy-only control baseline
     else:
         # Embedding scoring fits a Ledoit-Wolf covariance, so it DOES need a held-out
         # split to avoid leaking the eval samples into the fit.
@@ -305,6 +361,7 @@ def operational_signal_vs_rfi(model, preprocessed, raw_snippets, quiet_idx, rfi_
         def score(frames):
             return maha(embed(model, frames, device))
         neg = maha(emb_all[ev_rfi])
+        en_neg = frame_energy(preprocessed[ev_rfi])  # energy-only control baseline
 
     thr = np.percentile(neg, 90)  # 10% RFI false-positive operating point
     rows = []
@@ -314,9 +371,13 @@ def operational_signal_vs_rfi(model, preprocessed, raw_snippets, quiet_idx, rfi_
                                       seed=seed + j), preproc)
             for j, i in enumerate(ev_quiet)])
         pos = score(inj)
+        en_pos = frame_energy(inj)
         y = np.concatenate([np.ones(len(pos)), np.zeros(len(neg))])
         auc = float(roc_auc_score(y, np.concatenate([pos, neg])))
-        rows.append((snr, auc, float((pos > thr).mean() * 100)))
+        # Energy-only control on the SAME partition: if the model's AUC is no better
+        # than this, the "win" is just energy/contrast, not morphology.
+        auc_en = float(roc_auc_score(y, np.concatenate([en_pos, en_neg])))
+        rows.append((snr, auc, float((pos > thr).mean() * 100), auc_en))
     return {"n_rfi": len(ev_rfi), "n_quiet": len(ev_quiet), "rows": rows}
 
 
@@ -328,32 +389,29 @@ def print_operational(op, scoring="embedding"):
         print(f"  SKIPPED: {op['error']}")
         return
     print(f"  held-out: RFI(neg)={op['n_rfi']}  quiet→inject(pos)={op['n_quiet']}")
-    print(f"\n  {'SNR':>5s}  {'AUC(sig vs RFI)':>16s}  {'TPR@10%RFI-FP':>14s}")
-    print(f"  {'-'*5}  {'-'*16}  {'-'*14}")
+    print(f"\n  {'SNR':>5s}  {'AUC(model)':>11s}  {'AUC(energy)':>12s}  {'Δ vs energy':>12s}  {'TPR@10%FP':>10s}")
+    print(f"  {'-'*5}  {'-'*11}  {'-'*12}  {'-'*12}  {'-'*10}")
     floor = None
-    for snr, auc, tpr in op["rows"]:
+    beats_energy = []
+    for snr, auc, tpr, auc_en in op["rows"]:
         if floor is None and tpr >= 50:
             floor = snr
-        print(f"  {snr:5.0f}  {auc:16.3f}  {tpr:13.1f}%")
-    print(f"\n  VERDICT: signal beats RFI at "
-          f"{('SNR≈%.0f' % floor) if floor else 'NO SNR (≥50% TPR never reached)'} "
-          f"(@10% RFI-FP).")
-    if floor is not None and floor <= 15:
-        if scoring == "recon":
-            print("    -> reconstruction error separates the signal from RFI -> the memory "
-                  "(or whatever broke the copy) WORKS; build the search on recon scoring.")
-        else:
-            print("    -> unsupervised scorer keeps the signal while rejecting RFI -> REAL win; "
-                  "build the pipeline on Mahalanobis-on-embedding (full-background fit).")
+        beats_energy.append(auc - auc_en)
+        print(f"  {snr:5.0f}  {auc:11.3f}  {auc_en:12.3f}  {auc - auc_en:+12.3f}  {tpr:9.1f}%")
+    # The honest verdict is NOT "floor <= 15" (that just measures detection); it is
+    # whether the model's recon AUC clears the energy-only control. A model whose AUC
+    # only tracks (or trails) energy is a contrast detector, not a morphology detector.
+    max_delta = max(beats_energy)
+    print(f"\n  VERDICT: best margin over the energy-only control = {max_delta:+.3f}.")
+    if max_delta <= 0.03:
+        print("    -> the model does NOT beat a pure energy/contrast baseline on this "
+              "(un-matched) test -> the 'win' is energy, NOT morphology. Read the "
+              "matched-energy recon block below; the operational floor here is "
+              "energy-confounded and must not be trusted as a morphology result.")
     else:
-        if scoring == "recon":
-            print("    -> recon error does NOT separate signal from RFI -> noise-floor wall: "
-                  "the model reconstructs the background as badly as the line. MemAE degenerated "
-                  "to an energy detector here; do not invest in a polished run.")
-        else:
-            print("    -> signal does NOT separate from RFI unsupervised -> the morphology axis "
-                  "(block 3) is real but not reachable by distance-from-normal. Need a new "
-                  "OBJECTIVE (denoising / ON->OFF prediction), not just a new scorer.")
+        print("    -> the model's recon AUC exceeds the energy-only control -> there is signal "
+              "beyond contrast here; confirm it on the matched-energy recon block below "
+              "before trusting it as morphology.")
 
 
 def parse_args():
@@ -411,21 +469,65 @@ def main():
     rfi_idx = np.where(hot_fracs >= np.percentile(hot_fracs, 75))[0]
     print(f"  Quiet: {len(quiet_idx)}  RFI: {len(rfi_idx)}")
 
-    # ---- RECON scoring: run ONLY the operational signal-vs-RFI block ----
+    # ---- RECON scoring: operational signal-vs-RFI + the matched-energy control ----
     # The embedding blocks (1-4) need encode(x); recon scoring is for the AE/MAE/
-    # ViT-MAE/MemAE deployment metric (reconstruction MSE) and the noise-floor check.
+    # ViT-MAE/MemAE deployment metric (reconstruction MSE). Two blocks:
+    #   (R1) operational signal-vs-RFI, WITH an energy-only column (is the win energy?)
+    #   (R2) matched-energy recon — the discriminating morphology test.
     if args.scoring == "recon":
-        print(f"\n{'='*64}\nOPERATIONAL (RECON) — signal vs RFI on reconstruction MSE\n{'='*64}")
+        print(f"\n{'='*64}\nR1. OPERATIONAL (RECON) — signal vs RFI, with energy-only control\n{'='*64}")
         op = operational_signal_vs_rfi(model, preprocessed, raw_snippets, quiet_idx, rfi_idx,
                                        preproc, args.snr_list, args.drift_rate, args.device,
                                        scoring="recon", seed=args.seed)
         print_operational(op, scoring="recon")
+
+        # R2: matched-energy recon. Pool injected snippets across all SNRs so their
+        # energies span/overlap the RFI range, then caliper-match and compare recon
+        # AUC vs trivial-stats vs energy-only at matched energy.
+        print(f"\n{'='*64}\nR2. MATCHED-ENERGY RECON — is the recon win morphology or energy?\n{'='*64}")
+        rec_rfi = recon_score(model, preprocessed[rfi_idx], args.device)
+        en_rfi = frame_energy(preprocessed[rfi_idx])
+        st_rfi = frame_stats(preprocessed[rfi_idx])
+        rec_pool, en_pool, st_pool = [], [], []
+        for snr in args.snr_list:
+            inj = np.array([preprocess_raw(
+                inject_narrowband_on_only(raw_snippets[i], snr=snr, drift_rate=args.drift_rate,
+                                          seed=args.seed + j), preproc)
+                for j, i in enumerate(quiet_idx)])
+            rec_pool.append(recon_score(model, inj, args.device))
+            en_pool.append(frame_energy(inj))
+            st_pool.append(frame_stats(inj))
+        rec_pool = np.concatenate(rec_pool)
+        en_pool = np.concatenate(en_pool)
+        st_pool = np.concatenate(st_pool)
+        mm = morphology_matched_energy_recon(rec_pool, en_pool, st_pool,
+                                             rec_rfi, en_rfi, st_rfi, seed=args.seed)
+        if mm is None:
+            pass
+        elif "error" in mm:
+            print(f"  SKIPPED: {mm['error']}")
+        else:
+            print(f"  matched pairs: {mm['n_per_class']}/class  (caliper {mm['caliper']})")
+            print(f"  energy_only AUC : {mm['energy_only']:.3f}   (~0.5 => energy neutralised)")
+            print(f"  trivial   AUC   : {mm['trivial']:.3f}   (peakiness/kurtosis/top-pixel)")
+            print(f"  recon     AUC   : {mm['recon']:.3f}")
+            if mm["recon"] <= max(mm["trivial"], 0.58):
+                print("    -> recon at matched energy is NO better than a trivial contrast stat "
+                      "-> NOT morphology. The recon-B5 win is energy/contrast.")
+            else:
+                print("    -> recon at matched energy BEATS the trivial stat -> the model's "
+                      "reconstruction error carries genuine morphology (real win).")
+
         args.out_dir.mkdir(parents=True, exist_ok=True)
+        tag = f"{args.model_config.stem}_{args.checkpoint.stem}".replace("=", "").replace(".", "p")
+        out_npz = args.out_dir / f"recon_b5_{tag}.npz"
         if op is not None and "error" not in op:
-            np.savez(args.out_dir / "recon_signal_vs_rfi.npz",
-                     snr_list=np.array(args.snr_list),
-                     rows=np.array(op["rows"]), n_rfi=op["n_rfi"], n_quiet=op["n_quiet"])
-            print(f"\nSaved → {args.out_dir / 'recon_signal_vs_rfi.npz'}")
+            np.savez(out_npz, snr_list=np.array(args.snr_list),
+                     rows=np.array(op["rows"]), n_rfi=op["n_rfi"], n_quiet=op["n_quiet"],
+                     matched=np.array([mm.get("energy_only", np.nan), mm.get("trivial", np.nan),
+                                       mm.get("recon", np.nan)]) if mm and "error" not in mm
+                                     else np.array([np.nan, np.nan, np.nan]))
+            print(f"\nSaved → {out_npz}")
         return
 
     emb_quiet = embed(model, preprocessed[quiet_idx], args.device)
