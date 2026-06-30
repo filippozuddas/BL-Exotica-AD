@@ -26,6 +26,9 @@ import argparse
 import sys
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import yaml
@@ -72,6 +75,8 @@ def parse_args():
     p.add_argument("--eval_every", type=int, default=25)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--out_dir", type=Path, default=ROOT / "outputs/ssim_overfit")
+    p.add_argument("--n_examples", type=int, default=4, help="Examples to visualise per group")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
@@ -187,6 +192,50 @@ def main():
         print("  AMBIGUOUS: RFI and noise reconstruction quality are similar.")
         print("        Increase n_rfi, epochs, or check hot_frac threshold.")
     print(f"{'='*75}")
+
+    # ── reconstruction examples ───────────────────────────────────────────────
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    model.eval()
+    k = min(args.n_examples, len(noise_idx), len(rfi_idx))
+
+    for group_name, batch, hf_vals in [("noise", noise_batch[:k], hot_fracs[noise_idx[:k]]),
+                                        ("rfi",   rfi_batch[:k],   hot_fracs[rfi_idx[:k]])]:
+        with torch.no_grad():
+            recon = model.forward(batch)
+        orig  = batch.cpu().numpy()[:, 0]    # (k, 96, 1024)
+        rec   = recon.cpu().numpy()[:, 0]
+        diff  = np.abs(orig - rec)
+
+        # clip display range to ±5 MAD units for noise legibility
+        vmin, vmax = -3.0, 10.0
+
+        fig, axes = plt.subplots(k, 3, figsize=(18, 3.5 * k))
+        if k == 1:
+            axes = [axes]
+        fig.suptitle(f"Group: {group_name}   (columns: original | reconstruction | |error|)",
+                     fontsize=11)
+
+        for i in range(k):
+            err_i = float(ssim_loss(batch[i:i+1], recon[i:i+1]).item())
+            titles = [
+                f"Original  hot_frac={hf_vals[i]:.2e}",
+                f"Reconstruction  SSIM-err={err_i:.3f}",
+                "Absolute error",
+            ]
+            for j, (ax, data, title) in enumerate(zip(axes[i], [orig[i], rec[i], diff[i]], titles)):
+                vm = (vmin, vmax) if j < 2 else (0, diff[i].max())
+                im = ax.imshow(data, aspect="auto", origin="lower", cmap="viridis",
+                               vmin=vm[0], vmax=vm[1])
+                ax.set_title(title, fontsize=8)
+                ax.set_xlabel("freq channel")
+                ax.set_ylabel("time bin")
+                plt.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
+
+        plt.tight_layout()
+        out_path = args.out_dir / f"recon_{group_name}.png"
+        plt.savefig(out_path, dpi=130)
+        plt.close()
+        print(f"Saved → {out_path}")
 
 
 if __name__ == "__main__":
