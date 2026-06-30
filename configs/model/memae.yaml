@@ -1,0 +1,40 @@
+# Memory-augmented Autoencoder (MemAE, Gong et al. 2019)
+# Input: (tchans, fchans, 1) spectrogram snippet
+# Output: reconstructed snippet of same shape
+# Anomaly score: per-pixel MSE between input and reconstruction
+#
+# Same CNN conv stack as convae.yaml; the `memory: true` flag inserts a
+# content-addressable memory of normal prototypes between encoder and decoder
+# (per-spatial-position addressing on the latent feature map). This breaks the
+# plain AE's "copy" failure mode: a narrowband line, absent from every learned
+# normal prototype, cannot be redrawn and surfaces as reconstruction residual.
+
+architecture: convae
+
+# Backbone selector — mutually exclusive flags (mae / variational / memory).
+memory: true
+mem_slots: 500          # N memory items; MemAE is robust to N once large enough (Gong Fig. 7)
+shrink_threshold: 0.002 # hard-shrinkage lambda; paper range [1/N, 3/N] (=0.002..0.006 for N=500)
+entropy_weight: 2.0e-4  # alpha on addressing-entropy sparsity loss (Gong Eq. 10)
+
+mae: false
+variational: false
+
+encoder:
+  filters: [32, 64, 128, 256]  # 4 downsampling blocks → 16x spatial reduction
+  convs_per_block: 2
+  kernel_size: [3, 3]
+  activation: relu
+  use_batchnorm: true
+
+bottleneck:
+  latent_dim: 64   # Spatial bottleneck (= memory item dimension C), kept as feature map
+
+decoder:
+  filters: [256, 128, 64, 32]  # Mirror of encoder
+  kernel_size: [3, 3]
+  activation: relu
+  use_batchnorm: true
+  # Linear output: core_transform() (log1p + median/MAD) produces unbounded,
+  # signed values, so a sigmoid (range [0,1]) cannot reproduce the input.
+  output_activation: null

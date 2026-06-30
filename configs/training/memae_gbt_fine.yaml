@@ -1,0 +1,23 @@
+data: configs/data/gbt_fine.yaml
+model: configs/model/memae.yaml
+
+training:
+  batch_size: 1024
+  epochs: 200
+  warmup_epochs: 5
+  learning_rate: 1.0e-4   # Gong et al. train MemAE with Adam lr=1e-4
+  optimizer: adam
+  loss: mse
+  gradient_clip_val: 1.0
+  seed: 42
+  patience: 15
+  min_delta: 1.0e-5
+  monitor: val_loss
+  snapshot_every: 2
+
+hardware:
+  num_gpus: 2
+  mixed_precision: true
+  num_workers: 16
+
+output_dir: outputs

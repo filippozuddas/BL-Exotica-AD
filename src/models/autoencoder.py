@@ -13,6 +13,13 @@ conv stack:
   "too-good reconstruction" failure mode for locally-regular signals.
 - ``VAE`` (``variational=true``): variational backbone. Loss = reconstruction +
   ``beta`` * KL. Optional, fairly-comparable variant for empirical comparison.
+- ``MemAE`` (``memory=true``): memory-augmented AE (Gong et al. 2019). Inserts a
+  content-addressable memory of learned normal prototypes between encoder and
+  decoder (see ``memory.py``); the decoder reconstructs only from normal
+  prototypes, so anomalies (e.g. a narrowband line the plain AE would copy) are
+  redrawn as normal and surface as reconstruction residual. Loss =
+  reconstruction + ``entropy_weight`` * addressing-entropy. Scored by
+  reconstruction error.
 
 The 4th backbone is selected by ``architecture`` rather than the CNN flags:
 
@@ -40,9 +47,10 @@ from typing import Dict, List, Tuple
 from .encoder import build_encoder
 from .decoder import build_decoder
 from .losses import reconstruction_loss, kl_divergence, _masked_mse
+from .memory import MemoryUnit
 from .vit_mae import build_vit_mae
 
-__all__ = ["Autoencoder", "MAE", "VAE", "build_autoencoder"]
+__all__ = ["Autoencoder", "MAE", "VAE", "MemAE", "build_autoencoder"]
 
 
 class Autoencoder(nn.Module):
@@ -182,6 +190,76 @@ class VAE(nn.Module):
         return ((x - recon) ** 2).mean(dim=(1, 2, 3))
 
 
+class MemAE(nn.Module):
+    """Memory-augmented autoencoder (Gong et al. 2019).
+
+    Wraps the deterministic CNN encoder/decoder with a :class:`MemoryUnit`
+    addressed per spatial position of the latent feature map. Trained on normal
+    data only, the memory records prototypical normal patterns; an anomalous
+    encoding is replaced by the nearest normal prototypes before decoding, so the
+    decoder cannot redraw the anomaly and its reconstruction error is amplified.
+    This breaks the "copy" failure mode of the plain :class:`Autoencoder`, whose
+    spatial bottleneck lets a locally-regular signal (e.g. a narrowband line)
+    pass straight through to the decoder.
+
+    Scored at search time by reconstruction error (``method='recon'``), exactly
+    like the plain AE — the memory acts during reconstruction, not on the score.
+    ``encode`` is provided only for interface compatibility with the
+    embedding-based eval harness / ``OneClassScorer``; it is **not** the intended
+    anomaly score for this model.
+    """
+
+    def __init__(
+        self,
+        encoder: nn.Module,
+        decoder: nn.Module,
+        memory: MemoryUnit,
+        loss_fn,
+        entropy_weight: float = 2.0e-4,
+    ):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.memory = memory
+        self.loss_fn = loss_fn
+        self.entropy_weight = entropy_weight
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z_hat, _ = self.memory(self.encoder(x))
+        return self.decoder(z_hat)
+
+    def compute_loss(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Return ``(total, {"reconstruction_loss":..., "entropy_loss":...})``.
+
+        ``total = reconstruction + entropy_weight * entropy(addressing_weights)``
+        (Gong Eq. 10). The entropy term, together with the hard shrinkage inside
+        the memory unit, promotes sparse memory addressing.
+        """
+        z_hat, att = self.memory(self.encoder(x))
+        reconstruction = self.decoder(z_hat)
+        recon_loss = self.loss_fn(x, reconstruction).mean()
+        entropy_loss = self.memory.entropy(att)
+        total = recon_loss + self.entropy_weight * entropy_loss
+        return total, {
+            "reconstruction_loss": recon_loss.detach(),
+            "entropy_loss": entropy_loss.detach(),
+        }
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Global-average-pooled encoder output ``(B, latent_dim)``.
+
+        Interface shim for the embedding-based harness/``OneClassScorer`` only —
+        MemAE's anomaly score is reconstruction error, not this embedding.
+        """
+        return self.encoder(x).mean(dim=(2, 3))
+
+    def anomaly_score(self, x: torch.Tensor, method: str = "recon", **kwargs) -> torch.Tensor:
+        if method != "recon":
+            raise ValueError(f"MemAE only supports method='recon', got '{method}'.")
+        recon = self.forward(x)
+        return ((x - recon) ** 2).mean(dim=(1, 2, 3))
+
+
 def build_autoencoder(
     input_shape: Tuple[int, int, int],
     model_config: Dict,
@@ -229,8 +307,12 @@ def build_autoencoder(
         output_activation = dec_cfg.get("output_activation", "sigmoid")
         variational = bool(model_config.get("variational", False))
         mae = bool(model_config.get("mae", False))
+        memory = bool(model_config.get("memory", False))
         patch_size = tuple(model_config.get("patch_size", (4, 4)))
         mask_ratio = float(model_config.get("mask_ratio", 0.75))
+        mem_slots = int(model_config.get("mem_slots", 500))
+        shrink_threshold = model_config.get("shrink_threshold", None)
+        entropy_weight = float(model_config.get("entropy_weight", 2.0e-4))
 
         n_blocks = len(filters)
         factor = 2 ** n_blocks
@@ -277,6 +359,9 @@ def build_autoencoder(
             model = MAE(encoder, decoder, loss_fn, patch_size=patch_size, mask_ratio=mask_ratio)
         elif variational:
             model = VAE(encoder, decoder, loss_fn, beta=beta)
+        elif memory:
+            mem = MemoryUnit(mem_slots, latent_dim, shrink_threshold=shrink_threshold)
+            model = MemAE(encoder, decoder, mem, loss_fn, entropy_weight=entropy_weight)
         else:
             model = Autoencoder(encoder, decoder, loss_fn)
 
