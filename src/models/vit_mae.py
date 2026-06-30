@@ -192,7 +192,7 @@ class ViTMAE(nn.Module):
                 f"Input spatial dims {(h, w)} must be divisible by patch_size "
                 f"{patch_size} for ViT-MAE patch tokenisation."
             )
-        if loss_mode not in ("generative", "discriminative", "joint", "denoising"):
+        if loss_mode not in ("generative", "discriminative", "joint", "denoising", "ssim"):
             raise ValueError(f"Unknown loss_mode '{loss_mode}'.")
         if mask_mode not in ("random", "cluster"):
             raise ValueError(f"Unknown mask_mode '{mask_mode}'.")
@@ -383,6 +383,22 @@ class ViTMAE(nn.Module):
             pred_patches = self._reconstruct(O)
             target_patches = patchify(x, self.patch_size)
             return F.mse_loss(pred_patches, target_patches)
+
+        if self.loss_mode == "ssim":
+            # Masking + full-image SSIM loss.
+            # Unlike the generative path (MSE on masked patches only), SSIM is
+            # computed on the *complete* reconstruction so the 11×11 Gaussian
+            # window can measure local structural coherence across the whole
+            # 96×1024 image — including the cadence ON/OFF boundaries that are
+            # the morphological signature of narrowband signals.
+            from .losses import ssim_loss
+            b = x.shape[0]
+            ids_masked = self._sample_masked_ids(b, x.device)
+            mask_bool = self._mask_from_ids(ids_masked)
+            O = self._encode(x, mask_bool)
+            pred_patches = self._reconstruct(O)
+            reconstruction = unpatchify(pred_patches, self.patch_size, (b, *self.input_shape))
+            return ssim_loss(x, reconstruction).mean()
 
         b = x.shape[0]
         ids_masked = self._sample_masked_ids(b, x.device)

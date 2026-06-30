@@ -28,19 +28,26 @@ def mse_loss(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
     return ((y_true - y_pred) ** 2).mean(dim=(1, 2, 3))
 
 
-def ssim_loss(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
+def ssim_loss(y_true: torch.Tensor, y_pred: torch.Tensor,
+              data_range: float | None = None) -> torch.Tensor:
     """Per-sample structural dissimilarity ``1 - SSIM``.
 
-    Assumes inputs are in ``[0, 1]`` (per-snippet log-normalised spectrograms).
     ``pytorch_msssim.ssim`` returns higher-is-better similarity; with
     ``size_average=False`` it is per-sample, so the loss is ``1 - SSIM``.
+
+    ``data_range``: value range of the inputs, used to set SSIM stability
+    constants c1/c2. If None, computed per-batch from ``y_true``. Pass
+    ``data_range=1.0`` only when inputs are genuinely in ``[0, 1]``; for
+    MAD-normalised spectrograms leave it None so the constants scale correctly.
 
     ``pytorch-msssim`` is imported lazily so the module (and the default MSE
     path) loads with only ``torch`` installed.
     """
     from pytorch_msssim import ssim
 
-    return 1.0 - ssim(y_true, y_pred, data_range=1.0, size_average=False)
+    if data_range is None:
+        data_range = float((y_true.detach().max() - y_true.detach().min()).clamp_min(1e-6).item())
+    return 1.0 - ssim(y_true, y_pred, data_range=data_range, size_average=False)
 
 
 def mse_ssim_loss(

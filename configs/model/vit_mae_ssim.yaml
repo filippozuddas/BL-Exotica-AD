@@ -1,0 +1,29 @@
+architecture: vit_mae
+
+patch_size: [16, 16]
+
+embed_dim: 128
+depth: 6
+num_heads: 4
+mlp_ratio: 4
+
+mask_ratio: 0.75
+mask_mode: random
+cluster_factor: [3, 5]
+
+decoder_depth: 2
+decoder_dim: 64
+decoder_num_heads: 4
+
+loss_mode: ssim
+loss_weighting: none
+
+# discriminative head not used with ssim loss
+infonce_lambda: 10.0
+infonce_temperature: 0.07
+
+scoring: recon
+
+cadence_n_obs: 6
+cadence_on_obs: [0, 2, 4]
+norm_pix_loss: false
