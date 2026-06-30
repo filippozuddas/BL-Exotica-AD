@@ -51,16 +51,17 @@ from scripts.debug.injection_vs_rfi_test import preprocess_raw, inject_narrowban
 INPUT_SHAPE = (96, 1024, 1)
 
 
-def load_model(checkpoint_path: Path, model_config: dict, device: str):
+def load_model(checkpoint_path: Path, model_config: dict, device: str, require_encode: bool = True):
     model = build_autoencoder(INPUT_SHAPE, model_config, loss="mse")
     ckpt = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
     state = {k.replace("model.", "", 1): v
              for k, v in ckpt["state_dict"].items() if k.startswith("model.")}
     model.load_state_dict(state)
     model.eval().to(device)
-    if not hasattr(model, "encode"):
-        raise SystemExit(f"Model {type(model).__name__} has no encode() — this test needs "
-                         f"the ViT-MAE backbone (architecture: vit_mae).")
+    if require_encode and not hasattr(model, "encode"):
+        raise SystemExit(f"Model {type(model).__name__} has no encode() — the embedding "
+                         f"blocks need an encoder embedding (use --scoring recon for "
+                         f"reconstruction-error models such as the plain AE / MemAE).")
     return model
 
 
@@ -71,6 +72,20 @@ def embed(model, snippets: np.ndarray, device: str, batch: int = 64) -> np.ndarr
     for i in range(0, len(snippets), batch):
         x = torch.from_numpy(snippets[i:i + batch]).float().unsqueeze(1).to(device)
         out.append(model.encode(x).cpu().numpy())
+    return np.concatenate(out, axis=0)
+
+
+@torch.no_grad()
+def recon_score(model, snippets: np.ndarray, device: str, batch: int = 64) -> np.ndarray:
+    """(N, H, W) preprocessed -> (N,) per-sample reconstruction MSE.
+
+    The reconstruction-error analogue of ``embed`` — works for any backbone that
+    exposes ``anomaly_score(x, method='recon')`` (plain AE, MAE, ViT-MAE, MemAE).
+    """
+    out = []
+    for i in range(0, len(snippets), batch):
+        x = torch.from_numpy(snippets[i:i + batch]).float().unsqueeze(1).to(device)
+        out.append(model.anomaly_score(x, method="recon").cpu().numpy())
     return np.concatenate(out, axis=0)
 
 
@@ -86,21 +101,60 @@ def frame_energy(frames: np.ndarray) -> np.ndarray:
     return (frames.astype(np.float64) ** 2).mean(axis=(1, 2))
 
 
-def morphology_matched_energy(emb_inj, en_inj, emb_rfi, en_rfi, seed=0, nbins=8):
+def frame_stats(frames: np.ndarray) -> np.ndarray:
+    """Hand-crafted shape scalars per snippet, (N, 3): peakiness (max/std),
+    excess kurtosis, and fraction of energy in the brightest 0.1% pixels.
+
+    These are the trivial 'is it a thin bright line vs. diffuse RFI' statistics a
+    2-line numpy detector would use. The control: if the embedding's matched-energy
+    AUC is no better than an AUC from THESE, the encoder adds nothing over a scalar
+    threshold and the feature-scoring pivot is pointless.
+    """
+    f = frames.reshape(len(frames), -1).astype(np.float64)
+    mu = f.mean(1, keepdims=True)
+    sd = f.std(1) + 1e-9
+    peak = f.max(1) / sd
+    kurt = (((f - mu) ** 4).mean(1)) / (sd ** 4) - 3.0
+    p2 = np.sort(f ** 2, axis=1)
+    k = max(1, int(0.001 * f.shape[1]))
+    topfrac = p2[:, -k:].sum(1) / (p2.sum(1) + 1e-9)
+    return np.stack([peak, kurt, topfrac], axis=1)
+
+
+def _caliper_match(en_small, en_big, caliper, rng):
+    """Greedy 1:1 nearest-energy matching, without replacement. Iterates over the
+    smaller class; for each, takes the closest unused sample of the big class if
+    within ``caliper`` energy units. Returns (small_idx, big_idx) paired arrays."""
+    order = rng.permutation(len(en_small))
+    used = np.zeros(len(en_big), bool)
+    ps, pb = [], []
+    for i in order:
+        d = np.abs(en_big - en_small[i])
+        d[used] = np.inf
+        j = int(d.argmin())
+        if d[j] <= caliper:
+            used[j] = True
+            ps.append(int(i))
+            pb.append(j)
+    return np.array(ps, int), np.array(pb, int)
+
+
+def morphology_matched_energy(emb_inj, en_inj, st_inj, emb_rfi, en_rfi, st_rfi, seed=0):
     """Deciding test: at MATCHED input energy, does the embedding separate
-    injected-narrowband (anomaly) from RFI (normal-but-energetic)?
+    injected-narrowband (anomaly) from RFI (normal-but-energetic) — and does it do
+    so beyond what a TRIVIAL hand-crafted shape statistic already achieves?
 
-    Energy is the confound (a signal IS energy), and injected-narrowband barely
-    raises energy while RFI is genuinely energetic — so the two classes are nearly
-    energy-disjoint and *any* scorer separates them trivially by energy. To remove
-    that, we energy-stratify: split the energy-overlap band into ``nbins`` and draw
-    equal counts per class per bin, giving two sets with the SAME energy histogram.
-
-    Returns 5-fold-CV logistic AUCs on the matched sets:
-      - energy_only : sanity check — should be ~0.5 if matching worked.
-      - embedding   : AUC from the embedding. If >>0.5 with energy_only~0.5, a real
-                      MORPHOLOGY axis exists -> feature scoring is viable. If ~0.5,
-                      the embedding is ~pure energy -> recon == feature scoring.
+    Energy is the confound (a faint narrowband barely raises energy while RFI is
+    genuinely energetic), so we pair each RFI to an injected snippet of nearly
+    identical mean(x^2) (1:1 nearest-neighbour, adaptive caliper tightened until the
+    energy-only AUC drops to ~0.5). On the matched pairs we then compare three
+    5-fold-CV logistic AUCs:
+      - energy_only : sanity — ~0.5 means matching worked.
+      - trivial     : from frame_stats (peakiness/kurtosis/top-pixel fraction). The
+                      embedding must BEAT this — else it only re-encodes a higher-order
+                      energy statistic a 2-line detector captures (no AE needed).
+      - embedding   : if >> trivial and >> 0.5, the encoder carries genuine
+                      morphology a scalar can't -> feature scoring is justified.
     """
     try:
         from sklearn.linear_model import LogisticRegression
@@ -110,34 +164,196 @@ def morphology_matched_energy(emb_inj, en_inj, emb_rfi, en_rfi, seed=0, nbins=8)
         print("  (scikit-learn not available — skipping matched-energy test)")
         return None
 
-    rng = np.random.default_rng(seed)
-    lo, hi = max(en_inj.min(), en_rfi.min()), min(en_inj.max(), en_rfi.max())
-    if hi <= lo:
-        return {"error": "no energy overlap between injected and RFI"}
-    edges = np.linspace(lo, hi, nbins + 1)
-    ii, jj = [], []
-    for k in range(nbins):
-        hi_inc = k == nbins - 1  # include right edge in last bin
-        a = np.where((en_inj >= edges[k]) & ((en_inj <= edges[k + 1]) if hi_inc else (en_inj < edges[k + 1])))[0]
-        b = np.where((en_rfi >= edges[k]) & ((en_rfi <= edges[k + 1]) if hi_inc else (en_rfi < edges[k + 1])))[0]
-        m = min(len(a), len(b))
-        if m:
-            ii.append(rng.choice(a, m, replace=False))
-            jj.append(rng.choice(b, m, replace=False))
-    if not ii:
-        return {"error": "no overlapping energy bins with both classes populated"}
-    ii, jj = np.concatenate(ii), np.concatenate(jj)
-    X = np.concatenate([emb_inj[ii], emb_rfi[jj]], 0)
-    e = np.concatenate([en_inj[ii], en_rfi[jj]], 0)[:, None]
-    y = np.concatenate([np.ones(len(ii)), np.zeros(len(jj))])
-
-    def auc(feats):
+    def auc(feats, y):
         return float(cross_val_score(LogisticRegression(max_iter=2000),
                                      StandardScaler().fit_transform(feats),
                                      y, cv=5, scoring="roc_auc").mean())
 
-    return {"n_per_class": len(ii), "band": (float(lo), float(hi)),
-            "energy_only": auc(e), "embedding": auc(X)}
+    rng = np.random.default_rng(seed)
+    best = None
+    for caliper in [0.10, 0.05, 0.03, 0.02, 0.01, 0.005]:
+        ps, pb = _caliper_match(en_rfi, en_inj, caliper, rng)
+        if len(ps) < 20:
+            continue
+        e = np.concatenate([en_inj[pb], en_rfi[ps]], 0)[:, None]
+        y = np.concatenate([np.ones(len(pb)), np.zeros(len(ps))])
+        ea = auc(e, y)
+        cand = {"caliper": caliper, "n_per_class": len(ps), "energy_only": ea, "ps": ps, "pb": pb}
+        if ea <= 0.58:  # loosest caliper that already neutralises energy (keeps n high)
+            best = cand
+            break
+        if best is None or ea < best["energy_only"]:
+            best = cand
+    if best is None:
+        return {"error": "too few energy-matched pairs (RFI scarce in the injected band)"}
+
+    ps, pb = best["ps"], best["pb"]
+    y = np.concatenate([np.ones(len(pb)), np.zeros(len(ps))])
+    X_emb = np.concatenate([emb_inj[pb], emb_rfi[ps]], 0)
+    X_triv = np.concatenate([st_inj[pb], st_rfi[ps]], 0)
+    return {"n_per_class": int(best["n_per_class"]), "caliper": best["caliper"],
+            "energy_only": best["energy_only"], "trivial": auc(X_triv, y),
+            "embedding": auc(X_emb, y)}
+
+
+def unsupervised_occ(emb_quiet, emb_rfi, inj_emb, snr_list, seed=0):
+    """Fully-unsupervised one-class detectors on the frozen embedding (NO labels).
+
+    Fits three OCCs on the normal (quiet) embeddings only, then scores the held-out
+    quiet baseline, RFI, and each injected SNR. Threshold = quiet mean+3σ/5σ of each
+    OCC's own score (same calibration convention as the recon sweep), so the det@SNR
+    floor is directly comparable to recon's SNR>=20.
+
+      - maha : Mahalanobis distance, Ledoit-Wolf-shrunk covariance (proper full-cov
+               Gaussian one-class; the naive block-2 distance was diagonal-only).
+      - iforest / ocsvm : sklearn IsolationForest / OneClassSVM on standardised emb.
+
+    The question the supervised AUC could NOT answer: is the injected narrowband an
+    OUTLIER of the normal density (flaggable without labels), or does it sit inside it?
+    """
+    try:
+        from sklearn.covariance import LedoitWolf
+        from sklearn.ensemble import IsolationForest
+        from sklearn.svm import OneClassSVM
+        from sklearn.preprocessing import StandardScaler
+    except ImportError:
+        print("  (scikit-learn not available — skipping unsupervised OCC test)")
+        return None
+
+    scaler = StandardScaler().fit(emb_quiet)
+    qz = scaler.transform(emb_quiet)
+    lw = LedoitWolf().fit(emb_quiet)
+    iso = IsolationForest(n_estimators=300, random_state=seed).fit(qz)
+    svm = OneClassSVM(nu=0.1, gamma="scale").fit(qz)
+
+    scorers = {
+        "maha": lambda E: np.sqrt(np.clip(lw.mahalanobis(E), 0, None)),
+        "iforest": lambda E: -iso.score_samples(scaler.transform(E)),
+        "ocsvm": lambda E: -svm.decision_function(scaler.transform(E)),
+    }
+    out = {}
+    for name, fn in scorers.items():
+        base = fn(emb_quiet)
+        bm, bs = base.mean(), base.std() + 1e-12
+        out[name] = {
+            "b_mean": bm, "b_std": bs,
+            "rfi_d": cohens_d(fn(emb_rfi), base),
+            "det3": {s: float((fn(inj_emb[s]) > bm + 3 * bs).mean() * 100) for s in snr_list},
+            "det5": {s: float((fn(inj_emb[s]) > bm + 5 * bs).mean() * 100) for s in snr_list},
+        }
+    return out
+
+
+def operational_signal_vs_rfi(model, preprocessed, raw_snippets, quiet_idx, rfi_idx,
+                              preproc, snr_list, drift_rate, device, scoring="embedding", seed=0):
+    """THE operational test: in a real search (no labels), can the scorer rank an
+    injected signal ABOVE real RFI? Energy works AGAINST us here (injected-into-quiet
+    is LOW energy, RFI is HIGH) — so a high AUC means the scorer uses morphology, not
+    energy. Reports, per SNR, AUC(signal vs RFI) and TPR at 10% RFI-false-positive
+    rate. AUC~0.5 (or <0.5) => signal looks as normal as / more normal than RFI => no win.
+
+    Two scorings share the SAME held-out partition (so they are directly comparable):
+    - ``embedding`` (default): Mahalanobis (Ledoit-Wolf) fit on the fit-half embeddings
+      (RFI folded into 'normal'); score = Mahalanobis distance of ``encode(x)``.
+    - ``recon``: per-sample reconstruction MSE ``anomaly_score(x, 'recon')`` — no fit
+      needed. This is the score MemAE / the plain AE / ViT-MAE are actually deployed
+      with, and the metric that exposes the noise-floor failure mode.
+
+    Held-out: RFI = negatives, injected-into-held-out-quiet = positives.
+    """
+    try:
+        from sklearn.metrics import roc_auc_score
+    except ImportError:
+        print("  (scikit-learn not available — skipping operational test)")
+        return None
+
+    if scoring == "recon":
+        # Recon scoring fits NOTHING, so no held-out partition is needed: use ALL
+        # quiet (inject) and ALL RFI (negatives) with zero leakage. This also
+        # avoids the ~75/class held-out regime that produced the retracted 0.927
+        # artifact and clears the >=500/class sampling-guardrail floor.
+        ev_rfi = list(rfi_idx)
+        ev_quiet = list(quiet_idx)
+        if len(ev_rfi) < 10 or len(ev_quiet) < 10:
+            return {"error": f"too few quiet/RFI (RFI {len(ev_rfi)}, quiet {len(ev_quiet)}); "
+                             f"raise --n_samples"}
+
+        def score(frames):
+            return recon_score(model, frames, device)
+        neg = score(preprocessed[ev_rfi])
+    else:
+        # Embedding scoring fits a Ledoit-Wolf covariance, so it DOES need a held-out
+        # split to avoid leaking the eval samples into the fit.
+        from sklearn.covariance import LedoitWolf
+        rng = np.random.default_rng(seed + 1)
+        perm = rng.permutation(len(preprocessed))
+        fit = np.zeros(len(preprocessed), bool)
+        fit[perm[: int(0.7 * len(perm))]] = True
+
+        ev_rfi = [i for i in rfi_idx if not fit[i]]
+        ev_quiet = [i for i in quiet_idx if not fit[i]]
+        if len(ev_rfi) < 10 or len(ev_quiet) < 10:
+            return {"error": f"held-out too small (RFI {len(ev_rfi)}, quiet {len(ev_quiet)}); "
+                             f"raise --n_samples"}
+
+        emb_all = embed(model, preprocessed, device)
+        lw = LedoitWolf().fit(emb_all[fit])
+
+        def maha(E):
+            return np.sqrt(np.clip(lw.mahalanobis(E), 0, None))
+
+        def score(frames):
+            return maha(embed(model, frames, device))
+        neg = maha(emb_all[ev_rfi])
+
+    thr = np.percentile(neg, 90)  # 10% RFI false-positive operating point
+    rows = []
+    for snr in snr_list:
+        inj = np.array([preprocess_raw(
+            inject_narrowband_on_only(raw_snippets[i], snr=snr, drift_rate=drift_rate,
+                                      seed=seed + j), preproc)
+            for j, i in enumerate(ev_quiet)])
+        pos = score(inj)
+        y = np.concatenate([np.ones(len(pos)), np.zeros(len(neg))])
+        auc = float(roc_auc_score(y, np.concatenate([pos, neg])))
+        rows.append((snr, auc, float((pos > thr).mean() * 100)))
+    return {"n_rfi": len(ev_rfi), "n_quiet": len(ev_quiet), "rows": rows}
+
+
+def print_operational(op, scoring="embedding"):
+    """Print the operational signal-vs-RFI table + verdict (shared by both scorings)."""
+    if op is None:
+        return
+    if "error" in op:
+        print(f"  SKIPPED: {op['error']}")
+        return
+    print(f"  held-out: RFI(neg)={op['n_rfi']}  quiet→inject(pos)={op['n_quiet']}")
+    print(f"\n  {'SNR':>5s}  {'AUC(sig vs RFI)':>16s}  {'TPR@10%RFI-FP':>14s}")
+    print(f"  {'-'*5}  {'-'*16}  {'-'*14}")
+    floor = None
+    for snr, auc, tpr in op["rows"]:
+        if floor is None and tpr >= 50:
+            floor = snr
+        print(f"  {snr:5.0f}  {auc:16.3f}  {tpr:13.1f}%")
+    print(f"\n  VERDICT: signal beats RFI at "
+          f"{('SNR≈%.0f' % floor) if floor else 'NO SNR (≥50% TPR never reached)'} "
+          f"(@10% RFI-FP).")
+    if floor is not None and floor <= 15:
+        if scoring == "recon":
+            print("    -> reconstruction error separates the signal from RFI -> the memory "
+                  "(or whatever broke the copy) WORKS; build the search on recon scoring.")
+        else:
+            print("    -> unsupervised scorer keeps the signal while rejecting RFI -> REAL win; "
+                  "build the pipeline on Mahalanobis-on-embedding (full-background fit).")
+    else:
+        if scoring == "recon":
+            print("    -> recon error does NOT separate signal from RFI -> noise-floor wall: "
+                  "the model reconstructs the background as badly as the line. MemAE degenerated "
+                  "to an energy detector here; do not invest in a polished run.")
+        else:
+            print("    -> signal does NOT separate from RFI unsupervised -> the morphology axis "
+                  "(block 3) is real but not reachable by distance-from-normal. Need a new "
+                  "OBJECTIVE (denoising / ON->OFF prediction), not just a new scorer.")
 
 
 def parse_args():
@@ -155,6 +371,10 @@ def parse_args():
     p.add_argument("--out_dir", type=Path, default=ROOT / "outputs/sweeps/encode_separation")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--scoring", choices=["embedding", "recon"], default="embedding",
+                   help="embedding (default): run all blocks on encode(x) embeddings. "
+                        "recon: run ONLY the operational signal-vs-RFI block on "
+                        "reconstruction MSE (for AE / MAE / ViT-MAE / MemAE).")
     return p.parse_args()
 
 
@@ -168,7 +388,8 @@ def main():
         model_cfg = yaml.safe_load(f)
 
     print(f"Loading model from {args.checkpoint}")
-    model = load_model(args.checkpoint, model_cfg, args.device)
+    model = load_model(args.checkpoint, model_cfg, args.device,
+                       require_encode=(args.scoring == "embedding"))
 
     npy_path = Path(args.cache) / f"{args.split}.npy"
     print(f"Loading cache: {npy_path}")
@@ -190,9 +411,27 @@ def main():
     rfi_idx = np.where(hot_fracs >= np.percentile(hot_fracs, 75))[0]
     print(f"  Quiet: {len(quiet_idx)}  RFI: {len(rfi_idx)}")
 
+    # ---- RECON scoring: run ONLY the operational signal-vs-RFI block ----
+    # The embedding blocks (1-4) need encode(x); recon scoring is for the AE/MAE/
+    # ViT-MAE/MemAE deployment metric (reconstruction MSE) and the noise-floor check.
+    if args.scoring == "recon":
+        print(f"\n{'='*64}\nOPERATIONAL (RECON) — signal vs RFI on reconstruction MSE\n{'='*64}")
+        op = operational_signal_vs_rfi(model, preprocessed, raw_snippets, quiet_idx, rfi_idx,
+                                       preproc, args.snr_list, args.drift_rate, args.device,
+                                       scoring="recon", seed=args.seed)
+        print_operational(op, scoring="recon")
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+        if op is not None and "error" not in op:
+            np.savez(args.out_dir / "recon_signal_vs_rfi.npz",
+                     snr_list=np.array(args.snr_list),
+                     rows=np.array(op["rows"]), n_rfi=op["n_rfi"], n_quiet=op["n_quiet"])
+            print(f"\nSaved → {args.out_dir / 'recon_signal_vs_rfi.npz'}")
+        return
+
     emb_quiet = embed(model, preprocessed[quiet_idx], args.device)
     emb_rfi = embed(model, preprocessed[rfi_idx], args.device)
     en_rfi = frame_energy(preprocessed[rfi_idx])
+    st_rfi = frame_stats(preprocessed[rfi_idx])
     D = emb_quiet.shape[1]
 
     # ---- 1. COLLAPSE CHECK ----
@@ -232,7 +471,7 @@ def main():
     print(f"  {'-'*5}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}")
 
     t3, t5 = b_mean + 3 * b_std, b_mean + 5 * b_std
-    inj_scores, inj_emb, inj_en, results = {}, {}, {}, []
+    inj_scores, inj_emb, inj_en, inj_st, results = {}, {}, {}, {}, []
     for snr in args.snr_list:
         inj = np.array([preprocess_raw(
             inject_narrowband_on_only(raw_snippets[i], snr=snr, drift_rate=args.drift_rate,
@@ -241,6 +480,7 @@ def main():
         e_inj = embed(model, inj, args.device)
         inj_emb[snr] = e_inj
         inj_en[snr] = frame_energy(inj)
+        inj_st[snr] = frame_stats(inj)
         s = score(e_inj)
         inj_scores[snr] = s
         sigma = (s.mean() - b_mean) / b_std if b_std > 0 else 0.0
@@ -254,29 +494,65 @@ def main():
     # to maximise low-energy samples that overlap the RFI energy band.
     emb_pool = np.concatenate([inj_emb[s] for s in args.snr_list], 0)
     en_pool = np.concatenate([inj_en[s] for s in args.snr_list], 0)
-    print(f"\n{'='*64}\n3. MORPHOLOGY AT MATCHED ENERGY  (injected vs RFI, energy-stratified)\n{'='*64}")
+    st_pool = np.concatenate([inj_st[s] for s in args.snr_list], 0)
+    print(f"\n{'='*64}\n3. MORPHOLOGY AT MATCHED ENERGY  (injected vs RFI, energy-matched)\n{'='*64}")
     print(f"  raw energy range: injected {en_pool.min():.2f}–{en_pool.max():.2f} | "
           f"RFI {en_rfi.min():.2f}–{en_rfi.max():.2f}")
-    m = morphology_matched_energy(emb_pool, en_pool, emb_rfi, en_rfi, seed=args.seed)
+    m = morphology_matched_energy(emb_pool, en_pool, st_pool, emb_rfi, en_rfi, st_rfi, seed=args.seed)
     if m is not None and "error" in m:
         print(f"  SKIPPED: {m['error']}")
     elif m is not None:
-        print(f"  matched band     : {m['band'][0]:.2f}–{m['band'][1]:.2f}  "
-              f"(n/class = {m['n_per_class']})")
+        print(f"  matched pairs    : n/class = {m['n_per_class']}  (caliper = {m['caliper']:.3f})")
         print(f"  AUC energy-only  : {m['energy_only']:.3f}   (sanity: ~0.5 means matching worked)")
-        print(f"  AUC embedding    : {m['embedding']:.3f}   <-- morphology at matched energy")
+        print(f"  AUC trivial-stats: {m['trivial']:.3f}   (peakiness/kurtosis/top-pixel — the baseline to beat)")
+        print(f"  AUC embedding    : {m['embedding']:.3f}   <-- must beat trivial-stats to justify the AE")
         if m["n_per_class"] < 25:
-            print("  WARNING: few matched samples — AUC is underpowered; treat as indicative only.")
-        if m["energy_only"] > 0.65:
-            print("  WARNING: energy still separates after matching — band too wide / classes "
-                  "energy-disjoint; the embedding AUC may be energy, not morphology.")
-        elif m["embedding"] > 0.70:
-            print("  VERDICT: MORPHOLOGY axis exists at matched energy -> feature scoring is "
-                  "viable; build a better one-class than naive distance.")
+            print("  WARNING: few matched samples — AUCs underpowered; treat as indicative only.")
+        if m["energy_only"] > 0.60:
+            print("  WARNING: energy not neutralised even at the tightest caliper — embedding AUC suspect.")
+        elif m["embedding"] > m["trivial"] + 0.07:
+            print("  VERDICT: embedding beats trivial shape stats at matched energy -> the encoder "
+                  "carries genuine morphology -> feature scoring justified. NOTE: this is a "
+                  "SUPERVISED upper bound -> pursue a probe trained on synthetic injections, "
+                  "not (only) an unsupervised one-class.")
         else:
-            print("  VERDICT: embedding ~cannot separate injected from RFI at matched energy "
-                  "-> it encodes ~only energy; recon == feature scoring. Decision needed: "
-                  "change objective, or change target/product.")
+            print("  VERDICT: embedding ~= trivial shape stats -> the AE re-encodes a peakiness "
+                  "statistic a 2-line detector captures; the feature-scoring pivot adds little. "
+                  "Reconsider objective/target.")
+
+    # ---- 4. UNSUPERVISED ONE-CLASS DETECTORS (no labels) ----
+    print(f"\n{'='*64}\n4. UNSUPERVISED ONE-CLASS on frozen embedding (vs recon's SNR>=20 floor)\n{'='*64}")
+    occ = unsupervised_occ(emb_quiet, emb_rfi, inj_emb, args.snr_list, seed=args.seed)
+    if occ is not None:
+        for name, r in occ.items():
+            print(f"\n  [{name}]  RFI Cohen's d vs quiet = {r['rfi_d']:+.2f}")
+            print(f"    {'SNR':>5s}  {'det@3σ':>8s}  {'det@5σ':>8s}")
+            floor = None
+            for s in sorted(args.snr_list):
+                d3, d5 = r["det3"][s], r["det5"][s]
+                if floor is None and d3 >= 50:
+                    floor = s
+                print(f"    {s:5.0f}  {d3:7.1f}%  {d5:7.1f}%")
+            tag = (f"detects from SNR≈{floor:.0f}" if floor is not None else "never reaches 50% det@3σ")
+            print(f"    -> {name}: {tag}")
+        floors = [min((s for s in sorted(args.snr_list) if r['det3'][s] >= 50), default=None)
+                  for r in occ.values()]
+        best = min([f for f in floors if f is not None], default=None)
+        print(f"\n  VERDICT: best unsupervised OCC floor = "
+              f"{('SNR≈%.0f' % best) if best else 'none <50%'}  vs recon SNR≈20.")
+        if best is not None and best < 20:
+            print("    -> unsupervised feature scoring BEATS recon — pursue it (no labels needed).")
+        else:
+            print("    -> no unsupervised OCC beats recon: the morphology is real but sits inside "
+                  "the normal density. Fully-unsupervised gains need a new OBJECTIVE "
+                  "(denoising / intermediate-mask / ON->OFF prediction), not just a new scorer.")
+
+    # ---- 5. OPERATIONAL: signal vs RFI, OCC fit on FULL background ----
+    print(f"\n{'='*64}\n5. OPERATIONAL — signal vs RFI (OCC fit on FULL background, no labels)\n{'='*64}")
+    op = operational_signal_vs_rfi(model, preprocessed, raw_snippets, quiet_idx, rfi_idx,
+                                   preproc, args.snr_list, args.drift_rate, args.device,
+                                   scoring="embedding", seed=args.seed)
+    print_operational(op, scoring="embedding")
 
     # ---- save + plot ----
     args.out_dir.mkdir(parents=True, exist_ok=True)
