@@ -43,7 +43,6 @@ from src.models.autoencoder import build_autoencoder
 from src.data.preprocessing import bandpass_correct, core_transform
 from src.data.torch_dataset import _load_full_obs
 
-INPUT_SHAPE = (96, 1024, 1)
 METHODS = ["recon", "cadence"]
 MAD_SCALE = 1.4826
 
@@ -64,8 +63,8 @@ def _preprocess_at(f_start):
     return stacked
 
 
-def load_model(checkpoint_path: Path, model_config: dict, device: str):
-    model = build_autoencoder(INPUT_SHAPE, model_config, loss="mse")
+def load_model(checkpoint_path: Path, model_config: dict, input_shape: tuple, device: str):
+    model = build_autoencoder(input_shape, model_config, loss="mse")
     ckpt = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
     state = {k.replace("model.", "", 1): v
              for k, v in ckpt["state_dict"].items() if k.startswith("model.")}
@@ -182,6 +181,9 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=16)
     p.add_argument("--top_k", type=int, default=30,
                    help="Number of top candidates to plot per cadence per method")
+    p.add_argument("--methods", nargs="+", default=["recon"], choices=METHODS,
+                   help="Anomaly scoring methods to run. The plain Autoencoder/MAE/VAE "
+                        "only support 'recon'; 'cadence' requires the ViT-MAE backbone.")
     return p.parse_args()
 
 
@@ -198,9 +200,12 @@ def main():
     stride = frame.get("stride_infer", fchans // 2)
     downsample_factor = frame.get("downsample_factor", 1)
     df = data_cfg["raw"]["df"]
+    input_shape = (tchans, fchans, 1)
 
     with open(args.model_config) as f:
         model_cfg = yaml.safe_load(f)
+
+    methods = args.methods
 
     cadence_lines = [
         line.strip().split()
@@ -211,16 +216,16 @@ def main():
         cadence_lines = cadence_lines[:args.max_cadences]
 
     print(f"Loading model from {args.checkpoint}")
-    model = load_model(args.checkpoint, model_cfg, args.device)
+    model = load_model(args.checkpoint, model_cfg, input_shape, args.device)
 
     print(f"Cadences: {len(cadence_lines)}")
+    print(f"Input shape: {input_shape}  methods: {methods}")
     print(f"Frame: {tchans}x{fchans}, stride={stride}, downsample={downsample_factor}")
     print(f"Batch size: {args.batch_size}, workers: {args.num_workers}")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    all_recon = []
-    all_cadence = []
+    all_scores = {m: [] for m in methods}
     all_rows = []
     cadence_dirs = []
 
@@ -284,13 +289,11 @@ def main():
         batch_snippets = []
         batch_fstarts = []
         processed_count = 0
-        cad_recon_scores = []
-        cad_cadence_scores = []
+        cad_scores = {m: [] for m in methods}
         cad_fstarts = []
 
-        # Per-cadence top-K heaps
-        top_recon = []
-        top_cadence = []
+        # Per-cadence top-K heaps, one per method
+        top_heaps = {m: [] for m in methods}
 
         chunksize = max(1, min(256, n_snippets // (args.num_workers * 4)))
         print(f"  Pool: {args.num_workers} workers, chunksize={chunksize}")
@@ -302,37 +305,32 @@ def main():
                 batch_fstarts.append(f_start)
 
                 if len(batch_snippets) == args.batch_size or processed_count == n_snippets - 1:
-                    recon_scores = score_batch(model, batch_snippets, "recon", args.device)
-                    cadence_scores = score_batch(model, batch_snippets, "cadence", args.device)
+                    batch_scores = {m: score_batch(model, batch_snippets, m, args.device)
+                                    for m in methods}
 
                     for j in range(len(batch_snippets)):
-                        r_score = float(recon_scores[j])
-                        c_score = float(cadence_scores[j])
-                        cad_recon_scores.append(r_score)
-                        cad_cadence_scores.append(c_score)
                         cad_fstarts.append(batch_fstarts[j])
-                        all_recon.append(r_score)
-                        all_cadence.append(c_score)
-                        all_rows.append({
+                        local_idx = len(cad_fstarts) - 1
+                        snip_copy = batch_snippets[j].copy()
+
+                        row = {
                             "cadence_idx": cad_idx,
                             "target": target_name,
                             "f_start": batch_fstarts[j],
                             "f_center_mhz": batch_fstarts[j] * df / 1e6,
-                            "recon_score": r_score,
-                            "cadence_score": c_score,
-                        })
+                        }
+                        for m in methods:
+                            score = float(batch_scores[m][j])
+                            cad_scores[m].append(score)
+                            all_scores[m].append(score)
+                            row[f"{m}_score"] = score
 
-                        snip_copy = batch_snippets[j].copy()
-                        local_idx = len(cad_recon_scores) - 1
-                        if len(top_recon) < args.top_k:
-                            heapq.heappush(top_recon, (r_score, local_idx, snip_copy))
-                        elif r_score > top_recon[0][0]:
-                            heapq.heapreplace(top_recon, (r_score, local_idx, snip_copy))
-
-                        if len(top_cadence) < args.top_k:
-                            heapq.heappush(top_cadence, (c_score, local_idx, snip_copy))
-                        elif c_score > top_cadence[0][0]:
-                            heapq.heapreplace(top_cadence, (c_score, local_idx, snip_copy))
+                            heap = top_heaps[m]
+                            if len(heap) < args.top_k:
+                                heapq.heappush(heap, (score, local_idx, snip_copy))
+                            elif score > heap[0][0]:
+                                heapq.heapreplace(heap, (score, local_idx, snip_copy))
+                        all_rows.append(row)
 
                     batch_snippets = []
                     batch_fstarts = []
@@ -350,11 +348,11 @@ def main():
               f"({n_snippets/max(elapsed,1):.0f}/s)")
 
         # ---- Per-cadence summary & plots ----
-        cad_recon_arr = np.array(cad_recon_scores)
-        cad_cadence_arr = np.array(cad_cadence_scores)
+        cad_arrs = {m: np.array(cad_scores[m]) for m in methods}
 
-        for method, scores, heap in [("recon", cad_recon_arr, top_recon),
-                                      ("cadence", cad_cadence_arr, top_cadence)]:
+        for method in methods:
+            scores = cad_arrs[method]
+            heap = top_heaps[method]
             median, mad_sigma = robust_stats(scores)
             thresh_3 = median + 3 * mad_sigma
             thresh_5 = median + 5 * mad_sigma
@@ -377,36 +375,39 @@ def main():
                     f_start=fs, df=df, out_path=out_path,
                 )
 
-        # Per-cadence frequency profile
-        fig, ax = plt.subplots(figsize=(16, 4))
-        cad_med, cad_mad_s = robust_stats(cad_cadence_arr)
-        ax.plot(cad_fstarts, cad_cadence_arr, linewidth=0.3, alpha=0.7)
-        ax.axhline(cad_med + 3 * cad_mad_s, color="orange", ls="--", lw=1,
-                   label=f"3s = {cad_med + 3*cad_mad_s:.3f}")
-        ax.axhline(cad_med + 5 * cad_mad_s, color="red", ls="--", lw=1,
-                   label=f"5s = {cad_med + 5*cad_mad_s:.3f}")
-        ax.set_xlabel("Frequency channel (f_start)")
-        ax.set_ylabel("Cadence score")
-        ax.set_title(f"{target_name} — cadence score vs frequency")
-        ax.legend(fontsize=8)
-        plt.tight_layout()
-        plt.savefig(cad_dir / "cadence_score_vs_freq.png", dpi=150)
-        plt.close()
+        # Per-cadence frequency profile, one per method
+        for method in methods:
+            scores = cad_arrs[method]
+            fig, ax = plt.subplots(figsize=(16, 4))
+            med, mad_s = robust_stats(scores)
+            ax.plot(cad_fstarts, scores, linewidth=0.3, alpha=0.7)
+            ax.axhline(med + 3 * mad_s, color="orange", ls="--", lw=1,
+                       label=f"3s = {med + 3*mad_s:.3f}")
+            ax.axhline(med + 5 * mad_s, color="red", ls="--", lw=1,
+                       label=f"5s = {med + 5*mad_s:.3f}")
+            ax.set_xlabel("Frequency channel (f_start)")
+            ax.set_ylabel(f"{method} score")
+            ax.set_title(f"{target_name} — {method} score vs frequency")
+            ax.legend(fontsize=8)
+            plt.tight_layout()
+            plt.savefig(cad_dir / f"{method}_score_vs_freq.png", dpi=150)
+            plt.close()
 
-        print(f"  Saved {len(top_recon) + len(top_cadence)} candidate plots -> {cad_dir}")
+        n_plots = sum(len(h) for h in top_heaps.values())
+        print(f"  Saved {n_plots} candidate plots -> {cad_dir}")
 
         del obs_arrays
         _shared_obs = None
 
     # ---- Global summary ----
-    all_recon = np.array(all_recon)
-    all_cadence = np.array(all_cadence)
-    n_total = len(all_recon)
+    all_arrs = {m: np.array(all_scores[m]) for m in methods}
+    n_total = len(next(iter(all_arrs.values()))) if all_arrs else 0
 
     csv_path = args.out_dir / "inference_scores.csv"
     with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["cadence_idx", "target", "f_start",
-                                                "f_center_mhz", "recon_score", "cadence_score"])
+        fieldnames = ["cadence_idx", "target", "f_start", "f_center_mhz"]
+        fieldnames += [f"{m}_score" for m in methods]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(all_rows)
     print(f"\nSaved scores -> {csv_path}")
@@ -415,7 +416,8 @@ def main():
     print(f"GLOBAL SUMMARY -- {n_total} snippets across {len(cadence_lines)} cadences")
     print(f"{'='*70}")
 
-    for name, scores in [("recon", all_recon), ("cadence", all_cadence)]:
+    for name in methods:
+        scores = all_arrs[name]
         median, mad_sigma = robust_stats(scores)
         mean, std = scores.mean(), scores.std()
         thresh_3s = median + 3 * mad_sigma
@@ -430,9 +432,10 @@ def main():
         print(f"    3s (robust)={thresh_3s:.4f}  -> {n_3s} candidates ({n_3s/n_total*100:.3f}%)")
         print(f"    5s (robust)={thresh_5s:.4f}  -> {n_5s} candidates ({n_5s/n_total*100:.3f}%)")
 
-    # Global histograms
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    for ax, (name, scores) in zip(axes, [("recon", all_recon), ("cadence", all_cadence)]):
+    # Global histograms, one panel per method
+    fig, axes = plt.subplots(1, len(methods), figsize=(7 * len(methods), 5), squeeze=False)
+    for ax, name in zip(axes[0], methods):
+        scores = all_arrs[name]
         median, mad_sigma = robust_stats(scores)
         thresh_3 = median + 3 * mad_sigma
         thresh_5 = median + 5 * mad_sigma
