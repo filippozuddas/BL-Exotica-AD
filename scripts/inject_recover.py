@@ -1,23 +1,24 @@
 """
-Injection-recovery test on real cadences (Phase 2).
+Injection-recovery test on real cadences (Phase 2 — run BEFORE inference).
 
-Injects ON-only narrowband signals at varying SNR into clean frequency
-windows of a real cadence, scores with both recon and cadence methods,
-and compares against the RFI-inclusive background distribution from a
-prior inference run.
+Injects ON-only narrowband signals at varying SNR into quiet frequency
+windows of real cadences, and compares against an RFI-inclusive background
+built in-script from a full random probe of the same cadences (not just the
+quiet half used for injection sites).
 
 The key question: at what SNR does an ON-only injection rank above the
-real RFI candidates? This is the operationally relevant metric —
-not the clean-baseline σ (already measured by cadence_snr_sweep.py).
+real RFI in the background? This is the operationally relevant metric —
+not the clean-baseline sigma (already measured by cadence_snr_sweep.py,
+which uses a preprocessed training cache rather than real cadences).
 
-Requires a prior inference run to have produced inference_scores.csv.
+This test establishes the model's detection capability and must run before
+scripts/inference.py — it no longer depends on a prior inference run.
 
 Usage (run on the server):
     CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
     python scripts/inject_recover.py \
         --checkpoint outputs/training/<run>/checkpoints/best.ckpt \
         --cadence_list data/processed/inject_recovery_cadences.txt \
-        --inference_csv outputs/inference/srt_T1/inference_scores.csv \
         --out_dir outputs/inject_recovery/T1
 """
 
@@ -106,25 +107,11 @@ def preprocess_injected(raw_snippet, preproc, tchans=96):
     return frame.astype(np.float32)
 
 
-def load_background(csv_path):
-    """Load score distribution from a prior inference run."""
-    recon_scores = []
-    cadence_scores = []
-    with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            recon_scores.append(float(row["recon_score"]))
-            cadence_scores.append(float(row["cadence_score"]))
-    return np.array(recon_scores), np.array(cadence_scores)
-
-
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--cadence_list", type=Path, required=True)
-    p.add_argument("--inference_csv", type=Path, required=True,
-                   help="CSV from a prior inference run (background distribution)")
     p.add_argument("--data_config", type=Path, default=ROOT / "configs/data/gbt_fine.yaml")
     p.add_argument("--model_config", type=Path, default=ROOT / "configs/model/vit_mae.yaml")
     p.add_argument("--out_dir", type=Path, default=ROOT / "outputs/inject_recovery")
@@ -132,6 +119,11 @@ def parse_args():
     p.add_argument("--max_cadences", type=int, default=3)
     p.add_argument("--n_injections", type=int, default=20,
                    help="Injections per SNR level per cadence")
+    p.add_argument("--n_background_probe", type=int, default=2000,
+                   help="Random windows per cadence used to build the RFI-inclusive "
+                        "background (also the pool from which quiet injection sites "
+                        "are drawn). Keep >=500 (see sweep_baseline_sampling_guardrail: "
+                        "n=200 undersamples the RFI tail and biases the threshold low).")
     p.add_argument("--snr_list", type=float, nargs="+",
                    default=[3, 5, 7, 10, 15, 20, 30, 50])
     p.add_argument("--drift_rate", type=float, default=0.3)
@@ -155,20 +147,6 @@ def main():
 
     with open(args.model_config) as f:
         model_cfg = yaml.safe_load(f)
-
-    # Load background distribution from inference run
-    print(f"Loading background from {args.inference_csv}")
-    bg_recon, bg_cadence = load_background(args.inference_csv)
-    bg_all = {"recon": bg_recon, "cadence": bg_cadence}
-    bg = {}
-    for name, scores in bg_all.items():
-        median, mad_sigma = robust_stats(scores)
-        bg[name] = {"median": median, "mad_sigma": mad_sigma, "scores": scores,
-                    "thresh_3s": median + 3 * mad_sigma,
-                    "thresh_5s": median + 5 * mad_sigma}
-        n_3s = (scores > bg[name]["thresh_3s"]).sum()
-        print(f"  {name}: median={median:.4f}  MAD_s={mad_sigma:.4f}  "
-              f"3s={bg[name]['thresh_3s']:.4f} ({n_3s} real candidates)")
 
     cadence_lines = [
         line.strip().split()
@@ -198,6 +176,9 @@ def main():
 
     # Collect results across all cadences
     all_results = {m: {snr: [] for snr in args.snr_list} for m in methods}
+    # Background is built in-script from a full random probe of each cadence
+    # (RFI-inclusive) — NOT from the quiet half used for injection sites.
+    bg_scores = {m: [] for m in methods}
 
     for cad_idx, obs_paths in enumerate(cadence_lines):
         obs_paths = [Path(p) for p in obs_paths]
@@ -217,20 +198,26 @@ def main():
         nchans = obs_arrays[0].shape[1]
         print(f"  Loaded {len(obs_arrays)} obs, nchans={nchans}")
 
-        # Find clean windows: score a random sample, keep the quietest
-        n_probe = min(200, (nchans - fchans) // fchans)
+        # Full random probe: builds the RFI-inclusive background AND
+        # (via the recon score) identifies quiet windows for injection sites.
+        n_probe = min(args.n_background_probe, nchans - fchans)
         probe_fstarts = rng.choice((nchans - fchans), size=n_probe, replace=False)
-        probe_scores = []
+        probe_scores = {m: [] for m in methods}
         for fs in probe_fstarts:
             snip = preprocess_raw_window(obs_arrays, fs, fchans, preproc)
-            s = score_snippet(model, snip, "recon", args.device)
-            probe_scores.append(s)
-        probe_scores = np.array(probe_scores)
+            for m in methods:
+                probe_scores[m].append(score_snippet(model, snip, m, args.device))
+        probe_scores = {m: np.array(v) for m, v in probe_scores.items()}
 
-        # Use the quietest 50% as injection sites
-        quiet_mask = probe_scores <= np.median(probe_scores)
+        for m in methods:
+            bg_scores[m].extend(probe_scores[m].tolist())
+
+        # Use the quietest 50% (by recon score) as injection sites
+        recon_probe = probe_scores["recon"]
+        quiet_mask = recon_probe <= np.median(recon_probe)
         quiet_fstarts = probe_fstarts[quiet_mask]
-        print(f"  Probed {n_probe} windows, {quiet_mask.sum()} quiet (score <= {np.median(probe_scores):.4f})")
+        print(f"  Probed {n_probe} windows (background), "
+              f"{quiet_mask.sum()} quiet (recon <= {np.median(recon_probe):.4f})")
 
         injection_fstarts = rng.choice(quiet_fstarts,
                                         size=min(args.n_injections, len(quiet_fstarts)),
@@ -254,6 +241,22 @@ def main():
 
         del obs_arrays
         print(f"  Done cadence {cad_idx}")
+
+    # ---- Build RFI-inclusive background from the aggregated probe ----
+    print(f"\n{'='*70}")
+    print(f"RFI-INCLUSIVE BACKGROUND (from {len(cadence_lines)} cadences)")
+    print(f"{'='*70}")
+
+    bg = {}
+    for name in methods:
+        scores = np.array(bg_scores[name])
+        median, mad_sigma = robust_stats(scores)
+        bg[name] = {"median": median, "mad_sigma": mad_sigma, "scores": scores,
+                    "thresh_3s": median + 3 * mad_sigma,
+                    "thresh_5s": median + 5 * mad_sigma}
+        n_3s = (scores > bg[name]["thresh_3s"]).sum()
+        print(f"  {name}: n={len(scores)}  median={median:.4f}  MAD_s={mad_sigma:.4f}  "
+              f"3s={bg[name]['thresh_3s']:.4f} ({n_3s} candidates in probe)")
 
     # ---- Analysis against RFI-inclusive background ----
     print(f"\n{'='*70}")
