@@ -33,6 +33,7 @@ sys.path.insert(0, str(ROOT))
 
 from src.data.preprocessing import bandpass_correct, core_transform
 from src.models.autoencoder import build_autoencoder
+from scripts.debug.injection_vs_rfi_test import inject_narrowband_on_only
 
 
 def load_model(checkpoint_path, model_config, device="cpu"):
@@ -55,27 +56,6 @@ def preprocess_raw(raw_snippet, cfg_preproc):
     frame = bandpass_correct(frame, method=method, poly_degree=poly_degree)
     frame = core_transform(frame, mad_epsilon)
     return frame.astype(np.float32)
-
-
-def inject_narrowband_on_only(raw_snippet, snr=25.0, drift_rate=0.3, seed=42):
-    rng = np.random.default_rng(seed)
-    raw = raw_snippet.copy()
-    n_obs, tchans_per_obs, fchans = raw.shape
-    noise_std = np.median(np.abs(raw - np.median(raw))) * 1.4826
-    signal_amplitude = snr * noise_std
-    start_chan = rng.integers(100, fchans - 100)
-    width_chans = 3.0
-    dt = 18.25361108
-    df = 2.7939677238464355
-    drift_chans_per_bin = (drift_rate * dt) / df
-    for obs_idx in [0, 2, 4]:
-        global_t_start = obs_idx * tchans_per_obs
-        for t in range(tchans_per_obs):
-            center = start_chan + (global_t_start + t) * drift_chans_per_bin
-            chans = np.arange(fchans)
-            profile = signal_amplitude * np.exp(-0.5 * ((chans - center) / width_chans) ** 2)
-            raw[obs_idx, t] += profile
-    return raw
 
 
 def reconstruct(model, snippet, device="cpu"):
@@ -172,29 +152,29 @@ def main():
         diff_vmax = np.percentile(diff_abs[diff_abs > 0], 99) if (diff_abs > 0).any() else 1
 
         # Col 0: original
-        axes[row][0].imshow(orig, aspect="auto", origin="lower",
+        axes[row][0].imshow(orig, aspect="auto", origin="upper",
                             cmap="viridis", vmin=vmin, vmax=vmax)
         mse_orig = np.mean((orig - reconstruct(model, orig, args.device)) ** 2)
         axes[row][0].set_title(f"MSE={mse_orig:.3f}", fontsize=9)
 
         # Col 1: injected (ON-only)
-        axes[row][1].imshow(injected, aspect="auto", origin="lower",
+        axes[row][1].imshow(injected, aspect="auto", origin="upper",
                             cmap="viridis", vmin=vmin, vmax=vmax)
         axes[row][1].set_title(f"SNR={args.inject_snr}", fontsize=9)
 
         # Col 2: reconstruction
-        axes[row][2].imshow(recon, aspect="auto", origin="lower",
+        axes[row][2].imshow(recon, aspect="auto", origin="upper",
                             cmap="viridis", vmin=vmin, vmax=vmax)
         mse_inj = np.mean(error)
         axes[row][2].set_title(f"MSE={mse_inj:.3f}", fontsize=9)
 
         # Col 3: error map
-        axes[row][3].imshow(error, aspect="auto", origin="lower",
+        axes[row][3].imshow(error, aspect="auto", origin="upper",
                             cmap="hot", vmin=0, vmax=err_vmax)
         axes[row][3].set_title(f"max={error.max():.1f}", fontsize=9)
 
         # Col 4: difference (shows where injection landed)
-        axes[row][4].imshow(diff, aspect="auto", origin="lower",
+        axes[row][4].imshow(diff, aspect="auto", origin="upper",
                             cmap="RdBu_r", vmin=-diff_vmax, vmax=diff_vmax)
         axes[row][4].set_title("ON-only signal trace", fontsize=9)
 
