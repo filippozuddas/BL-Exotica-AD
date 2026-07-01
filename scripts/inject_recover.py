@@ -6,6 +6,15 @@ windows of real cadences, and compares against an RFI-inclusive background
 built in-script from a full random probe of the same cadences (not just the
 quiet half used for injection sites).
 
+Injection uses setigen natively (NarrowbandDriftingGenerator.inject_on_only_cadence
+in src/data/synthetic.py): one setigen Frame per observation assembled into a
+Cadence (t_overwrite=True) so the drift phase stays correct across the OFF
+observations' real duration (slew is negligible, per-obs duration is not), but
+the signal is only rendered into the 3 ON frames — OFF frames are returned
+byte-identical. Drift/width/profile are sampled once per injection site (same
+distributions as training) and held fixed across the SNR sweep at that site, so
+SNR is the sweep's one independent variable.
+
 The key question: at what SNR does an ON-only injection rank above the
 real RFI in the background? This is the operationally relevant metric —
 not the clean-baseline sigma (already measured by cadence_snr_sweep.py,
@@ -41,7 +50,7 @@ sys.path.insert(0, str(ROOT))
 from src.models.autoencoder import build_autoencoder
 from src.data.preprocessing import bandpass_correct, core_transform
 from src.data.torch_dataset import _load_full_obs
-from scripts.debug.injection_vs_rfi_test import inject_narrowband_on_only
+from src.data.synthetic import NarrowbandParams, NarrowbandDriftingGenerator
 
 INPUT_SHAPE = (96, 1024, 1)
 DEFAULT_METHODS = ["recon", "cadence"]
@@ -90,10 +99,9 @@ def preprocess_raw_window(obs_arrays, f_start, fchans, preproc, tchans=96):
     return stacked
 
 
-def inject_into_obs(obs_arrays, f_start, fchans, snr, drift_rate, seed, tchans_per_obs=16):
-    """Extract raw window from obs arrays, inject ON-only signal, return raw snippet."""
-    raw = np.stack([obs[:tchans_per_obs, f_start:f_start + fchans] for obs in obs_arrays])
-    return inject_narrowband_on_only(raw, snr=snr, drift_rate=drift_rate, seed=seed)
+def extract_obs_windows(obs_arrays, f_start, fchans, tchans_per_obs=16):
+    """Slice the (n_obs, tchans_per_obs, fchans) raw window at f_start."""
+    return np.stack([obs[:tchans_per_obs, f_start:f_start + fchans] for obs in obs_arrays])
 
 
 def preprocess_injected(raw_snippet, preproc, tchans=96):
@@ -126,7 +134,6 @@ def parse_args():
                         "n=200 undersamples the RFI tail and biases the threshold low).")
     p.add_argument("--snr_list", type=float, nargs="+",
                    default=[3, 5, 7, 10, 15, 20, 30, 50])
-    p.add_argument("--drift_rate", type=float, default=0.3)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--methods", nargs="+", default=None,
                    help="Scoring methods to test (default: all supported by model)")
@@ -147,6 +154,9 @@ def main():
 
     with open(args.model_config) as f:
         model_cfg = yaml.safe_load(f)
+
+    nb_params = NarrowbandParams.from_config(data_cfg)
+    total_tchans = INPUT_SHAPE[0]
 
     cadence_lines = [
         line.strip().split()
@@ -223,21 +233,28 @@ def main():
                                         size=min(args.n_injections, len(quiet_fstarts)),
                                         replace=False)
 
-        for snr in args.snr_list:
-            method_scores = {m: [] for m in methods}
+        # One signal morphology (drift, width, profile) per injection site,
+        # frozen and reused across the whole SNR sweep — only the amplitude
+        # varies, so SNR is the sweep's one true independent variable.
+        for j, fs in enumerate(injection_fstarts):
+            site_seed = args.seed + cad_idx * 1000 + j
+            gen = NarrowbandDriftingGenerator(nb_params, seed=site_seed)
+            drift_rate, start_channel, f_profile, t_profile_builder, sig_meta = \
+                gen.sample_cadence_signal_params(fchans, total_tchans)
 
-            for j, fs in enumerate(injection_fstarts):
-                raw_inj = inject_into_obs(obs_arrays, fs, fchans,
-                                           snr=snr, drift_rate=args.drift_rate,
-                                           seed=args.seed + cad_idx * 1000 + j)
+            obs_windows = extract_obs_windows(obs_arrays, fs, fchans)
+
+            for snr in args.snr_list:
+                raw_inj, _ = gen.inject_on_only_cadence(
+                    obs_windows, snr=snr, drift_rate=drift_rate,
+                    start_channel=start_channel, f_profile=f_profile,
+                    t_profile_builder=t_profile_builder,
+                )
                 snip_inj = preprocess_injected(raw_inj, preproc)
 
                 for m in methods:
                     s = score_snippet(model, snip_inj, m, args.device)
-                    method_scores[m].append(s)
-
-            for m in methods:
-                all_results[m][snr].extend(method_scores[m])
+                    all_results[m][snr].append(s)
 
         del obs_arrays
         print(f"  Done cadence {cad_idx}")
@@ -393,10 +410,17 @@ def main():
                     "recon", args.device) for fs in probe_fstarts]
     quiet_fs = probe_fstarts[np.argmin(probe_scores)]
 
+    example_gen = NarrowbandDriftingGenerator(nb_params, seed=args.seed + 9999)
+    ex_drift_rate, ex_start_channel, ex_f_profile, ex_t_profile_builder, ex_meta = \
+        example_gen.sample_cadence_signal_params(fchans, total_tchans)
+    example_obs_windows = extract_obs_windows(obs_arrays, quiet_fs, fchans)
+
     for snr in [5, 10, 20]:
-        raw_inj = inject_into_obs(obs_arrays, quiet_fs, fchans,
-                                   snr=snr, drift_rate=args.drift_rate,
-                                   seed=args.seed + 9999)
+        raw_inj, _ = example_gen.inject_on_only_cadence(
+            example_obs_windows, snr=snr, drift_rate=ex_drift_rate,
+            start_channel=ex_start_channel, f_profile=ex_f_profile,
+            t_profile_builder=ex_t_profile_builder,
+        )
         snip_inj = preprocess_injected(raw_inj, preproc)
         snip_clean = preprocess_raw_window(obs_arrays, quiet_fs, fchans, preproc)
         recon_arr = reconstruct_snippet(model, snip_inj, args.device)

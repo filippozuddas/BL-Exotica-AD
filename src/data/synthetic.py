@@ -417,18 +417,26 @@ class _SetigenInjector:
         log_min, log_max = np.log10(p.snr_min), np.log10(p.snr_max)
         return float(10 ** self.rng.uniform(log_min, log_max))
 
-    def _make_stochastic_t_profile(self, level: float, n_bins: int):
+    def _make_stochastic_t_profile(self, level: float, n_bins: int,
+                                    tau: Optional[float] = None,
+                                    depth: Optional[float] = None):
         """AR(1) red-noise amplitude modulation, unit-mean (ported from RST).
 
         Scintillation as a correlated log-normal envelope (not a clean sine,
         which the model could latch onto as a synthetic fingerprint).
         E[envelope] = 1, so the time-averaged level — and thus the SNR
         calibration — is preserved.
+
+        ``tau``/``depth`` are sampled if not given; pass them explicitly to
+        reuse the same envelope *shape* across repeated calls at different
+        ``level`` (e.g. an SNR sweep at one fixed injection site).
         """
         p = self.params
         dt = p.dt
-        tau = self.rng.uniform(p.scint_timescale_min, p.scint_timescale_max)
-        depth = self.rng.uniform(p.scint_depth_min, p.scint_depth_max)
+        if tau is None:
+            tau = self.rng.uniform(p.scint_timescale_min, p.scint_timescale_max)
+        if depth is None:
+            depth = self.rng.uniform(p.scint_depth_min, p.scint_depth_max)
         rho = np.exp(-dt / tau)
         x = np.zeros(n_bins)
         x[0] = self.rng.standard_normal()
@@ -443,6 +451,71 @@ class _SetigenInjector:
             return np.interp(t, t_grid, series)
 
         return t_profile
+
+    def inject_on_only_cadence(
+        self,
+        obs_windows: np.ndarray,
+        snr: float,
+        drift_rate: float,
+        start_channel: int,
+        f_profile,
+        t_profile_builder,
+        on_indices: Tuple[int, ...] = (0, 2, 4),
+    ) -> Tuple[np.ndarray, dict]:
+        """Inject an already-parameterized signal into ON observations only.
+
+        ``obs_windows`` is ``(n_obs, tchans_per_obs, fchans)``. Builds one
+        setigen ``Frame`` per observation and assembles them into a ``Cadence``
+        with ``t_overwrite=True`` so each frame's ``t_start`` accumulates the
+        real elapsed time of *every* preceding observation (including OFF ones —
+        slew is negligible but a 16-bin OFF observation's own duration is not).
+        The signal is drawn with one continuous drift track computed from that
+        absolute timeline, but is only rendered into ``on_indices`` frames (via
+        the same ``ts`` shift-render-unshift trick as ``Cadence.add_signal``,
+        restricted to those frames) — OFF frames are returned byte-identical to
+        the input, exactly as a real technosignature would vanish off-source.
+
+        The reference intensity (setigen's frame-integrated SNR) is computed
+        once from the first ON frame and reused for every ON frame, so the
+        injected signal has one constant physical amplitude across the cadence
+        rather than being re-normalized to each observation's local noise.
+
+        ``t_profile_builder(intensity, n_bins) -> t_profile`` defers profile
+        construction until the reference intensity is known.
+        """
+        obs_windows = np.asarray(obs_windows, dtype=float)
+        n_obs, tchans_per_obs, fchans = obs_windows.shape
+
+        frames = [self._make_frame(obs_windows[i]) for i in range(n_obs)]
+        cadence = stg.Cadence(frame_list=frames, t_slew=0, t_overwrite=True)
+
+        ref_frame = cadence.frames[on_indices[0]]
+        intensity = ref_frame.get_intensity(snr=snr)
+        # Span the whole cadence (not just one observation): a scintillating
+        # t_profile is evaluated at each ON frame's absolute shifted `ts`
+        # (0..n_obs*tchans_per_obs*dt), so its own time grid must cover that
+        # full range or later ON frames sample past its domain (np.interp
+        # would silently clamp to the edge value instead of the true envelope).
+        t_profile = t_profile_builder(intensity, n_obs * tchans_per_obs)
+        path = stg.constant_path(
+            f_start=ref_frame.get_frequency(index=start_channel),
+            drift_rate=drift_rate * u.Hz / u.s,
+        )
+        bp_profile = stg.constant_bp_profile(level=1)
+
+        for i in on_indices:
+            frame = cadence.frames[i]
+            frame.ts += frame.t_start - cadence.t_start
+            frame.add_signal(path, t_profile, f_profile, bp_profile)
+            frame.ts -= frame.t_start - cadence.t_start
+
+        out = np.stack([cadence.frames[i].data for i in range(n_obs)])
+        info = {
+            "snr": snr, "drift_rate": drift_rate,
+            "start_channel": int(start_channel), "intensity": intensity,
+            "on_indices": tuple(on_indices),
+        }
+        return out.astype(np.float32), info
 
     def synthetic_background(self) -> np.ndarray:
         """Generate a chi^2 noise background via setigen, shape ``(tchans, fchans)``."""
@@ -622,6 +695,23 @@ class NarrowbandDriftingGenerator(_SetigenInjector):
             return self._make_stochastic_t_profile(intensity, n_bins), "scintillating"
         return stg.constant_t_profile(level=intensity), "constant"
 
+    def _sample_start_channel(self, drift_rate: float, fchans: int, tchans: int) -> int:
+        """Constrain start_channel for full-frame visibility, given ``drift_rate``.
+
+        setigen renders drift>0 toward HIGHER channel index (verified, both
+        `ascending`), so a positive drift must leave room on the high-index
+        side, and vice-versa.
+        """
+        p = self.params
+        drift_chans = abs(drift_rate) / p.df * tchans * p.dt
+        if drift_rate > 0:
+            max_start = max(1, int(fchans - 1 - drift_chans))
+            return int(self.rng.integers(1, max_start + 1))
+        elif drift_rate < 0:
+            min_start = min(fchans - 2, int(drift_chans + 1))
+            return int(self.rng.integers(min_start, fchans - 1))
+        return int(self.rng.integers(1, fchans - 1))
+
     def inject_signal(
         self,
         data: np.ndarray,
@@ -649,19 +739,8 @@ class NarrowbandDriftingGenerator(_SetigenInjector):
             drift_rate = self._sample_drift_rate(max_drift)
         true_slope = self._slope_from_drift(drift_rate)
 
-        # Constrain start_channel for full-frame visibility. setigen renders
-        # drift>0 toward HIGHER channel index (verified, both `ascending`), so a
-        # positive drift must leave room on the high-index side, and vice-versa.
         if start_channel is None:
-            drift_chans = abs(drift_rate) / p.df * tchans * p.dt
-            if drift_rate > 0:
-                max_start = max(1, int(fchans - 1 - drift_chans))
-                start_channel = int(self.rng.integers(1, max_start + 1))
-            elif drift_rate < 0:
-                min_start = min(fchans - 2, int(drift_chans + 1))
-                start_channel = int(self.rng.integers(min_start, fchans - 1))
-            else:
-                start_channel = int(self.rng.integers(1, fchans - 1))
+            start_channel = self._sample_start_channel(drift_rate, fchans, tchans)
 
         width = self._calculate_eti_width(drift_rate)
 
@@ -690,6 +769,94 @@ class NarrowbandDriftingGenerator(_SetigenInjector):
             "t_profile": t_name,
         }
         return frame.data, info
+
+    def inject_signal_cadence(
+        self,
+        obs_windows: np.ndarray,
+        on_indices: Tuple[int, ...] = (0, 2, 4),
+        snr: Optional[float] = None,
+        start_channel: Optional[int] = None,
+        drift_rate: Optional[float] = None,
+    ) -> Tuple[np.ndarray, dict]:
+        """Inject one ON-only narrowband drifting signal across a full cadence.
+
+        ``obs_windows`` is ``(n_obs, tchans_per_obs, fchans)`` — one window per
+        cadence observation (e.g. the 6 ABACAD pointings), NOT yet stacked along
+        time. Samples SNR/drift/width/profile exactly like :meth:`inject_signal`
+        (a single continuous drift track for the whole cadence), then injects it
+        only into ``on_indices`` via :meth:`inject_on_only_cadence` — the OFF
+        observations are returned untouched, as a real technosignature would be
+        absent from off-source pointings.
+        """
+        p = self.params
+        obs_windows = np.asarray(obs_windows, dtype=float)
+        n_obs, tchans_per_obs, fchans = obs_windows.shape
+        total_tchans = n_obs * tchans_per_obs
+
+        if snr is None:
+            snr = self._sample_snr()
+
+        max_drift = self._max_drift_rate(fchans, total_tchans)
+        if drift_rate is None:
+            drift_rate = self._sample_drift_rate(max_drift)
+
+        if start_channel is None:
+            start_channel = self._sample_start_channel(drift_rate, fchans, total_tchans)
+
+        width = self._calculate_eti_width(drift_rate)
+        f_profile, f_name = self._select_f_profile(width)
+
+        picked_t_name = {}
+
+        def t_profile_builder(intensity: float, n_bins: int):
+            t_profile, t_name = self._select_t_profile(intensity, n_bins)
+            picked_t_name["value"] = t_name
+            return t_profile
+
+        out, info = self.inject_on_only_cadence(
+            obs_windows,
+            snr=snr,
+            drift_rate=drift_rate,
+            start_channel=start_channel,
+            f_profile=f_profile,
+            t_profile_builder=t_profile_builder,
+            on_indices=on_indices,
+        )
+        info.update({"width": width, "f_profile": f_name,
+                     "t_profile": picked_t_name.get("value")})
+        return out, info
+
+    def sample_cadence_signal_params(self, fchans: int, total_tchans: int):
+        """Sample drift/width/profile ONCE, frozen for reuse across an SNR sweep.
+
+        Returns ``(drift_rate, start_channel, f_profile, t_profile_builder, meta)``
+        for a single injection site: pass the same 4 values to repeated
+        :meth:`inject_on_only_cadence` calls varying only ``snr``, so the
+        signal's morphology (drift, width, profile, scintillation shape) stays
+        fixed and only its amplitude changes — isolating SNR as the one
+        variable in the sweep, per injection site.
+        """
+        max_drift = self._max_drift_rate(fchans, total_tchans)
+        drift_rate = self._sample_drift_rate(max_drift)
+        start_channel = self._sample_start_channel(drift_rate, fchans, total_tchans)
+        width = self._calculate_eti_width(drift_rate)
+        f_profile, f_name = self._select_f_profile(width)
+
+        p = self.params
+        t_name = str(self.rng.choice(list(p.time_profiles), p=list(p.time_profile_weights)))
+        if t_name == "scintillating":
+            tau = self.rng.uniform(p.scint_timescale_min, p.scint_timescale_max)
+            depth = self.rng.uniform(p.scint_depth_min, p.scint_depth_max)
+
+            def t_profile_builder(intensity: float, n_bins: int):
+                return self._make_stochastic_t_profile(intensity, n_bins, tau=tau, depth=depth)
+        else:
+            def t_profile_builder(intensity: float, n_bins: int):
+                return stg.constant_t_profile(level=intensity)
+
+        meta = {"drift_rate": drift_rate, "start_channel": int(start_channel),
+                "width": width, "f_profile": f_name, "t_profile": t_name}
+        return drift_rate, start_channel, f_profile, t_profile_builder, meta
 
 
 @dataclass
