@@ -32,8 +32,49 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from src.data.preprocessing import bandpass_correct, core_transform
+from src.data.synthetic import NarrowbandDriftingGenerator, NarrowbandParams
 from src.models.autoencoder import build_autoencoder
-from scripts.debug.injection_vs_rfi_test import inject_narrowband_on_only
+
+
+def build_narrowband_generator(data_cfg, seed):
+    return NarrowbandDriftingGenerator(NarrowbandParams.from_config(data_cfg), seed=seed)
+
+
+def inject_narrowband_on_only(generator, raw_snippet, snr=None, drift_rate=None):
+    """Inject a setigen narrowband drifting track into ON observations only (0, 2, 4).
+
+    One SNR/drift_rate/start_channel is sampled (or taken from the overrides) and
+    reused across all three ON observations, with ``start_channel`` advanced by the
+    drift accumulated over the full cadence timeline (including the intervening OFF
+    observations) so the track stays continuous across the gaps. Per-observation
+    synthesis (frequency/time profile, width, scintillation) is delegated to
+    ``NarrowbandDriftingGenerator.inject_signal``.
+    """
+    p = generator.params
+    raw = raw_snippet.copy()
+    n_obs, tchans_per_obs, fchans = raw.shape
+    on_obs = [0, 2, 4]
+
+    if snr is None:
+        snr = generator._sample_snr()
+    if drift_rate is None:
+        max_drift = generator._max_drift_rate(fchans, tchans_per_obs)
+        drift_rate = generator._sample_drift_rate(max_drift)
+    start_channel = int(generator.rng.integers(fchans // 8, 7 * fchans // 8))
+
+    drift_chans_per_bin = (drift_rate * p.dt) / p.df
+    for obs_idx in on_obs:
+        global_t_start = obs_idx * tchans_per_obs
+        obs_start_channel = int(np.clip(
+            round(start_channel + global_t_start * drift_chans_per_bin),
+            1, fchans - 2,
+        ))
+        injected, _ = generator.inject_signal(
+            raw[obs_idx], snr=snr, drift_rate=drift_rate,
+            start_channel=obs_start_channel,
+        )
+        raw[obs_idx] = injected
+    return raw
 
 
 def load_model(checkpoint_path, model_config, device="cpu"):
@@ -106,6 +147,7 @@ def main():
 
     print(f"Loading model from {args.checkpoint}")
     model = load_model(args.checkpoint, model_cfg, args.device)
+    generator = build_narrowband_generator(cfg, seed=args.seed)
 
     npy_path = Path(args.cache) / f"{args.split}.npy"
     print(f"Loading cache: {npy_path}")
@@ -138,9 +180,8 @@ def main():
     for row, ci in enumerate(chosen):
         raw = scan_raw[ci]
         orig = preprocess_raw(raw, preproc)
-        raw_inj = inject_narrowband_on_only(raw, snr=args.inject_snr,
-                                            drift_rate=args.drift_rate,
-                                            seed=args.seed + row)
+        raw_inj = inject_narrowband_on_only(generator, raw, snr=args.inject_snr,
+                                            drift_rate=args.drift_rate)
         injected = preprocess_raw(raw_inj, preproc)
         recon = reconstruct(model, injected, args.device)
         error = (injected - recon) ** 2
