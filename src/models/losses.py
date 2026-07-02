@@ -20,12 +20,34 @@ __all__ = [
     "reconstruction_loss",
     "kl_divergence",
     "_masked_mse",
+    "topk_mse",
 ]
 
 
 def mse_loss(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
     """Per-sample mean squared error, averaged over (C, H, W)."""
     return ((y_true - y_pred) ** 2).mean(dim=(1, 2, 3))
+
+
+def topk_mse(y_true: torch.Tensor, y_pred: torch.Tensor, frac: float = 0.02) -> torch.Tensor:
+    """Per-sample mean squared error over only the top ``frac`` of pixels by error.
+
+    Anomaly score alternative to full-frame mean MSE. Motivated by the MemAE
+    noise-floor diagnostic: a real injected signal can triple the local peak
+    squared-error while the whole-frame mean barely moves, because the
+    incompressible background noise (~1e5 pixels) dilutes a residual that is
+    only elevated over a few dozen of them. Restricting the average to the
+    top-``frac`` fraction preserves the local signal while still averaging
+    over enough pixels to not be a single-outlier statistic (unlike a raw
+    per-pixel max, which is already confounded by heavy-tailed background
+    residual — see [[eti_vs_rfi_occupancy_diagnostic]] / handoff 2026-07-01).
+    """
+    sq_err = (y_true - y_pred) ** 2
+    b = sq_err.shape[0]
+    flat = sq_err.reshape(b, -1)
+    k = max(1, int(round(flat.shape[1] * frac)))
+    top_vals, _ = flat.topk(k, dim=1)
+    return top_vals.mean(dim=1)
 
 
 def ssim_loss(y_true: torch.Tensor, y_pred: torch.Tensor,

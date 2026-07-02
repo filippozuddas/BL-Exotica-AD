@@ -76,16 +76,22 @@ def embed(model, snippets: np.ndarray, device: str, batch: int = 64) -> np.ndarr
 
 
 @torch.no_grad()
-def recon_score(model, snippets: np.ndarray, device: str, batch: int = 64) -> np.ndarray:
+def recon_score(model, snippets: np.ndarray, device: str, batch: int = 64,
+                 method: str = "recon", topk_frac: float = 0.02) -> np.ndarray:
     """(N, H, W) preprocessed -> (N,) per-sample reconstruction MSE.
 
     The reconstruction-error analogue of ``embed`` — works for any backbone that
-    exposes ``anomaly_score(x, method='recon')`` (plain AE, MAE, ViT-MAE, MemAE).
+    exposes ``anomaly_score(x, method='recon'|'topk')`` (plain AE, MAE, ViT-MAE,
+    MemAE). ``method='topk'`` averages only the top ``topk_frac`` of pixels by
+    squared error instead of the full frame — see ``losses.topk_mse``: the
+    MemAE diagnostic showed a real injected line triples the local peak error
+    while the whole-frame mean barely moves (background noise-floor dilution).
     """
     out = []
+    kwargs = {"topk_frac": topk_frac} if method == "topk" else {}
     for i in range(0, len(snippets), batch):
         x = torch.from_numpy(snippets[i:i + batch]).float().unsqueeze(1).to(device)
-        out.append(model.anomaly_score(x, method="recon").cpu().numpy())
+        out.append(model.anomaly_score(x, method=method, **kwargs).cpu().numpy())
     return np.concatenate(out, axis=0)
 
 
@@ -300,7 +306,8 @@ def unsupervised_occ(emb_quiet, emb_rfi, inj_emb, snr_list, seed=0):
 
 
 def operational_signal_vs_rfi(model, preprocessed, raw_snippets, quiet_idx, rfi_idx,
-                              preproc, snr_list, drift_rate, device, scoring="embedding", seed=0):
+                              preproc, snr_list, drift_rate, device, scoring="embedding", seed=0,
+                              recon_method="recon", topk_frac=0.02):
     """THE operational test: in a real search (no labels), can the scorer rank an
     injected signal ABOVE real RFI? Energy works AGAINST us here (injected-into-quiet
     is LOW energy, RFI is HIGH) — so a high AUC means the scorer uses morphology, not
@@ -334,7 +341,7 @@ def operational_signal_vs_rfi(model, preprocessed, raw_snippets, quiet_idx, rfi_
                              f"raise --n_samples"}
 
         def score(frames):
-            return recon_score(model, frames, device)
+            return recon_score(model, frames, device, method=recon_method, topk_frac=topk_frac)
         neg = score(preprocessed[ev_rfi])
         en_neg = frame_energy(preprocessed[ev_rfi])  # energy-only control baseline
     else:
@@ -433,6 +440,13 @@ def parse_args():
                    help="embedding (default): run all blocks on encode(x) embeddings. "
                         "recon: run ONLY the operational signal-vs-RFI block on "
                         "reconstruction MSE (for AE / MAE / ViT-MAE / MemAE).")
+    p.add_argument("--recon_method", choices=["recon", "topk"], default="recon",
+                   help="Aggregation for --scoring recon: 'recon' (default) is the "
+                        "full-frame mean MSE; 'topk' averages only the top --topk_frac "
+                        "pixels by squared error (see losses.topk_mse) — tests whether "
+                        "the mean-MSE noise-floor dilution, not the model, is the failure.")
+    p.add_argument("--topk_frac", type=float, default=0.02,
+                   help="Fraction of pixels kept for --recon_method topk (default 0.02).")
     return p.parse_args()
 
 
@@ -478,14 +492,16 @@ def main():
         print(f"\n{'='*64}\nR1. OPERATIONAL (RECON) — signal vs RFI, with energy-only control\n{'='*64}")
         op = operational_signal_vs_rfi(model, preprocessed, raw_snippets, quiet_idx, rfi_idx,
                                        preproc, args.snr_list, args.drift_rate, args.device,
-                                       scoring="recon", seed=args.seed)
+                                       scoring="recon", seed=args.seed,
+                                       recon_method=args.recon_method, topk_frac=args.topk_frac)
         print_operational(op, scoring="recon")
 
         # R2: matched-energy recon. Pool injected snippets across all SNRs so their
         # energies span/overlap the RFI range, then caliper-match and compare recon
         # AUC vs trivial-stats vs energy-only at matched energy.
         print(f"\n{'='*64}\nR2. MATCHED-ENERGY RECON — is the recon win morphology or energy?\n{'='*64}")
-        rec_rfi = recon_score(model, preprocessed[rfi_idx], args.device)
+        rec_rfi = recon_score(model, preprocessed[rfi_idx], args.device,
+                              method=args.recon_method, topk_frac=args.topk_frac)
         en_rfi = frame_energy(preprocessed[rfi_idx])
         st_rfi = frame_stats(preprocessed[rfi_idx])
         rec_pool, en_pool, st_pool = [], [], []
@@ -494,7 +510,8 @@ def main():
                 inject_narrowband_on_only(raw_snippets[i], snr=snr, drift_rate=args.drift_rate,
                                           seed=args.seed + j), preproc)
                 for j, i in enumerate(quiet_idx)])
-            rec_pool.append(recon_score(model, inj, args.device))
+            rec_pool.append(recon_score(model, inj, args.device,
+                                        method=args.recon_method, topk_frac=args.topk_frac))
             en_pool.append(frame_energy(inj))
             st_pool.append(frame_stats(inj))
         rec_pool = np.concatenate(rec_pool)
@@ -511,16 +528,25 @@ def main():
             print(f"  energy_only AUC : {mm['energy_only']:.3f}   (~0.5 => energy neutralised)")
             print(f"  trivial   AUC   : {mm['trivial']:.3f}   (peakiness/kurtosis/top-pixel)")
             print(f"  recon     AUC   : {mm['recon']:.3f}")
-            if mm["recon"] <= max(mm["trivial"], 0.58):
+            margin = mm["recon"] - mm["trivial"]
+            print(f"  recon − trivial : {margin:+.3f}   (residual energy AUC {mm['energy_only']:.3f})")
+            if margin <= 0.03 or mm["recon"] <= 0.55:
                 print("    -> recon at matched energy is NO better than a trivial contrast stat "
                       "-> NOT morphology. The recon-B5 win is energy/contrast.")
+            elif margin < 0.10 or mm["recon"] < 0.65:
+                print("    -> recon shows a WEAK/borderline morphology residual (above the trivial "
+                      "and energy controls, but by a small margin). Confirm with a tighter caliper "
+                      "/ multiple seeds before trusting; compare against the encoder embedding "
+                      "(block-3 ~0.75-0.85) — recon this far below it means most morphology stays "
+                      "in the encoder, not the reconstruction.")
             else:
-                print("    -> recon at matched energy BEATS the trivial stat -> the model's "
+                print("    -> recon at matched energy CLEARLY beats the trivial stat -> the model's "
                       "reconstruction error carries genuine morphology (real win).")
 
         args.out_dir.mkdir(parents=True, exist_ok=True)
         tag = f"{args.model_config.stem}_{args.checkpoint.stem}".replace("=", "").replace(".", "p")
-        out_npz = args.out_dir / f"recon_b5_{tag}.npz"
+        method_tag = args.recon_method if args.recon_method == "recon" else f"{args.recon_method}{args.topk_frac}"
+        out_npz = args.out_dir / f"recon_b5_{tag}_{method_tag}.npz"
         if op is not None and "error" not in op:
             np.savez(out_npz, snr_list=np.array(args.snr_list),
                      rows=np.array(op["rows"]), n_rfi=op["n_rfi"], n_quiet=op["n_quiet"],

@@ -46,7 +46,7 @@ from typing import Dict, List, Tuple
 
 from .encoder import build_encoder
 from .decoder import build_decoder
-from .losses import reconstruction_loss, kl_divergence, _masked_mse
+from .losses import reconstruction_loss, kl_divergence, _masked_mse, topk_mse
 from .memory import MemoryUnit
 from .vit_mae import build_vit_mae
 
@@ -69,10 +69,12 @@ class Autoencoder(nn.Module):
         """Scalar training loss: mean per-sample reconstruction error."""
         return self.loss_fn(x, self(x)).mean()
 
-    def anomaly_score(self, x: torch.Tensor, method: str = "recon", **kwargs) -> torch.Tensor:
-        if method != "recon":
-            raise ValueError(f"Autoencoder only supports method='recon', got '{method}'.")
+    def anomaly_score(self, x: torch.Tensor, method: str = "recon", topk_frac: float = 0.02, **kwargs) -> torch.Tensor:
+        if method not in ("recon", "topk"):
+            raise ValueError(f"Autoencoder only supports method='recon'/'topk', got '{method}'.")
         recon = self.forward(x)
+        if method == "topk":
+            return topk_mse(x, recon, frac=topk_frac)
         return ((x - recon) ** 2).mean(dim=(1, 2, 3))
 
 
@@ -134,10 +136,12 @@ class MAE(nn.Module):
         reconstruction = self(x * (1.0 - mask))
         return self._masked_mse(x, reconstruction, mask)
 
-    def anomaly_score(self, x: torch.Tensor, method: str = "recon", **kwargs) -> torch.Tensor:
-        if method != "recon":
-            raise ValueError(f"MAE only supports method='recon', got '{method}'.")
+    def anomaly_score(self, x: torch.Tensor, method: str = "recon", topk_frac: float = 0.02, **kwargs) -> torch.Tensor:
+        if method not in ("recon", "topk"):
+            raise ValueError(f"MAE only supports method='recon'/'topk', got '{method}'.")
         recon = self.forward(x)
+        if method == "topk":
+            return topk_mse(x, recon, frac=topk_frac)
         return ((x - recon) ** 2).mean(dim=(1, 2, 3))
 
 
@@ -183,10 +187,12 @@ class VAE(nn.Module):
         z_mean, _, _ = self.encoder(x)
         return z_mean
 
-    def anomaly_score(self, x: torch.Tensor, method: str = "recon", **kwargs) -> torch.Tensor:
-        if method != "recon":
-            raise ValueError(f"VAE only supports method='recon', got '{method}'.")
+    def anomaly_score(self, x: torch.Tensor, method: str = "recon", topk_frac: float = 0.02, **kwargs) -> torch.Tensor:
+        if method not in ("recon", "topk"):
+            raise ValueError(f"VAE only supports method='recon'/'topk', got '{method}'.")
         recon = self.forward(x)
+        if method == "topk":
+            return topk_mse(x, recon, frac=topk_frac)
         return ((x - recon) ** 2).mean(dim=(1, 2, 3))
 
 
@@ -253,10 +259,12 @@ class MemAE(nn.Module):
         """
         return self.encoder(x).mean(dim=(2, 3))
 
-    def anomaly_score(self, x: torch.Tensor, method: str = "recon", **kwargs) -> torch.Tensor:
-        if method != "recon":
-            raise ValueError(f"MemAE only supports method='recon', got '{method}'.")
+    def anomaly_score(self, x: torch.Tensor, method: str = "recon", topk_frac: float = 0.02, **kwargs) -> torch.Tensor:
+        if method not in ("recon", "topk"):
+            raise ValueError(f"MemAE only supports method='recon'/'topk', got '{method}'.")
         recon = self.forward(x)
+        if method == "topk":
+            return topk_mse(x, recon, frac=topk_frac)
         return ((x - recon) ** 2).mean(dim=(1, 2, 3))
 
 
