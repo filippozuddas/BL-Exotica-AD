@@ -281,3 +281,85 @@ def test_cadence_score_raises_on_single_obs():
     x = _batch(SHAPES[0], b=2)
     with pytest.raises(ValueError):
         m.anomaly_score(x, method="cadence")
+
+
+# ---- MemAE (CNN memory-augmented AE) backbone contract ----
+
+from src.models.autoencoder import MemAE  # noqa: E402
+from src.models.memory import MemoryUnit  # noqa: E402
+
+
+def _memae_cfg(**overrides):
+    """Tiny CNN MemAE config: 2 blocks (factor 4), small memory — CPU-light."""
+    cfg = dict(
+        architecture="convae",
+        memory=True,
+        mem_slots=8,
+        shrink_threshold=0.125,  # 1/N for N=8
+        entropy_weight=2.0e-4,
+        encoder=dict(filters=[4, 8], convs_per_block=2, kernel_size=[3, 3],
+                     activation="relu", use_batchnorm=True),
+        bottleneck=dict(latent_dim=6),
+        decoder=dict(filters=[8, 4], kernel_size=[3, 3], activation="relu",
+                     use_batchnorm=True, output_activation=None),
+    )
+    cfg.update(overrides)
+    return cfg
+
+
+def test_build_autoencoder_dispatches_to_memae():
+    m = build_autoencoder(SHAPES[0], _memae_cfg(), loss="mse", learning_rate=1e-4)
+    assert isinstance(m, MemAE)
+    assert isinstance(m.memory, MemoryUnit)
+    assert m.memory.memory.shape == (8, 6)  # (mem_slots, latent_dim)
+    assert m.learning_rate == 1e-4
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+def test_memae_forward_roundtrip(shape):
+    m = build_autoencoder(shape, _memae_cfg(), loss="mse").eval()
+    x = _batch(shape, b=2)
+    with torch.no_grad():
+        recon = m(x)
+    assert recon.shape == x.shape
+
+
+def test_memae_compute_loss_returns_tuple():
+    m = build_autoencoder(SHAPES[0], _memae_cfg(), loss="mse")
+    out = m.compute_loss(_batch(SHAPES[0], b=3))
+    assert isinstance(out, tuple) and len(out) == 2
+    total, components = out
+    assert set(components) == {"reconstruction_loss", "entropy_loss"}
+    assert total.ndim == 0 and torch.isfinite(total)
+
+
+def test_memae_encode_shape():
+    m = build_autoencoder(SHAPES[0], _memae_cfg(), loss="mse").eval()
+    with torch.no_grad():
+        emb = m.encode(_batch(SHAPES[0], b=4))
+    assert emb.shape == (4, 6)  # (B, latent_dim) — global-avg-pooled
+
+
+def test_memae_anomaly_score_recon():
+    m = build_autoencoder(SHAPES[0], _memae_cfg(), loss="mse").eval()
+    s = m.anomaly_score(_batch(SHAPES[0], b=5), method="recon")
+    assert s.shape == (5,) and torch.isfinite(s).all()
+
+
+def test_memae_anomaly_score_rejects_non_recon():
+    m = build_autoencoder(SHAPES[0], _memae_cfg(), loss="mse").eval()
+    with pytest.raises(ValueError):
+        m.anomaly_score(_batch(SHAPES[0], b=2), method="embedding")
+
+
+def test_memory_unit_sparse_addressing():
+    """Hard shrinkage + renormalisation: addressing weights are sparse and sum to 1."""
+    mem = MemoryUnit(mem_slots=16, feature_dim=6, shrink_threshold=1 / 16).eval()
+    z = torch.randn(2, 6, 4, 8)  # (B, C, H, W)
+    with torch.no_grad():
+        z_hat, att = mem(z)
+    assert z_hat.shape == z.shape
+    assert att.shape == (2 * 4 * 8, 16)
+    row_sums = att.sum(dim=1)
+    assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-5)
+    assert (att == 0).any()  # shrinkage zeroed at least some weights
