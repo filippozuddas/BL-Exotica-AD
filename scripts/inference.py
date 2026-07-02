@@ -26,7 +26,6 @@ import heapq
 import multiprocessing as mp
 import sys
 import time
-from multiprocessing import shared_memory
 from pathlib import Path
 
 import h5py
@@ -51,12 +50,11 @@ _shared_obs = None
 _shared_fchans = None
 _shared_tchans = None
 _shared_preproc = None
-_shared_shms = None
 
 
-def _worker_init(shm_specs, fchans, tchans, preproc):
-    """Pool(initializer=...) target: attach to the parent's shared-memory
-    observation buffers by name.
+def _worker_init(file_specs, fchans, tchans, preproc):
+    """Pool(initializer=...) target: memory-map the parent's observation
+    files by path.
 
     Runs once per spawned worker process. Workers are started with the
     'spawn' context (never forked from the main process), because the main
@@ -65,13 +63,15 @@ def _worker_init(shm_specs, fchans, tchans, preproc):
     inherit an unusable copy of driver-internal locks). 'spawn' processes
     never inherit parent memory, so data must come in explicitly rather
     than via a global set right before a fork.
+
+    Uses plain disk-backed np.memmap rather than multiprocessing.shared_memory:
+    the latter is backed by /dev/shm, which defaults to a small quota (e.g.
+    64 MB in Docker) and dies with a SIGBUS ("Bus error") once a write crosses
+    it — nowhere near enough for a ~26 GB cadence.
     """
-    global _shared_obs, _shared_fchans, _shared_tchans, _shared_preproc, _shared_shms
-    _shared_shms = [shared_memory.SharedMemory(name=name) for name, _, _ in shm_specs]
-    _shared_obs = [
-        np.ndarray(shape, dtype=dtype, buffer=shm.buf)
-        for shm, (_, shape, dtype) in zip(_shared_shms, shm_specs)
-    ]
+    global _shared_obs, _shared_fchans, _shared_tchans, _shared_preproc
+    _shared_obs = [np.memmap(path, dtype=dtype, mode="r", shape=shape)
+                   for path, shape, dtype in file_specs]
     _shared_fchans = fchans
     _shared_tchans = tchans
     _shared_preproc = preproc
@@ -302,17 +302,19 @@ def main():
         print(f"  {mem_gb:.1f} GB in RAM, loaded in {load_time:.1f}s")
         print(f"  nchans={nchans} -> {n_snippets} snippets (stride={stride})")
 
-        # Stage each observation in POSIX shared memory so 'spawn' workers can
-        # attach by name instead of relying on fork's copy-on-write (which
+        # Stage each observation as a disk-backed memmap so 'spawn' workers can
+        # open it by path instead of relying on fork's copy-on-write (which
         # would require forking the main process after it already holds an
         # initialized CUDA context — see _worker_init).
-        shms = []
-        shm_specs = []
-        for arr in obs_arrays:
-            shm = shared_memory.SharedMemory(create=True, size=arr.nbytes)
-            np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf)[:] = arr
-            shms.append(shm)
-            shm_specs.append((shm.name, arr.shape, arr.dtype))
+        scratch_dir = args.out_dir / "_scratch"
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+        shm_paths = []
+        file_specs = []
+        for i, arr in enumerate(obs_arrays):
+            path = scratch_dir / f"cad{cad_idx:02d}_obs{i}.f32"
+            arr.tofile(str(path))
+            shm_paths.append(path)
+            file_specs.append((str(path), arr.shape, arr.dtype))
         del obs_arrays
 
         f_starts = [i * stride for i in range(n_snippets)]
@@ -332,7 +334,7 @@ def main():
 
         ctx = mp.get_context("spawn")
         with ctx.Pool(args.num_workers, initializer=_worker_init,
-                      initargs=(shm_specs, fchans, tchans, preproc)) as pool:
+                      initargs=(file_specs, fchans, tchans, preproc)) as pool:
             for f_start, snippet in zip(f_starts, pool.imap(_preprocess_at, f_starts,
                                                              chunksize=chunksize)):
                 batch_snippets.append(snippet)
@@ -430,9 +432,8 @@ def main():
         n_plots = sum(len(h) for h in top_heaps.values())
         print(f"  Saved {n_plots} candidate plots -> {cad_dir}")
 
-        for shm in shms:
-            shm.close()
-            shm.unlink()
+        for path in shm_paths:
+            path.unlink()
 
     # ---- Global summary ----
     all_arrs = {m: np.array(all_scores[m]) for m in methods}
