@@ -621,6 +621,28 @@ def main():
         print(f"  {snr:5.0f}  {s.mean():8.4f}  {sigma:8.2f}σ  {cohens_d(s, base):8.2f}  "
               f"{det3:7.1f}%  {det5:7.1f}%")
 
+    # ---- 2.5 BACKGROUND-ONLY CONTROL (no injection at all) ----
+    # Isolates the confound in block 3: its positive class is quiet+injected-line and
+    # its negative class is real RFI, so a high AUC there could reflect "quiet-texture
+    # vs RFI-texture" background discrimination alone, with the injected line adding
+    # ~nothing. This control removes the injected line entirely and asks the identical
+    # matched-energy question of the SAME real quiet vs real RFI backgrounds. If this
+    # AUC is close to block 3's, block 3 was (mostly) a background-type classifier, not
+    # a signal detector — the line adds little incremental separability.
+    en_quiet = frame_energy(preprocessed[quiet_idx])
+    st_quiet = frame_stats(preprocessed[quiet_idx])
+    print(f"\n{'='*64}\n2.5 BACKGROUND-ONLY CONTROL  (real quiet, NO injection, vs real RFI)\n{'='*64}")
+    m0 = morphology_matched_energy(emb_quiet, en_quiet, st_quiet, emb_rfi, en_rfi, st_rfi, seed=args.seed)
+    if m0 is not None and "error" in m0:
+        print(f"  SKIPPED: {m0['error']}")
+    elif m0 is not None:
+        print(f"  matched pairs    : n/class = {m0['n_per_class']}  (caliper = {m0['caliper']:.3f})")
+        print(f"  AUC energy-only  : {m0['energy_only']:.3f}   (sanity: ~0.5 means matching worked)")
+        print(f"  AUC trivial-stats: {m0['trivial']:.3f}")
+        print(f"  AUC embedding    : {m0['embedding']:.3f}   <-- compare directly against block 3 below")
+        print("  If this is close to block 3's embedding AUC, block 3 is mostly reading "
+              "background type (quiet vs RFI), not the injected line's morphology.")
+
     # ---- 3. MORPHOLOGY AT MATCHED ENERGY (the deciding test) ----
     # Pool ALL injected SNRs (narrowband adds little energy, so even SNR=50 sits low)
     # to maximise low-energy samples that overlap the RFI energy band.
