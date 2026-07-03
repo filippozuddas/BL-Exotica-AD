@@ -259,9 +259,32 @@ class MemAE(nn.Module):
         """
         return self.encoder(x).mean(dim=(2, 3))
 
+    def latent_residual_map(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-spatial-position squared distance between the encoder query and the
+        memory-addressed reconstruction, ``((z - z_hat) ** 2).mean(dim=channel)``.
+
+        This is the memory's own per-position "how far from any normal prototype"
+        signal, measured in latent space *before* the decoder — unlike pixel-space
+        recon error, it is never diluted by the ~98k incompressible noise pixels of
+        the frame, since it is computed on the ``(H', W')`` bottleneck grid, not the
+        full input resolution. ``encode()`` (GAP-pooled) throws this map away; use
+        this method directly to keep spatial resolution for anomaly scoring.
+        """
+        z = self.encoder(x)
+        z_hat, _ = self.memory(z)
+        return ((z - z_hat) ** 2).mean(dim=1)  # (B, H', W')
+
     def anomaly_score(self, x: torch.Tensor, method: str = "recon", topk_frac: float = 0.02, **kwargs) -> torch.Tensor:
-        if method not in ("recon", "topk"):
-            raise ValueError(f"MemAE only supports method='recon'/'topk', got '{method}'.")
+        if method not in ("recon", "topk", "latent_max", "latent_topk"):
+            raise ValueError(
+                f"MemAE supports method='recon'/'topk'/'latent_max'/'latent_topk', got '{method}'."
+            )
+        if method in ("latent_max", "latent_topk"):
+            resid = self.latent_residual_map(x).flatten(1)  # (B, H'*W')
+            if method == "latent_max":
+                return resid.max(dim=1).values
+            k = max(1, int(round(topk_frac * resid.shape[1])))
+            return resid.topk(k, dim=1).values.mean(dim=1)
         recon = self.forward(x)
         if method == "topk":
             return topk_mse(x, recon, frac=topk_frac)

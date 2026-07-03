@@ -88,7 +88,7 @@ def recon_score(model, snippets: np.ndarray, device: str, batch: int = 64,
     while the whole-frame mean barely moves (background noise-floor dilution).
     """
     out = []
-    kwargs = {"topk_frac": topk_frac} if method == "topk" else {}
+    kwargs = {"topk_frac": topk_frac} if method in ("topk", "latent_topk") else {}
     for i in range(0, len(snippets), batch):
         x = torch.from_numpy(snippets[i:i + batch]).float().unsqueeze(1).to(device)
         out.append(model.anomaly_score(x, method=method, **kwargs).cpu().numpy())
@@ -440,13 +440,17 @@ def parse_args():
                    help="embedding (default): run all blocks on encode(x) embeddings. "
                         "recon: run ONLY the operational signal-vs-RFI block on "
                         "reconstruction MSE (for AE / MAE / ViT-MAE / MemAE).")
-    p.add_argument("--recon_method", choices=["recon", "topk"], default="recon",
+    p.add_argument("--recon_method", choices=["recon", "topk", "latent_max", "latent_topk"],
+                   default="recon",
                    help="Aggregation for --scoring recon: 'recon' (default) is the "
                         "full-frame mean MSE; 'topk' averages only the top --topk_frac "
                         "pixels by squared error (see losses.topk_mse) — tests whether "
-                        "the mean-MSE noise-floor dilution, not the model, is the failure.")
+                        "the mean-MSE noise-floor dilution, not the model, is the failure. "
+                        "'latent_max'/'latent_topk' (MemAE only) score the per-position "
+                        "encoder-vs-memory residual on the (H',W') bottleneck grid instead "
+                        "of pixel space — see MemAE.latent_residual_map.")
     p.add_argument("--topk_frac", type=float, default=0.02,
-                   help="Fraction of pixels kept for --recon_method topk (default 0.02).")
+                   help="Fraction kept for --recon_method topk/latent_topk (default 0.02).")
     return p.parse_args()
 
 
