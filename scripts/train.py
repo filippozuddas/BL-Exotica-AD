@@ -68,6 +68,8 @@ def _print_config_summary(cfg, args):
     model_cfg = cfg["model"]
     if model_cfg.get("architecture") == "vit_mae":
         backbone = "ViT-MAE"
+    elif model_cfg.get("architecture") == "udma":
+        backbone = "UDMA"
     elif model_cfg.get("mae"):
         backbone = "MAE"
     elif model_cfg.get("variational"):
@@ -170,7 +172,7 @@ def main():
         beta=float(cfg["model"].get("beta", 1.0)),
     )
 
-    if model_cfg.get("architecture") == "udma":
+    if cfg["model"].get("architecture") == "udma":
         teacher = model.teacher
         if torch.allclose(teacher.mu, torch.zeros_like(teacher.mu)) and \
            torch.allclose(teacher.sigma, torch.ones_like(teacher.sigma)):
@@ -215,7 +217,7 @@ def main():
     # UDMA has no pixel decoder (forward() raises) — ReconstructionSnapshot
     # calls model(x) expecting a pixel reconstruction, so skip it for this
     # backbone rather than passing a val_sample it can't use.
-    snapshot_val_sample = None if model_cfg.get("architecture") == "udma" else val_samples
+    snapshot_val_sample = None if cfg["model"].get("architecture") == "udma" else val_samples
     callbacks = build_callbacks(cfg, run_dir, val_sample=snapshot_val_sample)
 
     module = AELightningModule(model, cfg)
