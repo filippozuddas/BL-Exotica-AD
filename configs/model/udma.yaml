@@ -1,0 +1,72 @@
+# UDMA — Unsupervised Distillation and Memory-enhanced Autoencoder (Qi et al. 2024)
+# 5th build_autoencoder backbone. architecture: udma routes build_autoencoder()
+# to build_udma(), bypassing the CNN encoder/bottleneck/decoder top-level config
+# keys (the student section below reuses that schema, but nested under `student:`).
+# See src/models/udma.py and docs/2026-07-05_udma_design_spec.md (Q1-Q10).
+#
+# Frozen ViT-MAE teacher (self-supervised, read at an intermediate transformer
+# block) supplies a (128, 6, 64) token-feature target; two CNN students (one
+# plain, one memory-augmented) are trained to regress it. Anomaly score =
+# student disagreement on this feature grid (map_st1/map_st2/map_ss), NOT pixel
+# reconstruction — there is no pixel decoder in this backbone.
+
+architecture: udma
+
+# --- Teacher (frozen, Q1) ---
+teacher:
+  # Canonical checkpoint (loss_mode: generative, matches vit_mae.yaml below).
+  # Pinned for comparability with the B3/teacher_sensitivity_test diagnostics —
+  # do not swap without re-running the Q1 gate (scripts/debug/teacher_sensitivity_test.py).
+  checkpoint: outputs/training/20260624_084754_057f87c/checkpoints/epoch=006-val_loss=2.1715.ckpt
+  vit_config: configs/model/vit_mae.yaml
+  # Transformer block the teacher reads tokens from (1-indexed; -1 = final
+  # block). block3 dominates/ties every gate metric and has the lowest
+  # RFI/quiet residual ratio (2.73x vs 3.86x at final) — see gate results in
+  # the design spec, section "Esito del gate (2026-07-05)".
+  teacher_layer: 3
+  # Offline per-channel mu/sigma (Q2), computed once by
+  # scripts/fit_udma_teacher_norm.py and loaded here. REQUIRED before training:
+  # without it TeacherViT.mu/sigma default to identity (0/1) and the students
+  # regress raw, unnormalized teacher features (invalid run, violates Q2).
+  # norm_stats: outputs/udma_teacher_norm/gbt_fine_block3.pt
+
+# --- Students (from-scratch trunk, Q3) ---
+# Same CNN conv stack as convae.yaml/memae.yaml (4 blocks -> 16x spatial
+# reduction on a (96,1024) input == (6,64), matching the teacher's patch grid).
+student:
+  encoder:
+    filters: [32, 64, 128, 256]
+    convs_per_block: 2
+    kernel_size: [3, 3]
+    activation: relu
+    use_batchnorm: true
+  bottleneck:
+    latent_dim: 64
+  # Projection head onto the teacher's 128-channel token grid: head_context_convs
+  # 3x3 convs (64->128->128 for the default of 2) followed by a 1x1 projection
+  # to out_channels (set at build time = teacher channel count). No upsampling —
+  # the head operates on the trunk's native (6,64) grid.
+  head_hidden: 128
+  head_context_convs: 2
+  # MemoryUnit hyperparameters for the MemAE-student (same module as memae.yaml).
+  mem_slots: 500
+  shrink_threshold: 0.002
+
+# --- Loss (Q4) ---
+# L = lambda1*||Norm(T(x))-S_AE(x)||^2 + lambda2*||Norm(T(x))-S_Mem(x)||^2
+#     + lambda3*||S_AE(x)-S_Mem(x)||^2 + entropy_weight*H(addressing)
+# lambda3 in training MINIMIZES agreement between students on normal data —
+# this is what makes their disagreement informative on anomalies (paper Eq. 8-9).
+loss:
+  lambda1: 1.0
+  lambda2: 1.0
+  lambda3: 1.0
+  entropy_weight: 2.0e-4
+
+# --- Scoring (Q5) ---
+# map_cob = w1*map_st1 + w2*map_st2 + w3*map_ss, aggregated frame-level by
+# anomaly_score(x, method='recon'|'topk'|'max'). topk_frac=0.02 -> ~8 of 384
+# grid positions (6x64), matching the convae/vit_mae topk convention.
+scoring:
+  weights: [0.5, 0.5, 0.5]
+  topk_frac: 0.02

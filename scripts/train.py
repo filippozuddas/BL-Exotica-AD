@@ -72,6 +72,8 @@ def _print_config_summary(cfg, args):
         backbone = "MAE"
     elif model_cfg.get("variational"):
         backbone = "VAE"
+    elif model_cfg.get("memory"):
+        backbone = "MemAE"
     else:
         backbone = "AE"
 
@@ -168,6 +170,17 @@ def main():
         beta=float(cfg["model"].get("beta", 1.0)),
     )
 
+    if model_cfg.get("architecture") == "udma":
+        teacher = model.teacher
+        if torch.allclose(teacher.mu, torch.zeros_like(teacher.mu)) and \
+           torch.allclose(teacher.sigma, torch.ones_like(teacher.sigma)):
+            raise SystemExit(
+                "UDMA teacher normalization (Q2) is unfit (mu=0/sigma=1, the identity "
+                "default) — training would regress raw, unnormalized teacher features. "
+                "Run scripts/fit_udma_teacher_norm.py and set teacher.norm_stats in "
+                "configs/model/udma.yaml before training."
+            )
+
     # --------------------------------------------------------- output / train
     # Lightning's DDP subprocess launcher re-executes this script per GPU rank,
     # so without sharing the path each rank would create its own timestamped
@@ -199,7 +212,11 @@ def main():
     val_samples = torch.stack([val_ds[i] for i in snap_indices])
     if hasattr(val_ds, "close"):
         val_ds.close()
-    callbacks = build_callbacks(cfg, run_dir, val_sample=val_samples)
+    # UDMA has no pixel decoder (forward() raises) — ReconstructionSnapshot
+    # calls model(x) expecting a pixel reconstruction, so skip it for this
+    # backbone rather than passing a val_sample it can't use.
+    snapshot_val_sample = None if model_cfg.get("architecture") == "udma" else val_samples
+    callbacks = build_callbacks(cfg, run_dir, val_sample=snapshot_val_sample)
 
     module = AELightningModule(model, cfg)
     trainer = build_trainer(cfg, run_dir, callbacks=callbacks)

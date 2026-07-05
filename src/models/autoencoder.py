@@ -21,7 +21,7 @@ conv stack:
   reconstruction + ``entropy_weight`` * addressing-entropy. Scored by
   reconstruction error.
 
-The 4th backbone is selected by ``architecture`` rather than the CNN flags:
+The 4th and 5th backbones are selected by ``architecture`` rather than the CNN flags:
 
 - ``ViTMAE`` (``architecture: vit_mae``, see ``vit_mae.py``): He et al.-style
   Vision-Transformer Masked Autoencoder — Conv2d patch tokeniser +
@@ -29,12 +29,21 @@ The 4th backbone is selected by ``architecture`` rather than the CNN flags:
   deterministic partitioned reconstruction at inference. A ViT alternative to
   the CNN ``MAE`` (which is inherently CNN-based), bypassing the
   encoder/bottleneck/decoder config sections entirely.
+- ``UDMA`` (``architecture: udma``, see ``udma.py``): Qi et al. 2024 teacher-
+  student distillation + memory. A frozen ``ViTMAE`` teacher (self-supervised,
+  read at an intermediate block) supplies a token-feature target that two CNN
+  "students" (one plain, one memory-augmented) are trained to regress; the
+  anomaly score is their prediction disagreement on the teacher's feature grid,
+  not pixel reconstruction. No pixel decoder. See
+  ``docs/2026-07-05_udma_design_spec.md``.
 
-All four are pure ``nn.Module`` wrappers exposing ``forward`` (inference) and
-``compute_loss`` (training); a PyTorch Lightning ``LightningModule`` wraps them
-in ``src/training/trainer.py`` for the optimiser/checkpoint/multi-GPU loop. At
-search time they are scored by reconstruction error only (see
-``src/search/scorer.py``). None trains a classifier — unlike the
+All five are pure ``nn.Module`` wrappers exposing ``compute_loss`` (training)
+and ``anomaly_score`` (search-time scoring); the first four also expose
+``forward`` as a pixel reconstruction (UDMA has no pixel decoder — its
+"reconstruction" lives entirely in ``anomaly_score``/``anomaly_map``). A
+PyTorch Lightning ``LightningModule`` wraps all five in
+``src/training/trainer.py`` for the optimiser/checkpoint/multi-GPU loop. None
+trains a classifier — unlike the
 ContrastiveVAE + Random Forest of Ma et al., we drop the supervised
 contrastive/cadence head, enabling search across a broader morphology space.
 See CLAUDE.md ("Relationship to Ma et al.").
@@ -49,6 +58,7 @@ from .decoder import build_decoder
 from .losses import reconstruction_loss, kl_divergence, _masked_mse, topk_mse
 from .memory import MemoryUnit
 from .vit_mae import build_vit_mae
+from .udma import build_udma
 
 __all__ = ["Autoencoder", "MAE", "VAE", "MemAE", "build_autoencoder"]
 
@@ -324,6 +334,8 @@ def build_autoencoder(
 
     if architecture == "vit_mae":
         model: nn.Module = build_vit_mae(input_shape, model_config, loss=loss, learning_rate=learning_rate)
+    elif architecture == "udma":
+        model = build_udma(input_shape, model_config)
     else:
         enc_cfg = model_config["encoder"]
         dec_cfg = model_config.get("decoder", {})

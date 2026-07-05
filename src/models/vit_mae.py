@@ -55,6 +55,8 @@ import torch.nn.functional as F
 from torch import nn
 from typing import Dict, Optional, Tuple
 
+from .losses import topk_mse
+
 __all__ = ["PatchEmbed", "ViTMAE", "build_vit_mae", "patchify", "unpatchify"]
 
 
@@ -435,8 +437,33 @@ class ViTMAE(nn.Module):
 
         Used by per-token max Mahalanobis scoring to avoid the 9/384 dilution
         that mean-pooling causes for localised anomalies (narrowband signals).
+        Equivalent to ``encode_tokens_at(x, -1)``.
         """
-        return self._encode(x, mask_bool=None)
+        return self.encode_tokens_at(x, layer=-1)
+
+    def encode_tokens_at(self, x: torch.Tensor, layer: int) -> torch.Tensor:
+        """Token embeddings ``(B, num_patches, embed_dim)`` from transformer block
+        ``layer`` (no masking).
+
+        ``layer`` is 1-indexed (block 1 = first ``TransformerEncoderLayer``);
+        ``-1`` or ``len(self.encoder.layers)`` means the final block including
+        the terminal ``LayerNorm``; ``0`` means patch+positional embedding only,
+        before any block. Used by the UDMA teacher (``udma.py``), which reads an
+        intermediate block per the teacher-sensitivity gate
+        (``scripts/debug/teacher_sensitivity_test.py``, ``teacher_layer`` config).
+        """
+        n_layers = len(self.encoder.layers)
+        k = n_layers if layer in (-1, n_layers) else layer
+        if not 0 <= k <= n_layers:
+            raise ValueError(f"layer must be in 0..{n_layers} or -1, got {layer}")
+        tokens = self.patch_embed(x) + self.pos_embed
+        for j, blk in enumerate(self.encoder.layers, start=1):
+            if j > k:
+                break
+            tokens = blk(tokens)
+        if k == n_layers and getattr(self.encoder, "norm", None) is not None:
+            tokens = self.encoder.norm(tokens)
+        return tokens
 
     def _n_groups(self) -> int:
         """Partition group count whose mask ratio ``(G-1)/G`` matches ``mask_ratio``."""
@@ -504,18 +531,23 @@ class ViTMAE(nn.Module):
         return (diff_sq * on_mask).sum(dim=1) / on_mask.sum()
 
     @torch.no_grad()
-    def anomaly_score(self, x: torch.Tensor, method: Optional[str] = None, occ=None) -> torch.Tensor:
+    def anomaly_score(self, x: torch.Tensor, method: Optional[str] = None, occ=None,
+                       topk_frac: float = 0.02) -> torch.Tensor:
         """Per-sample anomaly score ``(B,)``.
 
-        ``method``: ``recon`` (partitioned reconstruction MSE), ``cadence``
-        (mask-ON/reconstruct-from-OFF), ``infonce`` (per-patch self-recognition
-        difficulty), or ``embedding`` (one-class classifier ``occ`` on
-        ``encode(x)``). Defaults to ``self.scoring``.
+        ``method``: ``recon`` (partitioned reconstruction MSE), ``topk``
+        (partitioned reconstruction, top-``topk_frac`` pixels by squared error
+        only — see ``losses.topk_mse``), ``cadence`` (mask-ON/reconstruct-from-OFF),
+        ``infonce`` (per-patch self-recognition difficulty), or ``embedding``
+        (one-class classifier ``occ`` on ``encode(x)``). Defaults to ``self.scoring``.
         """
         method = method or self.scoring
         if method == "recon":
             recon = self.forward(x)
             return ((x - recon) ** 2).mean(dim=(1, 2, 3))
+        if method == "topk":
+            recon = self.forward(x)
+            return topk_mse(x, recon, frac=topk_frac)
         if method == "cadence":
             return self._cadence_score(x)
         if method == "infonce":
