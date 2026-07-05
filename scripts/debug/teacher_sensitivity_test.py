@@ -180,22 +180,40 @@ def main():
     tok_rfi = encode_tokens_layer(model, f_rfi, args.device, args.layer)
     D = tok_quiet.shape[2]
 
-    # ================= T1: collapse / effective rank =================
-    print(f"\n{'='*64}\nT1. COLLAPSE / EFFECTIVE RANK  (quiet tokens, layer={layer_tag})\n{'='*64}")
+    # ================= T1: collapse check (+ informative ranks) =================
+    # AMENDED 2026-07-05 (see spec Q1): the original ">= 16 pooled PR-rank" gate
+    # was mis-specified — pooled token covariance is dominated by positional-
+    # embedding structure that is CONSTANT per position, i.e. free to predict
+    # for a student, so it must not count against the teacher. G1 now gates on
+    # collapse only (rel-std, dead dims); ranks are reported as informative,
+    # with the per-position-CENTERED rank as the content-dimensionality figure
+    # (hard warning only if it is degenerate, < 4).
+    print(f"\n{'='*64}\nT1. COLLAPSE CHECK  (quiet tokens, layer={layer_tag})\n{'='*64}")
     flat = tok_quiet.reshape(-1, D)
     sub = flat[rng.choice(len(flat), size=min(20000, len(flat)), replace=False)]
     sd = sub.std(axis=0)
     mu_norm = float(np.linalg.norm(sub.mean(axis=0)))
     rel_std = float(sd.mean()) / (mu_norm / np.sqrt(D) + 1e-12)
     dead = int((sd < 1e-4).sum())
-    ev = np.linalg.eigvalsh(np.cov((sub - sub.mean(0)).T))
-    ev = np.clip(ev, 0, None)
-    pr_rank = float(ev.sum() ** 2 / ((ev ** 2).sum() + 1e-12))
+
+    def pr_rank_of(rows: np.ndarray) -> float:
+        ev = np.linalg.eigvalsh(np.cov((rows - rows.mean(0)).T))
+        ev = np.clip(ev, 0, None)
+        return float(ev.sum() ** 2 / ((ev ** 2).sum() + 1e-12))
+
+    pr_pooled = pr_rank_of(sub)
+    cflat = (tok_quiet - tok_quiet.mean(axis=0, keepdims=True)).reshape(-1, D)
+    csub = cflat[rng.choice(len(cflat), size=min(20000, len(cflat)), replace=False)]
+    pr_content = pr_rank_of(csub)
     print(f"  mean per-dim std      : {sd.mean():.5f}  (dead dims: {dead}/{D})")
     print(f"  rel. variation        : {rel_std:.4f}   (gate: >= 0.05)")
-    print(f"  participation-ratio rank: {pr_rank:.1f} / {D}   (gate: >= 16)")
-    g1 = rel_std >= 0.05 and pr_rank >= 16
-    print(f"  G1: {'PASS' if g1 else 'FAIL'}")
+    print(f"  PR-rank pooled        : {pr_pooled:.1f} / {D}   (informative — inflated/deflated by pos-embed)")
+    print(f"  PR-rank content       : {pr_content:.1f} / {D}   (per-position-centered; warn if < 4)")
+    g1 = rel_std >= 0.05 and dead <= 0.1 * D
+    if pr_content < 4:
+        print("  WARNING: content rank < 4 — near-degenerate regression target; "
+              "consider PCA-projected target / channel weighting (spec Q4 lever).")
+    print(f"  G1 (collapse): {'PASS' if g1 else 'FAIL'}")
 
     # ================= T2: paired token displacement =================
     print(f"\n{'='*64}\nT2. RESPONSIVENESS — paired token displacement ||T(x+s) − T(x)||\n{'='*64}")
@@ -314,26 +332,29 @@ def main():
 
     # ================= verdict =================
     print(f"\n{'='*64}\nVERDICT (teacher = {args.checkpoint.name}, layer = {layer_tag})\n{'='*64}")
-    for name, ok in [("G1 rank/collapse", g1), ("G2 responsiveness", g2),
+    for name, ok in [("G1 collapse", g1), ("G2 responsiveness", g2),
                      ("G3a token residual", g3a), ("G3b frame preview", g3b)]:
         print(f"  {name:22s}: {'PASS' if ok else 'FAIL'}")
-    if g1 and g2 and g3a and g3b:
-        print("  -> teacher FIT: proceed with the UDMA build (spec Q1 confirmed).")
-    elif g2 and not (g3a and g3b):
+    if not g2:
+        print("  -> teacher NOT responsive to lines at token level: rerun with --layer 3/4 "
+              "and/or another checkpoint; if none passes G2, the ViT-MAE teacher is unfit "
+              "-> spec v2 (small-RF CNN teacher / ImageNet backbone).")
+    elif not (g3a and g3b):
         print("  -> teacher responsive but too PREDICTABLE for a linear student. This is "
               "not necessarily fatal (conv students are stronger than ridge), but derisk "
               "first: rerun with --layer 3 and --layer 4; prefer the layer with the best "
               "G3 without losing G2. If no layer clears G3, fall back to spec v2 teacher.")
+    elif not g1:
+        print("  -> direct mechanism tests PASS but the teacher features look collapsed "
+              "(G1) — contradictory readout; inspect T1 numbers before proceeding.")
     else:
-        print("  -> teacher NOT responsive to lines at token level: rerun with --layer 3/4 "
-              "and/or another checkpoint; if none passes G2, the ViT-MAE teacher is unfit "
-              "-> spec v2 (small-RF CNN teacher / ImageNet backbone).")
+        print("  -> teacher FIT: proceed with the UDMA build (spec Q1 confirmed).")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     tag = f"{args.checkpoint.stem}_{layer_tag}".replace("=", "").replace(".", "p")
     out_npz = args.out_dir / f"teacher_fitness_{tag}.npz"
     np.savez(out_npz,
-             rel_std=rel_std, pr_rank=pr_rank,
+             rel_std=rel_std, pr_rank_pooled=pr_pooled, pr_rank_content=pr_content,
              snr_list=np.array(sorted(t2_auc)),
              t2_auc=np.array([t2_auc[s] for s in sorted(t2_auc)]),
              t3_tok_auc=np.array([t3_tok_auc.get(s, np.nan) for s in sorted(t2_auc)]),
