@@ -23,10 +23,26 @@ Two things are measured on the ViT-MAE's mean-pooled encoder embedding ``encode(
 Mirrors the sweep's harness exactly (same cache, q25 hot-frac quiet split, ON-only
 injection into the quiet snippets) so the comparison is apples-to-apples.
 
+A third scoring mode, ``--scoring disagree``, is the zero-training probe of the
+UDMA direction (Qi et al. 2024, IEEE IoT J. 11(24)): instead of input-vs-recon
+error it scores the DISAGREEMENT between two already-trained students,
+``||AE(x) - MemAE(x)||^2``. The AE copies a narrowband line, the MemAE redraws
+it from normal prototypes, so their outputs diverge exactly where the input is
+anomalous — while on real RFI (seen by both in training) they should agree.
+Runs the same R1/R2 blocks, so the readout is directly comparable to recon.
+
 Usage (server, not dev machine):
     CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
     python scripts/debug/encode_separation_test.py \
         --checkpoint outputs/training/20260624_084754_057f87c/checkpoints/epoch=006-val_loss=2.1715.ckpt \
+        --cache /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine \
+        --out_dir outputs/sweeps/encode_separation
+
+    # UDMA student-disagreement probe (no --checkpoint needed):
+    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
+    python scripts/debug/encode_separation_test.py --scoring disagree \
+        --ae_checkpoint outputs/training/<ae_run>/checkpoints/<best>.ckpt \
+        --memae_checkpoint outputs/training/<memae_run>/checkpoints/<best>.ckpt \
         --cache /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine \
         --out_dir outputs/sweeps/encode_separation
 """
@@ -93,6 +109,45 @@ def recon_score(model, snippets: np.ndarray, device: str, batch: int = 64,
         x = torch.from_numpy(snippets[i:i + batch]).float().unsqueeze(1).to(device)
         out.append(model.anomaly_score(x, method=method, **kwargs).cpu().numpy())
     return np.concatenate(out, axis=0)
+
+
+class DisagreementPair:
+    """UDMA student-disagreement scorer (Qi et al. 2024, their λ3 term) from two
+    FROZEN checkpoints — a zero-training probe of the distillation direction.
+
+    Duck-typed stand-in for a single backbone in the recon harness: exposes
+    ``anomaly_score(x, method='recon'|'topk')`` like the real models, but the
+    scored map is ``(AE(x) - MemAE(x))^2`` — model disagreement — instead of
+    the input-vs-reconstruction residual. This decouples the score from input
+    predictability (the diagnosed recon-MSE failure: a smooth ETI line is
+    pixel-easy and can score BELOW the noise baseline): the plain AE copies the
+    line, the MemAE redraws it from normal prototypes, so they diverge exactly
+    on the anomaly, while on real RFI — in both training sets — they agree.
+
+    The disagreement is localised on the line, so ``method='topk'`` (mean of
+    the top ``topk_frac`` map pixels) is the aggregation expected to matter:
+    the frame-mean dilutes any local divergence by ~98k noise pixels, the same
+    dilution already measured for recon error (see losses.topk_mse note).
+    """
+
+    def __init__(self, ae, memae):
+        self.ae = ae
+        self.memae = memae
+
+    @torch.no_grad()
+    def anomaly_score(self, x: torch.Tensor, method: str = "recon",
+                      topk_frac: float = 0.02, **kwargs) -> torch.Tensor:
+        if method not in ("recon", "topk"):
+            raise ValueError(
+                f"DisagreementPair supports method='recon'/'topk', got '{method}' "
+                f"(latent_* are MemAE-internal residuals, not a disagreement)."
+            )
+        d = (self.ae(x) - self.memae(x)) ** 2  # (B, 1, H, W)
+        if method == "topk":
+            flat = d.flatten(1)
+            k = max(1, int(round(topk_frac * flat.shape[1])))
+            return flat.topk(k, dim=1).values.mean(dim=1)
+        return d.mean(dim=(1, 2, 3))
 
 
 def cohens_d(a: np.ndarray, b: np.ndarray) -> float:
@@ -424,11 +479,18 @@ def print_operational(op, scoring="embedding"):
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--checkpoint", type=Path, required=True)
+    p.add_argument("--checkpoint", type=Path, default=None,
+                   help="Backbone checkpoint — required for --scoring embedding/recon.")
     p.add_argument("--cache", type=Path, required=True)
     p.add_argument("--split", default="train")
     p.add_argument("--data_config", type=Path, default=ROOT / "configs/data/gbt_fine.yaml")
     p.add_argument("--model_config", type=Path, default=ROOT / "configs/model/vit_mae.yaml")
+    p.add_argument("--ae_checkpoint", type=Path, default=None,
+                   help="Plain-AE checkpoint (with --memae_checkpoint) for --scoring disagree.")
+    p.add_argument("--ae_config", type=Path, default=ROOT / "configs/model/convae.yaml")
+    p.add_argument("--memae_checkpoint", type=Path, default=None,
+                   help="MemAE checkpoint (with --ae_checkpoint) for --scoring disagree.")
+    p.add_argument("--memae_config", type=Path, default=ROOT / "configs/model/memae.yaml")
     p.add_argument("--n_samples", type=int, default=500)
     p.add_argument("--snr_list", type=float, nargs="+",
                    default=[3, 5, 7, 10, 12, 15, 20, 25, 30, 40, 50])
@@ -436,10 +498,13 @@ def parse_args():
     p.add_argument("--out_dir", type=Path, default=ROOT / "outputs/sweeps/encode_separation")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--scoring", choices=["embedding", "recon"], default="embedding",
+    p.add_argument("--scoring", choices=["embedding", "recon", "disagree"], default="embedding",
                    help="embedding (default): run all blocks on encode(x) embeddings. "
                         "recon: run ONLY the operational signal-vs-RFI block on "
-                        "reconstruction MSE (for AE / MAE / ViT-MAE / MemAE).")
+                        "reconstruction MSE (for AE / MAE / ViT-MAE / MemAE). "
+                        "disagree: same R1/R2 blocks scored by the UDMA student-"
+                        "disagreement ||AE(x)-MemAE(x)||^2 from two frozen checkpoints "
+                        "(needs --ae_checkpoint + --memae_checkpoint; --checkpoint unused).")
     p.add_argument("--recon_method", choices=["recon", "topk", "latent_max", "latent_topk"],
                    default="recon",
                    help="Aggregation for --scoring recon: 'recon' (default) is the "
@@ -463,9 +528,27 @@ def main():
     with open(args.model_config) as f:
         model_cfg = yaml.safe_load(f)
 
-    print(f"Loading model from {args.checkpoint}")
-    model = load_model(args.checkpoint, model_cfg, args.device,
-                       require_encode=(args.scoring == "embedding"))
+    if args.scoring == "disagree":
+        if not (args.ae_checkpoint and args.memae_checkpoint):
+            raise SystemExit("--scoring disagree needs BOTH --ae_checkpoint and --memae_checkpoint.")
+        if args.recon_method not in ("recon", "topk"):
+            raise SystemExit("--scoring disagree supports --recon_method recon/topk only "
+                             "(latent_* are MemAE-internal residuals, not a disagreement).")
+        with open(args.ae_config) as f:
+            ae_cfg = yaml.safe_load(f)
+        with open(args.memae_config) as f:
+            memae_cfg = yaml.safe_load(f)
+        print(f"Loading AE from {args.ae_checkpoint}")
+        ae = load_model(args.ae_checkpoint, ae_cfg, args.device, require_encode=False)
+        print(f"Loading MemAE from {args.memae_checkpoint}")
+        memae = load_model(args.memae_checkpoint, memae_cfg, args.device, require_encode=False)
+        model = DisagreementPair(ae, memae)
+    else:
+        if args.checkpoint is None:
+            raise SystemExit("--checkpoint is required for --scoring embedding/recon.")
+        print(f"Loading model from {args.checkpoint}")
+        model = load_model(args.checkpoint, model_cfg, args.device,
+                           require_encode=(args.scoring == "embedding"))
 
     npy_path = Path(args.cache) / f"{args.split}.npy"
     print(f"Loading cache: {npy_path}")
@@ -492,18 +575,20 @@ def main():
     # ViT-MAE/MemAE deployment metric (reconstruction MSE). Two blocks:
     #   (R1) operational signal-vs-RFI, WITH an energy-only column (is the win energy?)
     #   (R2) matched-energy recon — the discriminating morphology test.
-    if args.scoring == "recon":
-        print(f"\n{'='*64}\nR1. OPERATIONAL (RECON) — signal vs RFI, with energy-only control\n{'='*64}")
+    if args.scoring in ("recon", "disagree"):
+        score_name = "disagree" if args.scoring == "disagree" else "recon"
+        label = "DISAGREE ||AE−MemAE||²" if args.scoring == "disagree" else "RECON"
+        print(f"\n{'='*64}\nR1. OPERATIONAL ({label}) — signal vs RFI, with energy-only control\n{'='*64}")
         op = operational_signal_vs_rfi(model, preprocessed, raw_snippets, quiet_idx, rfi_idx,
                                        preproc, args.snr_list, args.drift_rate, args.device,
                                        scoring="recon", seed=args.seed,
                                        recon_method=args.recon_method, topk_frac=args.topk_frac)
         print_operational(op, scoring="recon")
 
-        # R2: matched-energy recon. Pool injected snippets across all SNRs so their
-        # energies span/overlap the RFI range, then caliper-match and compare recon
-        # AUC vs trivial-stats vs energy-only at matched energy.
-        print(f"\n{'='*64}\nR2. MATCHED-ENERGY RECON — is the recon win morphology or energy?\n{'='*64}")
+        # R2: matched-energy score. Pool injected snippets across all SNRs so their
+        # energies span/overlap the RFI range, then caliper-match and compare the
+        # score's AUC vs trivial-stats vs energy-only at matched energy.
+        print(f"\n{'='*64}\nR2. MATCHED-ENERGY {label} — is the win morphology or energy?\n{'='*64}")
         rec_rfi = recon_score(model, preprocessed[rfi_idx], args.device,
                               method=args.recon_method, topk_frac=args.topk_frac)
         en_rfi = frame_energy(preprocessed[rfi_idx])
@@ -531,26 +616,32 @@ def main():
             print(f"  matched pairs: {mm['n_per_class']}/class  (caliper {mm['caliper']})")
             print(f"  energy_only AUC : {mm['energy_only']:.3f}   (~0.5 => energy neutralised)")
             print(f"  trivial   AUC   : {mm['trivial']:.3f}   (peakiness/kurtosis/top-pixel)")
-            print(f"  recon     AUC   : {mm['recon']:.3f}")
+            print(f"  {score_name:9s} AUC  : {mm['recon']:.3f}")
             margin = mm["recon"] - mm["trivial"]
-            print(f"  recon − trivial : {margin:+.3f}   (residual energy AUC {mm['energy_only']:.3f})")
+            print(f"  {score_name} − trivial : {margin:+.3f}   (residual energy AUC {mm['energy_only']:.3f})")
             if margin <= 0.03 or mm["recon"] <= 0.55:
-                print("    -> recon at matched energy is NO better than a trivial contrast stat "
-                      "-> NOT morphology. The recon-B5 win is energy/contrast.")
+                print(f"    -> {score_name} at matched energy is NO better than a trivial contrast "
+                      "stat -> NOT morphology. The win is energy/contrast.")
             elif margin < 0.10 or mm["recon"] < 0.65:
-                print("    -> recon shows a WEAK/borderline morphology residual (above the trivial "
-                      "and energy controls, but by a small margin). Confirm with a tighter caliper "
-                      "/ multiple seeds before trusting; compare against the encoder embedding "
-                      "(block-3 ~0.75-0.85) — recon this far below it means most morphology stays "
-                      "in the encoder, not the reconstruction.")
+                print(f"    -> {score_name} shows a WEAK/borderline morphology residual (above the "
+                      "trivial and energy controls, but by a small margin). Confirm with a tighter "
+                      "caliper / multiple seeds before trusting; compare against the encoder "
+                      f"embedding (block-3 ~0.75-0.85) — {score_name} this far below it means most "
+                      "morphology stays in the encoder, not in this score.")
             else:
-                print("    -> recon at matched energy CLEARLY beats the trivial stat -> the model's "
-                      "reconstruction error carries genuine morphology (real win).")
+                print(f"    -> {score_name} at matched energy CLEARLY beats the trivial stat -> the "
+                      "score carries genuine morphology (real win).")
 
         args.out_dir.mkdir(parents=True, exist_ok=True)
-        tag = f"{args.model_config.stem}_{args.checkpoint.stem}".replace("=", "").replace(".", "p")
+        if args.scoring == "disagree":
+            prefix = "disagree_b5"
+            tag = (f"{args.ae_checkpoint.stem}__{args.memae_checkpoint.stem}"
+                   .replace("=", "").replace(".", "p"))
+        else:
+            prefix = "recon_b5"
+            tag = f"{args.model_config.stem}_{args.checkpoint.stem}".replace("=", "").replace(".", "p")
         method_tag = args.recon_method if args.recon_method == "recon" else f"{args.recon_method}{args.topk_frac}"
-        out_npz = args.out_dir / f"recon_b5_{tag}_{method_tag}.npz"
+        out_npz = args.out_dir / f"{prefix}_{tag}_{method_tag}.npz"
         if op is not None and "error" not in op:
             np.savez(out_npz, snr_list=np.array(args.snr_list),
                      rows=np.array(op["rows"]), n_rfi=op["n_rfi"], n_quiet=op["n_quiet"],
