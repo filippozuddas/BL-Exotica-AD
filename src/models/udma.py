@@ -247,15 +247,27 @@ class UDMA(nn.Module):
         }
 
     @torch.no_grad()
-    def anomaly_map(self, x: torch.Tensor) -> torch.Tensor:
-        """Fused disagreement map ``(B, nh, nw)`` (``map_cob``, Q5)."""
+    def anomaly_map_components(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """The three disagreement maps (Q5) plus their fusion, each ``(B, nh, nw)``.
+
+        Exposed separately from ``anomaly_map`` for qualitative inspection
+        (``scripts/debug/udma_anomaly_maps.py``) — e.g. checking whether the
+        teacher's global attention smears ``st1``/``st2`` into diffuse maps
+        (the Q1 risk) even where the fused ``cob`` map still looks localised.
+        """
         target = self.teacher(x)
         s_ae, s_mem, _ = self._forward_students(x)
         w1, w2, w3 = self.score_weights
         map_st1 = (target - s_ae).pow(2).mean(dim=1)
         map_st2 = (target - s_mem).pow(2).mean(dim=1)
         map_ss = (s_ae - s_mem).pow(2).mean(dim=1)
-        return w1 * map_st1 + w2 * map_st2 + w3 * map_ss
+        map_cob = w1 * map_st1 + w2 * map_st2 + w3 * map_ss
+        return {"st1": map_st1, "st2": map_st2, "ss": map_ss, "cob": map_cob}
+
+    @torch.no_grad()
+    def anomaly_map(self, x: torch.Tensor) -> torch.Tensor:
+        """Fused disagreement map ``(B, nh, nw)`` (``map_cob``, Q5)."""
+        return self.anomaly_map_components(x)["cob"]
 
     @torch.no_grad()
     def anomaly_score(self, x: torch.Tensor, method: str = "topk", topk_frac: Optional[float] = None, **kwargs) -> torch.Tensor:
