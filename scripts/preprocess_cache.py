@@ -21,7 +21,8 @@ Two-pass extraction: pass 1 validates all file headers and computes exact
 snippet counts; pass 2 allocates the .npy via memmap and writes directly to
 disk, keeping RAM usage bounded to one cadence buffer at a time.
 
-Usage:
+Usage (legacy, internal shuffle-and-fraction split — one manifest in, script
+decides train/val/inject-recovery):
     PYTHONPATH=. python scripts/preprocess_cache.py \\
         --config    configs/training/srt_real.yaml \\
         --output    data/processed/cache_gbt_fine \\
@@ -29,6 +30,18 @@ Usage:
         --max-snippets 1100000 \\
         --train-fraction 0.7 \\
         --seed 42
+
+Usage (pre-split manifests — e.g. from `scripts/build_gbt_cadence_manifest.py`,
+which stratifies by band/target; --train-fraction/--val-fraction/
+--exclude-targets are ignored in this mode since the split was already made):
+    PYTHONPATH=. python scripts/preprocess_cache.py \\
+        --config              configs/training/srt_real.yaml \\
+        --output              data/processed/cache_gbt_fine \\
+        --train-cadence-list  data/raw/gbt_0000_train_cadences.txt \\
+        --val-cadence-list    data/raw/gbt_0000_val_cadences.txt \\
+        --heldout-cadence-list data/raw/gbt_0000_heldout_cadences.txt \\
+        --snippets-per-cadence 18000 \\
+        --max-snippets 1100000
 """
 
 import argparse
@@ -125,9 +138,22 @@ def main():
     p.add_argument("--val-fraction", type=float, default=0.15,
                    help="Fraction of train cadences held out for validation (within train pool)")
     p.add_argument("--exclude-targets", nargs="*", default=None,
-                   help="Target names to force into inject-recovery pool (never trained on)")
+                   help="Target names to force into inject-recovery pool (never trained on). "
+                        "Ignored when --train-cadence-list/--val-cadence-list are given.")
+    p.add_argument("--train-cadence-list", type=Path, default=None,
+                   help="Pre-split train manifest (e.g. from build_gbt_cadence_manifest.py). "
+                        "Requires --val-cadence-list; bypasses --train-fraction/--val-fraction/--exclude-targets.")
+    p.add_argument("--val-cadence-list", type=Path, default=None,
+                   help="Pre-split val manifest, paired with --train-cadence-list.")
+    p.add_argument("--heldout-cadence-list", type=Path, default=None,
+                   help="Pre-split held-out manifest (not cached/extracted here — just copied through "
+                        "to the output dir for provenance; consumed directly by inject_recover.py/search.py).")
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
+
+    pre_split = args.train_cadence_list is not None
+    if pre_split != (args.val_cadence_list is not None):
+        raise ValueError("--train-cadence-list and --val-cadence-list must be given together")
 
     # ------------------------------------------------------------------ config
     cfg = load_config(args.config)
@@ -137,53 +163,76 @@ def main():
     fchans = frame_cfg["fchans"]           # 1024
     cfg_preproc = data_cfg["preprocessing"]
 
-    cadence_list_path = Path(data_cfg["dataset"]["cadence_list"])
-    all_cadences = [
-        [Path(p) for p in line.strip().split()]
-        for line in cadence_list_path.read_text().splitlines()
-        if line.strip()
-    ]
-
-    print(f"Total cadences in manifest: {len(all_cadences)}")
-
-    # ---------------------------------------------------------- cadence split
-    rng = random.Random(args.seed)
     np_rng = np.random.default_rng(args.seed)
 
-    cadences = list(all_cadences)
-    rng.shuffle(cadences)
+    def _load_manifest(path: Path):
+        return [
+            [Path(p) for p in line.strip().split()]
+            for line in path.read_text().splitlines()
+            if line.strip()
+        ]
 
-    exclude = set(args.exclude_targets or [])
-
-    def _target_name(paths):
-        """Best-effort: filename field before _ON/_OFF."""
-        import re
-        stem = paths[0].stem
-        m = re.search(r"([A-Za-z0-9_]+?)_(ON|OFF)", stem)
-        return m.group(1) if m else stem
-
-    excluded = [c for c in cadences if _target_name(c) in exclude]
-    cadences  = [c for c in cadences if _target_name(c) not in exclude]
-
-    n_train_total = int(len(cadences) * args.train_fraction)
-    train_and_val = cadences[:n_train_total]
-    inject_recovery = cadences[n_train_total:] + excluded
-
-    n_val_cad = max(1, int(len(train_and_val) * args.val_fraction))
-    val_cadences   = train_and_val[:n_val_cad]
-    train_cadences = train_and_val[n_val_cad:]
-
-    print(f"Train cadences : {len(train_cadences)}")
-    print(f"Val cadences   : {len(val_cadences)}")
-    print(f"Inject-recovery: {len(inject_recovery)}")
-
-    # ----------------------------------- save inject-recovery cadence manifest
     args.output.mkdir(parents=True, exist_ok=True)
-    inj_path = args.output / "inject_recovery_cadences.txt"
-    with open(inj_path, "w") as f:
-        for cad in inject_recovery:
-            f.write(" ".join(str(p) for p in cad) + "\n")
-    print(f"Inject-recovery cadences saved to: {inj_path}")
+
+    if pre_split:
+        print(f"Pre-split mode: train={args.train_cadence_list}  val={args.val_cadence_list}")
+        train_cadences = _load_manifest(args.train_cadence_list)
+        val_cadences = _load_manifest(args.val_cadence_list)
+        inject_recovery = _load_manifest(args.heldout_cadence_list) if args.heldout_cadence_list else []
+
+        print(f"Train cadences : {len(train_cadences)}")
+        print(f"Val cadences   : {len(val_cadences)}")
+        print(f"Held-out       : {len(inject_recovery)}")
+
+        inj_path = args.output / "heldout_cadences.txt"
+        with open(inj_path, "w") as f:
+            for cad in inject_recovery:
+                f.write(" ".join(str(p) for p in cad) + "\n")
+        if inject_recovery:
+            print(f"Held-out cadences copied to: {inj_path} (unmodified — read directly by "
+                  f"inject_recover.py/search.py, not extracted into this cache)")
+    else:
+        cadence_list_path = Path(data_cfg["dataset"]["cadence_list"])
+        all_cadences = _load_manifest(cadence_list_path)
+
+        print(f"Total cadences in manifest: {len(all_cadences)}")
+
+        # ------------------------------------------------------ cadence split
+        rng = random.Random(args.seed)
+
+        cadences = list(all_cadences)
+        rng.shuffle(cadences)
+
+        exclude = set(args.exclude_targets or [])
+
+        def _target_name(paths):
+            """Best-effort: filename field before _ON/_OFF."""
+            import re
+            stem = paths[0].stem
+            m = re.search(r"([A-Za-z0-9_]+?)_(ON|OFF)", stem)
+            return m.group(1) if m else stem
+
+        excluded = [c for c in cadences if _target_name(c) in exclude]
+        cadences  = [c for c in cadences if _target_name(c) not in exclude]
+
+        n_train_total = int(len(cadences) * args.train_fraction)
+        train_and_val = cadences[:n_train_total]
+        inject_recovery = cadences[n_train_total:] + excluded
+
+        n_val_cad = max(1, int(len(train_and_val) * args.val_fraction))
+        val_cadences   = train_and_val[:n_val_cad]
+        train_cadences = train_and_val[n_val_cad:]
+
+        print(f"Train cadences : {len(train_cadences)}")
+        print(f"Val cadences   : {len(val_cadences)}")
+        print(f"Inject-recovery: {len(inject_recovery)}")
+
+        # ------------------------------------- save inject-recovery manifest
+        inj_path = args.output / "inject_recovery_cadences.txt"
+        with open(inj_path, "w") as f:
+            for cad in inject_recovery:
+                f.write(" ".join(str(p) for p in cad) + "\n")
+        print(f"Inject-recovery cadences saved to: {inj_path}")
 
     # Determine n_obs and tchans_per_obs from first available cadence
     sample_cad = (train_cadences or val_cadences)[0]
@@ -286,11 +335,15 @@ def main():
         "shape_per_snippet": list(snippet_shape),
         "n_train_cadences": len(train_plan),
         "n_val_cadences": len(val_plan),
-        "n_inject_recovery_cadences": len(inject_recovery),
+        "n_heldout_cadences": len(inject_recovery),
         "snippets_per_cadence": args.snippets_per_cadence,
         "seed": args.seed,
-        "train_fraction": args.train_fraction,
-        "val_fraction": args.val_fraction,
+        "split_mode": "pre-split" if pre_split else "internal-shuffle",
+        "train_fraction": None if pre_split else args.train_fraction,
+        "val_fraction": None if pre_split else args.val_fraction,
+        "train_cadence_list": str(args.train_cadence_list) if pre_split else None,
+        "val_cadence_list": str(args.val_cadence_list) if pre_split else None,
+        "heldout_cadence_list": str(args.heldout_cadence_list) if pre_split else None,
         "preprocessing": cfg_preproc,
     }
     meta_path = out_dir / "meta.json"
