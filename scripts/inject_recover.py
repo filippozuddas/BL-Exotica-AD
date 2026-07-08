@@ -189,6 +189,13 @@ def main():
     # Background is built in-script from a full random probe of each cadence
     # (RFI-inclusive) — NOT from the quiet half used for injection sites.
     bg_scores = {m: [] for m in methods}
+    # Per-cadence-tagged copies of the same scores (for the per-cadence-threshold
+    # table + the between-vs-within-cadence variance decomposition below). Each
+    # entry is one cadence's array; the two lists stay index-aligned because both
+    # are appended once per successful cadence (a corrupt-file `continue` skips
+    # both). bg_by_cad[m][k] and inj_by_cad[m][snr][k] refer to the same cadence k.
+    bg_by_cad = {m: [] for m in methods}
+    inj_by_cad = {m: {snr: [] for snr in args.snr_list} for m in methods}
 
     for cad_idx, obs_paths in enumerate(cadence_lines):
         obs_paths = [Path(p) for p in obs_paths]
@@ -221,6 +228,7 @@ def main():
 
         for m in methods:
             bg_scores[m].extend(probe_scores[m].tolist())
+            bg_by_cad[m].append(probe_scores[m])
 
         # Use the quietest 50% (by recon score) as injection sites
         recon_probe = probe_scores["recon"]
@@ -236,6 +244,7 @@ def main():
         # One signal morphology (drift, width, profile) per injection site,
         # frozen and reused across the whole SNR sweep — only the amplitude
         # varies, so SNR is the sweep's one true independent variable.
+        cad_inj = {m: {snr: [] for snr in args.snr_list} for m in methods}
         for j, fs in enumerate(injection_fstarts):
             site_seed = args.seed + cad_idx * 1000 + j
             gen = NarrowbandDriftingGenerator(nb_params, seed=site_seed)
@@ -255,6 +264,11 @@ def main():
                 for m in methods:
                     s = score_snippet(model, snip_inj, m, args.device)
                     all_results[m][snr].append(s)
+                    cad_inj[m][snr].append(s)
+
+        for m in methods:
+            for snr in args.snr_list:
+                inj_by_cad[m][snr].append(np.array(cad_inj[m][snr]))
 
         del obs_arrays
         print(f"  Done cadence {cad_idx}")
@@ -316,6 +330,89 @@ def main():
                 "rank_pct": rank_pct,
             })
 
+    # ---- Per-cadence threshold + variance decomposition (confound-1 test) ----
+    # The pooled table above scores every injection against ONE global median+3σ,
+    # merging cadences whose background RFI severity spans ~2 orders of magnitude.
+    # Two questions the pooled table can't answer:
+    #   (A) does a per-cadence threshold (each injection vs its OWN cadence's 3σ,
+    #       the operationally honest metric — the real search runs per cadence)
+    #       materially raise detection? If yes, the pooled threshold was the
+    #       artifact depressing det@3σ.
+    #   (B) is the huge injection-score spread (std ≈ 19× MAD at SNR50, so det@3σ
+    #       is only 73% despite mean at +17σ) driven by BETWEEN-cadence variance
+    #       (per-cadence threshold fixes it) or WITHIN-cadence variance (some
+    #       injected signals produce almost no disagreement even at high SNR —
+    #       a model/representation property no threshold can rescue)?
+    #       η² = SS_between / SS_total: →1 between-dominated, →0 within-dominated.
+    print(f"\n{'='*70}")
+    print(f"PER-CADENCE THRESHOLD + VARIANCE DECOMPOSITION")
+    print(f"{'='*70}")
+
+    def eta_squared(groups):
+        """Fraction of variance explained by cadence identity (one-way ANOVA η²).
+        `groups` = list of per-cadence 1-D score arrays. Returns (eta2, n_total)."""
+        groups = [g for g in groups if len(g) > 0]
+        if len(groups) < 2:
+            return float("nan"), sum(len(g) for g in groups)
+        all_x = np.concatenate(groups)
+        grand = all_x.mean()
+        ss_between = sum(len(g) * (g.mean() - grand) ** 2 for g in groups)
+        ss_within = sum(((g - g.mean()) ** 2).sum() for g in groups)
+        ss_total = ss_between + ss_within
+        return (float(ss_between / ss_total) if ss_total > 0 else float("nan"),
+                len(all_x))
+
+    for method in methods:
+        # Each cadence's own robust threshold from its own background probe.
+        cad_thresh3 = []
+        cad_thresh5 = []
+        for cad_bg in bg_by_cad[method]:
+            med_c, mad_c = robust_stats(cad_bg)
+            cad_thresh3.append(med_c + 3 * mad_c)
+            cad_thresh5.append(med_c + 5 * mad_c)
+        cad_thresh3 = np.array(cad_thresh3)
+
+        print(f"\n  {method}: per-cadence 3σ thresholds — "
+              f"min={cad_thresh3.min():.4f}, median={np.median(cad_thresh3):.4f}, "
+              f"max={cad_thresh3.max():.4f}  (pooled 3σ={bg[method]['thresh_3s']:.4f})")
+        print(f"  {'SNR':>5s}  {'det@3s_pool':>11s}  {'det@3s_cad':>11s}  "
+              f"{'det@5s_cad':>11s}  {'eta2(cad)':>9s}")
+        print(f"  {'-'*5}  {'-'*11}  {'-'*11}  {'-'*11}  {'-'*9}")
+        for snr in args.snr_list:
+            groups3 = inj_by_cad[method][snr]
+            # pooled det@3σ (same as table above, recomputed for side-by-side)
+            pooled_scores = np.array(all_results[method][snr])
+            det_pool = (pooled_scores > bg[method]["thresh_3s"]).mean() * 100
+            # per-cadence det@3σ / det@5σ: each cadence's injections vs its own thr
+            hits3 = tot = hits5 = 0
+            for ci, inj_arr in enumerate(groups3):
+                if len(inj_arr) == 0:
+                    continue
+                hits3 += (inj_arr > cad_thresh3[ci]).sum()
+                hits5 += (inj_arr > cad_thresh5[ci]).sum()
+                tot += len(inj_arr)
+            det_cad3 = 100 * hits3 / tot if tot else float("nan")
+            det_cad5 = 100 * hits5 / tot if tot else float("nan")
+            eta2, _ = eta_squared(groups3)
+            print(f"  {snr:5.0f}  {det_pool:10.1f}%  {det_cad3:10.1f}%  "
+                  f"{det_cad5:10.1f}%  {eta2:9.3f}")
+
+        # High-SNR variance read: if η² stays low at SNR30/50, per-cadence
+        # thresholding cannot rescue detection — the spread is within-cadence.
+        hi = [s for s in args.snr_list if s >= 30]
+        if hi:
+            etas = [eta_squared(inj_by_cad[method][s])[0] for s in hi]
+            mean_eta = np.nanmean(etas)
+            print(f"  → high-SNR (≥30) mean η² = {mean_eta:.3f}: ", end="")
+            if mean_eta > 0.5:
+                print("BETWEEN-cadence variance dominates → per-cadence threshold "
+                      "is the fix (pooled threshold was the artifact).")
+            else:
+                print("WITHIN-cadence variance dominates → per-cadence threshold "
+                      "CANNOT rescue detection; some injections yield little "
+                      "disagreement even at high SNR (model/representation, not "
+                      "thresholding).")
+
     # Save CSV
     csv_path = args.out_dir / "inject_recovery_results.csv"
     with open(csv_path, "w", newline="") as f:
@@ -326,7 +423,9 @@ def main():
 
     # ---- Plot 1: Detection rate vs SNR (head-to-head) ----
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    colors = {"recon": "steelblue", "cadence": "crimson"}
+    _base_colors = {"recon": "steelblue", "cadence": "crimson"}
+    _cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    colors = {m: _base_colors.get(m, _cycle[i % len(_cycle)]) for i, m in enumerate(methods)}
     snrs = sorted(args.snr_list)
 
     # Left: score vs SNR
@@ -423,7 +522,12 @@ def main():
         )
         snip_inj = preprocess_injected(raw_inj, preproc)
         snip_clean = preprocess_raw_window(obs_arrays, quiet_fs, fchans, preproc)
-        recon_arr = reconstruct_snippet(model, snip_inj, args.device)
+        try:
+            recon_arr = reconstruct_snippet(model, snip_inj, args.device)
+        except NotImplementedError:
+            # UDMA has no pixel decoder — fall back to its native (nh,nw)
+            # disagreement map for the illustrative panel below.
+            recon_arr = None
 
         method_scores = {}
         for m in methods:
@@ -444,13 +548,20 @@ def main():
         axes[1, 0].set_title(f"Injected SNR={snr}")
         axes[1, 0].set_ylabel("Time bin")
 
-        axes[1, 1].imshow(recon_arr, aspect="auto", origin="upper",
-                          vmin=vmin, vmax=vmax, cmap="viridis")
-        axes[1, 1].set_title("Reconstruction")
+        if recon_arr is not None:
+            axes[1, 1].imshow(recon_arr, aspect="auto", origin="upper",
+                              vmin=vmin, vmax=vmax, cmap="viridis")
+            axes[1, 1].set_title("Reconstruction")
 
-        error = np.abs(snip_inj - recon_arr)
-        axes[1, 2].imshow(error, aspect="auto", origin="upper", cmap="hot")
-        axes[1, 2].set_title("Residual")
+            error = np.abs(snip_inj - recon_arr)
+            axes[1, 2].imshow(error, aspect="auto", origin="upper", cmap="hot")
+            axes[1, 2].set_title("Residual")
+        else:
+            x_inj = torch.from_numpy(snip_inj).float().unsqueeze(0).unsqueeze(0).to(args.device)
+            amap = model.anomaly_map(x_inj)[0].cpu().numpy()
+            axes[1, 1].imshow(amap, aspect="auto", origin="upper", cmap="viridis")
+            axes[1, 1].set_title("anomaly_map (UDMA, native (nh,nw) grid)")
+            axes[1, 2].axis("off")
 
         diff = np.abs(snip_inj - snip_clean)
         axes[0, 1].imshow(diff, aspect="auto", origin="upper", cmap="hot")
