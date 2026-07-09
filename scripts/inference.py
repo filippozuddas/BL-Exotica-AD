@@ -22,7 +22,6 @@ Usage (run on the server):
 
 import argparse
 import csv
-import heapq
 import multiprocessing as mp
 import sys
 import time
@@ -42,8 +41,9 @@ sys.path.insert(0, str(ROOT))
 from src.models.autoencoder import build_autoencoder
 from src.data.preprocessing import bandpass_correct, core_transform
 from src.data.torch_dataset import _load_full_obs
+from src.search.candidates import cluster_candidates, on_off_contrast
 
-METHODS = ["recon", "cadence"]
+METHODS = ["recon", "topk", "max", "cadence"]
 MAD_SCALE = 1.4826
 
 _shared_obs = None
@@ -78,13 +78,15 @@ def _worker_init(file_specs, fchans, tchans, preproc):
 
 
 def _preprocess_at(f_start):
-    frames = [obs[:, f_start:f_start + _shared_fchans] for obs in _shared_obs]
-    stacked = np.concatenate(frames, axis=0)[:_shared_tchans, :]
     method = _shared_preproc.get("bandpass_method", "polynomial")
     poly_degree = _shared_preproc.get("poly_degree", 3)
     mad_epsilon = _shared_preproc.get("mad_epsilon", 1e-6)
-    stacked = bandpass_correct(stacked, method=method, poly_degree=poly_degree)
-    stacked = core_transform(stacked, mad_epsilon)
+    frames = [obs[:, f_start:f_start + _shared_fchans] for obs in _shared_obs]
+    normed = [
+        core_transform(bandpass_correct(f, method=method, poly_degree=poly_degree), mad_epsilon)
+        for f in frames
+    ]
+    stacked = np.concatenate(normed, axis=0)[:_shared_tchans, :]
     return stacked
 
 
@@ -155,8 +157,11 @@ def make_cadence_dirname(cad_idx: int, meta: dict) -> str:
 
 
 def plot_candidate(original, reconstruction, score, sigma, method, cad_idx,
-                   target, f_start, df, out_path):
-    error = np.abs(original - reconstruction)
+                   target, f_start, df, out_path, anomaly_map=None):
+    """``reconstruction``/error panels for pixel-decoder backbones; if
+    ``reconstruction`` is None (UDMA, no pixel decoder), ``anomaly_map`` — its
+    native (nh,nw) disagreement grid — is shown instead (see
+    ``UDMA.anomaly_map`` / ``scripts/debug/udma_anomaly_maps.py``)."""
     vmin, vmax = np.percentile(original, [1, 99])
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
@@ -168,16 +173,25 @@ def plot_candidate(original, reconstruction, score, sigma, method, cad_idx,
     axes[0].set_xlabel("Freq channel")
     plt.colorbar(im0, ax=axes[0], fraction=0.046)
 
-    im1 = axes[1].imshow(reconstruction, aspect="auto", origin="upper",
-                          vmin=vmin, vmax=vmax, cmap="viridis")
-    axes[1].set_title("Reconstruction")
-    axes[1].set_xlabel("Freq channel")
-    plt.colorbar(im1, ax=axes[1], fraction=0.046)
+    if reconstruction is not None:
+        im1 = axes[1].imshow(reconstruction, aspect="auto", origin="upper",
+                              vmin=vmin, vmax=vmax, cmap="viridis")
+        axes[1].set_title("Reconstruction")
+        axes[1].set_xlabel("Freq channel")
+        plt.colorbar(im1, ax=axes[1], fraction=0.046)
 
-    im2 = axes[2].imshow(error, aspect="auto", origin="upper", cmap="hot")
-    axes[2].set_title("Residual |orig - recon|")
-    axes[2].set_xlabel("Freq channel")
-    plt.colorbar(im2, ax=axes[2], fraction=0.046)
+        error = np.abs(original - reconstruction)
+        im2 = axes[2].imshow(error, aspect="auto", origin="upper", cmap="hot")
+        axes[2].set_title("Residual |orig - recon|")
+        axes[2].set_xlabel("Freq channel")
+        plt.colorbar(im2, ax=axes[2], fraction=0.046)
+    else:
+        im1 = axes[1].imshow(anomaly_map, aspect="auto", origin="upper", cmap="viridis")
+        axes[1].set_title("anomaly_map (UDMA, native (nh,nw) grid)")
+        axes[1].set_xlabel("Freq patch col")
+        axes[1].set_ylabel("Time patch row")
+        plt.colorbar(im1, ax=axes[1], fraction=0.046)
+        axes[2].axis("off")
 
     f_center_mhz = f_start * df / 1e6
     fig.suptitle(
@@ -208,7 +222,9 @@ def parse_args():
                    help="Number of top candidates to plot per cadence per method")
     p.add_argument("--methods", nargs="+", default=["recon"], choices=METHODS,
                    help="Anomaly scoring methods to run. The plain Autoencoder/MAE/VAE "
-                        "only support 'recon'; 'cadence' requires the ViT-MAE backbone.")
+                        "only support 'recon'/'topk'; 'cadence' requires the ViT-MAE "
+                        "backbone; UDMA supports 'recon'/'topk'/'max' (its own topk_frac "
+                        "default, no 'cadence').")
     return p.parse_args()
 
 
@@ -326,9 +342,6 @@ def main():
         cad_scores = {m: [] for m in methods}
         cad_fstarts = []
 
-        # Per-cadence top-K heaps, one per method
-        top_heaps = {m: [] for m in methods}
-
         chunksize = max(1, min(256, n_snippets // (args.num_workers * 4)))
         print(f"  Pool: {args.num_workers} workers (spawn), chunksize={chunksize}")
 
@@ -346,8 +359,6 @@ def main():
 
                     for j in range(len(batch_snippets)):
                         cad_fstarts.append(batch_fstarts[j])
-                        local_idx = len(cad_fstarts) - 1
-                        snip_copy = batch_snippets[j].copy()
 
                         row = {
                             "cadence_idx": cad_idx,
@@ -360,12 +371,6 @@ def main():
                             cad_scores[m].append(score)
                             all_scores[m].append(score)
                             row[f"{m}_score"] = score
-
-                            heap = top_heaps[m]
-                            if len(heap) < args.top_k:
-                                heapq.heappush(heap, (score, local_idx, snip_copy))
-                            elif score > heap[0][0]:
-                                heapq.heapreplace(heap, (score, local_idx, snip_copy))
                         all_rows.append(row)
 
                     batch_snippets = []
@@ -385,10 +390,16 @@ def main():
 
         # ---- Per-cadence summary & plots ----
         cad_arrs = {m: np.array(cad_scores[m]) for m in methods}
+        cad_fstarts_arr = np.array(cad_fstarts)
 
+        # Re-populate this (main) process's globals so _preprocess_at can
+        # re-derive individual snippets on demand for the cluster-peak plots
+        # below, without keeping all n_snippets arrays in RAM during scoring.
+        _worker_init(file_specs, fchans, tchans, preproc)
+
+        n_plots = 0
         for method in methods:
             scores = cad_arrs[method]
-            heap = top_heaps[method]
             median, mad_sigma = robust_stats(scores)
             thresh_3 = median + 3 * mad_sigma
             thresh_5 = median + 5 * mad_sigma
@@ -397,18 +408,78 @@ def main():
             print(f"  {method}: median={median:.4f}  MAD_s={mad_sigma:.4f}  "
                   f"3s->{n_3s}  5s->{n_5s}")
 
-            candidates = sorted(heap, key=lambda x: -x[0])
-            for rank, (score, local_idx, snippet) in enumerate(candidates):
+            # Frequency-adjacency dedup (src/search/candidates.py): a single
+            # wide/strong line triggers many adjacent overlapping windows
+            # (stride < fchans) — collapse those into one candidate per event.
+            clusters = cluster_candidates(cad_fstarts_arr, scores, thresh_3, stride, fchans, df)
+            print(f"  {method}: {len(clusters)} distinct candidates after "
+                  f"frequency-adjacency dedup (from {n_3s} raw threshold-crossings)")
+
+            # ON/OFF contrast (src/search/candidates.py): UDMA's (6,64) grid
+            # has one row per cadence observation (ABACAD order) — reuses the
+            # per-candidate anomaly map, no extra forward passes beyond one
+            # per cluster. Descriptive only, added as CSV columns for human
+            # review — see arch_constraint_encoder_based_only in memory.
+            has_amap = hasattr(model, "anomaly_map")
+            amaps_by_cluster = [None] * len(clusters)
+            if has_amap and len(clusters) > 0:
+                contrasts, on_means, off_means = [], [], []
+                n_on_hits_l, n_off_hits_l = [], []
+                for i, (_, crow) in enumerate(clusters.iterrows()):
+                    fs_c = int(crow["f_start_peak"])
+                    snippet_c = _preprocess_at(fs_c)
+                    x_c = torch.from_numpy(snippet_c).float().unsqueeze(0).unsqueeze(0).to(args.device)
+                    with torch.no_grad():
+                        amap_c = model.anomaly_map(x_c)[0].cpu().numpy()
+                    amaps_by_cluster[i] = amap_c
+                    stats = on_off_contrast(amap_c, threshold=thresh_3)
+                    contrasts.append(stats["on_off_contrast"])
+                    on_means.append(stats["on_mean"])
+                    off_means.append(stats["off_mean"])
+                    n_on_hits_l.append(stats["n_on_hits"])
+                    n_off_hits_l.append(stats["n_off_hits"])
+                clusters["on_off_contrast"] = contrasts
+                clusters["on_mean"] = on_means
+                clusters["off_mean"] = off_means
+                clusters["n_on_hits"] = n_on_hits_l
+                clusters["n_off_hits"] = n_off_hits_l
+
+            clusters.to_csv(cad_dir / f"{method}_candidates.csv", index=False)
+
+            # Plot selection: rank by on_off_contrast when available (UDMA) —
+            # peak_score alone rewards persistent RFI over target-only events
+            # (see search_candidate_clustering memory, 2026-07-06 finding).
+            # Caveat: n_off_hits==0 is NOT proof of target-locking — the
+            # fixed-column drift-tolerance window can miss fast/non-linear
+            # drifters that are actually present in every OFF block too
+            # (observed on a satellite-like chirp candidate) — always confirm
+            # visually, this only re-prioritises what to look at first.
+            if has_amap and len(clusters) > 0:
+                order = np.argsort(-clusters["on_off_contrast"].to_numpy())
+                clusters_ranked = clusters.iloc[order].reset_index(drop=True)
+                amaps_by_cluster = [amaps_by_cluster[i] for i in order]
+            else:
+                clusters_ranked = clusters
+
+            top_clusters = clusters_ranked.head(args.top_k).reset_index(drop=True)
+            n_plots += len(top_clusters)
+            for rank, row in top_clusters.iterrows():
+                fs = int(row["f_start_peak"])
+                score = float(row["peak_score"])
+                snippet = _preprocess_at(fs)
                 sigma = (score - median) / mad_sigma if mad_sigma > 0 else 0
-                recon = reconstruct_batch(model, [snippet], args.device)
-                fs = cad_fstarts[local_idx]
+                amap = amaps_by_cluster[rank]
+                recon = None
+                if amap is None:
+                    recon = reconstruct_batch(model, [snippet], args.device)[0]
                 out_path = cad_dir / f"{method}_rank{rank:02d}_f{fs}.png"
                 plot_candidate(
                     original=snippet,
-                    reconstruction=recon[0],
+                    reconstruction=recon,
                     score=score, sigma=sigma, method=method,
                     cad_idx=cad_idx, target=target_name,
                     f_start=fs, df=df, out_path=out_path,
+                    anomaly_map=amap,
                 )
 
         # Per-cadence frequency profile, one per method
@@ -429,7 +500,6 @@ def main():
             plt.savefig(cad_dir / f"{method}_score_vs_freq.png", dpi=150)
             plt.close()
 
-        n_plots = sum(len(h) for h in top_heaps.values())
         print(f"  Saved {n_plots} candidate plots -> {cad_dir}")
 
         for path in shm_paths:

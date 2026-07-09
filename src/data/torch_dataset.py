@@ -202,10 +202,12 @@ class SpectrogramDataset(Dataset):
             self._obs_cache[path][:, f_start : f_start + self.fchans]
             for path in self.cadence_paths[cad_idx]
         ]
-        result = np.concatenate(sub_frames, axis=0)          # (total_time, fchans)
+        normed = [
+            core_transform(bandpass_correct(f, method=method, poly_degree=poly_degree), mad_epsilon)
+            for f in sub_frames
+        ]
+        result = np.concatenate(normed, axis=0)              # (total_time, fchans)
         result = result[: self.tchans, :]                    # enforce fixed height
-        result = bandpass_correct(result, method=method, poly_degree=poly_degree)
-        result = core_transform(result, mad_epsilon)
         return torch.from_numpy(result).float().unsqueeze(0)  # (1, tchans, fchans)
 
 
@@ -269,9 +271,11 @@ class CachedDataset(Dataset):
         mad_epsilon = self.cfg_preproc.get("mad_epsilon", 1e-6)
 
         raw = self.data[idx]                          # (n_obs, tchans_per_obs, fchans)
-        result = np.concatenate(raw, axis=0)          # (tchans, fchans)
-        result = bandpass_correct(result, method=method, poly_degree=poly_degree)
-        result = core_transform(result, mad_epsilon)
+        normed = [
+            core_transform(bandpass_correct(obs, method=method, poly_degree=poly_degree), mad_epsilon)
+            for obs in raw
+        ]
+        result = np.concatenate(normed, axis=0)       # (tchans, fchans)
         return torch.from_numpy(result).float().unsqueeze(0)
 
 
