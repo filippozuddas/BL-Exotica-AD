@@ -41,14 +41,22 @@ def build_narrowband_generator(data_cfg, seed):
 
 
 def inject_narrowband_on_only(generator, raw_snippet, snr=None, drift_rate=None):
-    """Inject a setigen narrowband drifting track into ON observations only (0, 2, 4).
+    """Inject the same setigen narrowband track into ON obs (0, 2, 4), drift-shifted.
 
-    One SNR/drift_rate/start_channel is sampled (or taken from the overrides) and
-    reused across all three ON observations, with ``start_channel`` advanced by the
-    drift accumulated over the full cadence timeline (including the intervening OFF
-    observations) so the track stays continuous across the gaps. Per-observation
-    synthesis (frequency/time profile, width, scintillation) is delegated to
-    ``NarrowbandDriftingGenerator.inject_signal``.
+    The track (frequency/time profile, width, scintillation) is synthesized once
+    via ``NarrowbandDriftingGenerator.inject_signal`` against the first ON
+    observation's real noise (needed to calibrate SNR -> intensity). The resulting
+    additive signal-only component is then reused for the other two ON
+    observations, rolled along the frequency axis by the drift accumulated since
+    the reference observation (including the intervening OFF gaps) — same
+    waveform, correctly repositioned rather than frozen at one channel.
+
+    Returns ``(raw, mask)`` where ``mask`` is a boolean array of the same shape
+    flagging pixels touched by the injected signal (>=5% of its peak raw
+    amplitude), used downstream to compute a signal-region MSE — the full-frame
+    MSE is dominated by background noise/RFI since the track covers a tiny
+    fraction of the 96x1024 frame, so it barely moves whether the model
+    reconstructs the track well or misses it entirely.
     """
     p = generator.params
     raw = raw_snippet.copy()
@@ -62,19 +70,21 @@ def inject_narrowband_on_only(generator, raw_snippet, snr=None, drift_rate=None)
         drift_rate = generator._sample_drift_rate(max_drift)
     start_channel = int(generator.rng.integers(fchans // 8, 7 * fchans // 8))
 
+    ref_obs = on_obs[0]
+    injected_ref, _ = generator.inject_signal(
+        raw[ref_obs], snr=snr, drift_rate=drift_rate, start_channel=start_channel,
+    )
+    signal_only = injected_ref - raw[ref_obs]
+    peak = np.abs(signal_only).max()
+
+    mask = np.zeros_like(raw, dtype=bool)
     drift_chans_per_bin = (drift_rate * p.dt) / p.df
     for obs_idx in on_obs:
-        global_t_start = obs_idx * tchans_per_obs
-        obs_start_channel = int(np.clip(
-            round(start_channel + global_t_start * drift_chans_per_bin),
-            1, fchans - 2,
-        ))
-        injected, _ = generator.inject_signal(
-            raw[obs_idx], snr=snr, drift_rate=drift_rate,
-            start_channel=obs_start_channel,
-        )
-        raw[obs_idx] = injected
-    return raw
+        shift = int(round((obs_idx - ref_obs) * tchans_per_obs * drift_chans_per_bin))
+        shifted = np.roll(signal_only, shift, axis=1)
+        raw[obs_idx] = raw[obs_idx] + shifted
+        mask[obs_idx] = np.abs(shifted) > 0.05 * peak
+    return raw, mask
 
 
 def load_model(checkpoint_path, model_config, device="cpu"):
@@ -180,12 +190,14 @@ def main():
     for row, ci in enumerate(chosen):
         raw = scan_raw[ci]
         orig = preprocess_raw(raw, preproc)
-        raw_inj = inject_narrowband_on_only(generator, raw, snr=args.inject_snr,
-                                            drift_rate=args.drift_rate)
+        raw_inj, signal_mask_obs = inject_narrowband_on_only(
+            generator, raw, snr=args.inject_snr, drift_rate=args.drift_rate)
         injected = preprocess_raw(raw_inj, preproc)
         recon = reconstruct(model, injected, args.device)
         error = (injected - recon) ** 2
         diff = injected - orig
+        signal_mask = np.concatenate(signal_mask_obs, axis=0)
+        mse_signal = float(error[signal_mask].mean()) if signal_mask.any() else float("nan")
 
         vmin, vmax = np.percentile(orig, [1, 99])
         err_vmax = np.percentile(error, 99)
@@ -207,7 +219,7 @@ def main():
         axes[row][2].imshow(recon, aspect="auto", origin="upper",
                             cmap="viridis", vmin=vmin, vmax=vmax)
         mse_inj = np.mean(error)
-        axes[row][2].set_title(f"MSE={mse_inj:.3f}", fontsize=9)
+        axes[row][2].set_title(f"MSE={mse_inj:.3f} (signal={mse_signal:.2f})", fontsize=9)
 
         # Col 3: error map
         axes[row][3].imshow(error, aspect="auto", origin="upper",
