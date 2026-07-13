@@ -19,7 +19,7 @@ detections of the same event down to one entry.
 import numpy as np
 import pandas as pd
 
-__all__ = ["cluster_candidates", "on_off_contrast"]
+__all__ = ["cluster_candidates", "on_off_contrast", "full_row_hits"]
 
 
 def _summarize_cluster(cluster_idx: np.ndarray, f_starts: np.ndarray,
@@ -175,3 +175,61 @@ def on_off_contrast(
         result["n_on_hits"] = int((on_row_vals > threshold).sum())
         result["n_off_hits"] = int((off_row_vals > threshold).sum())
     return result
+
+
+def full_row_hits(
+    anomaly_map: np.ndarray,
+    threshold: float,
+    on_rows=(0, 2, 4),
+    off_rows=(1, 3, 5),
+) -> dict:
+    """Row-level ON/OFF hit counts with no column restriction, for short-list
+    volume reduction (separate from ``on_off_contrast``, which still drives
+    plot ranking).
+
+    ``on_off_contrast``'s ``col_window`` is anchored to a single peak column
+    shared by all 6 rows, so a fast or non-linear drifter that shifts columns
+    block-to-block can fall outside the window and be misread as OFF-absent
+    (documented case: a satellite-like chirp visible in all 6 blocks scored
+    ``n_off_hits=0``). This function drops the column restriction entirely —
+    each row's own max over the whole frequency axis — trading that blind
+    spot for a different one (an unrelated OFF-row event anywhere in the
+    snippet's frequency span now also counts as a hit). Used only to decide
+    short-list membership (candidate shown for manual vetting vs. kept in the
+    full CSV only), never for ranking or as a silent discard.
+
+    Short-list rule: ``n_on_hits_full >= 2`` (out of ``len(on_rows)``, mirrors
+    ``on_off_contrast``'s existing per-row hit counting) AND not ``off_leak``,
+    where ``off_leak`` requires >=2 of ``len(off_rows)`` OFF rows to
+    independently clear ``threshold`` (a single OFF hit can be a coincidental
+    unrelated blip; two independent OFF pointings agreeing is not).
+
+    Args:
+        anomaly_map: ``(6, 64)`` map from ``UDMA.anomaly_map`` /
+            ``anomaly_map_components`` for one snippet.
+        threshold: per-cadence detection threshold, same one passed to
+            ``on_off_contrast``.
+        on_rows: grid row indices corresponding to ON-target observations.
+        off_rows: grid row indices corresponding to OFF-target observations.
+
+    Returns:
+        dict with ``n_on_hits_full``, ``n_off_hits_full``, ``off_leak``,
+        ``in_short_list``.
+    """
+    nh, _ = anomaly_map.shape
+    on_idx = [r for r in on_rows if r < nh]
+    off_idx = [r for r in off_rows if r < nh]
+    on_row_max = anomaly_map[on_idx, :].max(axis=1) if on_idx else np.array([])
+    off_row_max = anomaly_map[off_idx, :].max(axis=1) if off_idx else np.array([])
+
+    n_on_hits_full = int((on_row_max > threshold).sum())
+    n_off_hits_full = int((off_row_max > threshold).sum())
+    off_leak = n_off_hits_full >= 2
+    in_short_list = (n_on_hits_full >= 2) and not off_leak
+
+    return {
+        "n_on_hits_full": n_on_hits_full,
+        "n_off_hits_full": n_off_hits_full,
+        "off_leak": off_leak,
+        "in_short_list": in_short_list,
+    }

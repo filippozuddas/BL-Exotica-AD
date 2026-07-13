@@ -41,7 +41,7 @@ sys.path.insert(0, str(ROOT))
 from src.models.autoencoder import build_autoencoder
 from src.data.preprocessing import bandpass_correct, core_transform
 from src.data.torch_dataset import _load_full_obs
-from src.search.candidates import cluster_candidates, on_off_contrast
+from src.search.candidates import cluster_candidates, on_off_contrast, full_row_hits
 
 METHODS = ["recon", "topk", "max", "cadence"]
 MAD_SCALE = 1.4826
@@ -425,6 +425,7 @@ def main():
             if has_amap and len(clusters) > 0:
                 contrasts, on_means, off_means = [], [], []
                 n_on_hits_l, n_off_hits_l = [], []
+                n_on_hits_full_l, n_off_hits_full_l, off_leak_l, in_short_list_l = [], [], [], []
                 for i, (_, crow) in enumerate(clusters.iterrows()):
                     fs_c = int(crow["f_start_peak"])
                     snippet_c = _preprocess_at(fs_c)
@@ -438,11 +439,23 @@ def main():
                     off_means.append(stats["off_mean"])
                     n_on_hits_l.append(stats["n_on_hits"])
                     n_off_hits_l.append(stats["n_off_hits"])
+                    # Short-list volume reduction (full_row_hits, no column
+                    # restriction) — separate from on_off_contrast, which
+                    # still ranks the short-listed candidates for plotting.
+                    fr = full_row_hits(amap_c, threshold=thresh_3)
+                    n_on_hits_full_l.append(fr["n_on_hits_full"])
+                    n_off_hits_full_l.append(fr["n_off_hits_full"])
+                    off_leak_l.append(fr["off_leak"])
+                    in_short_list_l.append(fr["in_short_list"])
                 clusters["on_off_contrast"] = contrasts
                 clusters["on_mean"] = on_means
                 clusters["off_mean"] = off_means
                 clusters["n_on_hits"] = n_on_hits_l
                 clusters["n_off_hits"] = n_off_hits_l
+                clusters["n_on_hits_full"] = n_on_hits_full_l
+                clusters["n_off_hits_full"] = n_off_hits_full_l
+                clusters["off_leak"] = off_leak_l
+                clusters["in_short_list"] = in_short_list_l
 
             clusters.to_csv(cad_dir / f"{method}_candidates.csv", index=False)
 
@@ -454,10 +467,19 @@ def main():
             # drifters that are actually present in every OFF block too
             # (observed on a satellite-like chirp candidate) — always confirm
             # visually, this only re-prioritises what to look at first.
+            #
+            # Volume reduction: before ranking, restrict to in_short_list
+            # (full_row_hits: n_on_hits_full>=2 AND not off_leak). The full
+            # CSV below still has every candidate — this only shrinks what
+            # gets plotted for manual vetting.
             if has_amap and len(clusters) > 0:
-                order = np.argsort(-clusters["on_off_contrast"].to_numpy())
+                short_mask = clusters["in_short_list"].to_numpy()
+                short_idx = np.nonzero(short_mask)[0]
+                order = short_idx[np.argsort(-clusters["on_off_contrast"].to_numpy()[short_idx])]
                 clusters_ranked = clusters.iloc[order].reset_index(drop=True)
                 amaps_by_cluster = [amaps_by_cluster[i] for i in order]
+                print(f"  {method}: {len(order)}/{len(clusters)} candidates "
+                      f"in short list after ON/OFF full-row filter")
             else:
                 clusters_ranked = clusters
 
