@@ -199,19 +199,32 @@ def main():
     os.environ["BL_EXOTICA_RUN_DIR"] = str(run_dir)
     print(f"Run directory: {run_dir}")
 
+    # Only the rank-0 process needs snapshot samples (ReconstructionSnapshot is
+    # rank_zero_only) -- Lightning's DDP subprocess launcher re-executes this
+    # whole script per additional GPU rank, so without this guard every rank
+    # would redundantly pay the cost below. LOCAL_RANK is unset for the
+    # original process (which stays rank 0) and set by the launcher's Popen
+    # env for every spawned child.
+    is_rank_zero = int(os.environ.get("LOCAL_RANK", "0")) == 0
     n_snap = min(4, len(val_ds))
-    if n_snap >= 4:
-        variances = torch.tensor(
-            [val_ds[i].var().item() for i in range(len(val_ds))]
-        )
-        top_idx = int(variances.argmax())
+    if is_rank_zero and n_snap >= 4:
+        # Variance over a random subset, not the full val set: with the real
+        # GBT cache (194k snippets) a full per-item scan through
+        # bandpass_correct+core_transform takes tens of minutes -- long enough
+        # on its own to blow past the DDP rendezvous timeout on multi-GPU runs.
         rng = torch.Generator().manual_seed(42)
-        others = torch.randperm(len(val_ds), generator=rng)
-        others = [int(i) for i in others if int(i) != top_idx][:n_snap - 1]
+        pool_size = min(len(val_ds), 2000)
+        pool = torch.randperm(len(val_ds), generator=rng)[:pool_size].tolist()
+        variances = torch.tensor([val_ds[i].var().item() for i in pool])
+        top_idx = pool[int(variances.argmax())]
+        others = [i for i in pool if i != top_idx][:n_snap - 1]
         snap_indices = [top_idx] + others
+        val_samples = torch.stack([val_ds[i] for i in snap_indices])
+    elif n_snap >= 4:
+        val_samples = None  # non-zero ranks never render snapshots
     else:
         snap_indices = list(range(n_snap))
-    val_samples = torch.stack([val_ds[i] for i in snap_indices])
+        val_samples = torch.stack([val_ds[i] for i in snap_indices])
     if hasattr(val_ds, "close"):
         val_ds.close()
     # UDMA has no pixel decoder (forward() raises) — ReconstructionSnapshot
