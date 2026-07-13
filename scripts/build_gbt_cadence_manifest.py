@@ -238,11 +238,21 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for pool_name in POOLS:
         out_path = args.output_dir / f"gbt_0000_{pool_name}_cadences.txt"
-        rows = df.loc[pool[pool == pool_name].index]
+        row_idx = pool[pool == pool_name].index.to_numpy().copy()
+        # Shuffle before writing: preprocess_cache.py's _plan_split truncates
+        # a manifest in file order once it hits --max-snippets, without
+        # reshuffling. Writing rows in band-grouped order (this df's natural
+        # order) would silently undo the whole point of the stratified split
+        # -- a truncated run would only see the first few sessions/bands
+        # instead of a random cross-section. Found 2026-07-06 when a real
+        # run only touched 62/452 train cadences (7/48 sessions, 28/61 bands,
+        # 10/22 targets) before hitting the snippet cap.
+        rng.shuffle(row_idx)
+        rows = df.loc[row_idx]
         with open(out_path, "w") as f:
             for files in rows["files"]:
                 f.write(files.strip() + "\n")
-        print(f"\nWrote {len(rows)} cadences -> {out_path}")
+        print(f"\nWrote {len(rows)} cadences -> {out_path} (shuffled)")
 
 
 if __name__ == "__main__":
