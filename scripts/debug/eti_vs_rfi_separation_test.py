@@ -154,7 +154,11 @@ def main():
     model = None
     if args.checkpoint is not None:
         print(f"Loading model from {args.checkpoint}")
-        model = load_model(args.checkpoint, model_cfg, args.device, require_encode=True)
+        # UDMA has no encode() (no embedding readout, see udma.py) — the
+        # supervised-probe block below is skipped for it, only the recon
+        # (anomaly_score) block runs.
+        require_encode = model_cfg.get("architecture") != "udma"
+        model = load_model(args.checkpoint, model_cfg, args.device, require_encode=require_encode)
 
     pair = None
     if args.ae_checkpoint is not None:
@@ -209,9 +213,11 @@ def main():
     en_rfi = frame_energy(rfi_frames)
     st_eti = frame_stats(eti_frames)
     st_rfi = frame_stats(rfi_frames)
-    if model is not None:
+    has_encode = model is not None and hasattr(model, "encode")
+    if has_encode:
         emb_eti = embed(model, eti_frames, args.device)
         emb_rfi = embed(model, rfi_frames, args.device)
+    if model is not None:
         rec_eti = recon_score(model, eti_frames, args.device)
         rec_rfi = recon_score(model, rfi_frames, args.device)
     if pair is not None:
@@ -226,7 +232,10 @@ def main():
     if model is None:
         print("\n(no --checkpoint: skipping the supervised-probe and recon blocks)")
         # fall through to the disagreement block
-    if model is not None:
+    elif not has_encode:
+        print(f"\n(model has no encode() — e.g. UDMA — skipping the supervised-probe block, "
+              f"only the recon/anomaly_score block below runs)")
+    if has_encode:
         print(f"\n{'='*72}\nSUPERVISED PROBE (primary) — ETI (ON-only) vs RFI-control (persistent), "
               f"SAME quiet backgrounds, matched energy\n{'='*72}")
         m = morphology_matched_energy(emb_eti, en_eti, st_eti, emb_rfi, en_rfi, st_rfi, seed=args.seed)
@@ -304,9 +313,11 @@ def main():
     out = {"en_eti": en_eti, "en_rfi": en_rfi}
     if model is not None:
         out.update(
-            emb_eti=emb_eti, emb_rfi=emb_rfi, rec_eti=rec_eti, rec_rfi=rec_rfi,
+            rec_eti=rec_eti, rec_rfi=rec_rfi,
             supervised_auc=m.get("embedding", np.nan) if m and "error" not in m else np.nan,
             recon_auc=mr.get("recon", np.nan) if mr and "error" not in mr else np.nan)
+        if has_encode:
+            out.update(emb_eti=emb_eti, emb_rfi=emb_rfi)
     if pair is not None:
         out.update(
             dis_eti=dis_eti, dis_rfi=dis_rfi,
