@@ -1,5 +1,6 @@
 # Outputs — never commit artifacts
 outputs/
+scripts/debug/archive/
 data/processed/
 data/raw/
 
