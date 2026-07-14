@@ -42,6 +42,7 @@ sys.path.insert(0, str(ROOT))
 from src.data.synthetic import NarrowbandParams, NarrowbandDriftingGenerator
 from scripts.debug.injection_vs_rfi_test import preprocess_raw
 from scripts.debug.encode_separation_test import load_model
+from src.utils.visualization import overlay_anomaly_map
 
 INPUT_SHAPE = (96, 1024, 1)
 MAP_KEYS = ("st1", "st2", "ss", "cob")
@@ -123,8 +124,9 @@ def main():
     examples["eti"] = preprocess_raw(eti_raw, preproc)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    fig, axes = plt.subplots(3, 5, figsize=(22, 12))
-    col_titles = ["Input", "map_st1 (AE gap)", "map_st2 (MemAE gap)", "map_ss (disagreement)", "map_cob (fused)"]
+    fig, axes = plt.subplots(3, 6, figsize=(26, 12))
+    col_titles = ["Input", "map_st1 (AE gap)", "map_st2 (MemAE gap)", "map_ss (disagreement)",
+                  "map_cob (fused)", "map_cob (bilinear overlay)"]
     saved = {}
     for row, (name, frame) in enumerate(examples.items()):
         maps = _maps(model, frame, args.device)
@@ -139,6 +141,12 @@ def main():
                 ax.set_ylabel(f"{name}\ntime bin")
             ax.set_xlabel("freq channel" if col == 0 else "freq patch col")
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+        overlay_ax = axes[row, 5]
+        overlay_anomaly_map(overlay_ax, frame, maps["cob"], origin="lower")
+        if row == 0:
+            overlay_ax.set_title(col_titles[5])
+        overlay_ax.set_xlabel("freq channel")
 
     fig.suptitle("UDMA anomaly maps — noise / rfi / eti (qualitative, Q1 smearing check)")
     fig.tight_layout()

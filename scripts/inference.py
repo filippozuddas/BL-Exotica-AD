@@ -42,6 +42,7 @@ from src.models.autoencoder import build_autoencoder
 from src.data.preprocessing import bandpass_correct, core_transform
 from src.data.torch_dataset import _load_full_obs
 from src.search.candidates import cluster_candidates, on_off_contrast, full_row_hits
+from src.utils.visualization import overlay_anomaly_map
 
 METHODS = ["recon", "topk", "max", "cadence"]
 MAD_SCALE = 1.4826
@@ -191,7 +192,8 @@ def plot_candidate(original, reconstruction, score, sigma, method, cad_idx,
         axes[1].set_xlabel("Freq patch col")
         axes[1].set_ylabel("Time patch row")
         plt.colorbar(im1, ax=axes[1], fraction=0.046)
-        axes[2].axis("off")
+        overlay_anomaly_map(axes[2], original, anomaly_map,
+                             title="anomaly_map (bilinear overlay)")
 
     f_center_mhz = f_start * df / 1e6
     fig.suptitle(

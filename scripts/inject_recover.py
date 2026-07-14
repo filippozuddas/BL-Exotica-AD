@@ -51,6 +51,7 @@ from src.models.autoencoder import build_autoencoder
 from src.data.preprocessing import bandpass_correct, core_transform
 from src.data.torch_dataset import _load_full_obs
 from src.data.synthetic import NarrowbandParams, NarrowbandDriftingGenerator
+from src.utils.visualization import overlay_anomaly_map
 
 INPUT_SHAPE = (96, 1024, 1)
 DEFAULT_METHODS = ["recon", "cadence"]
@@ -568,7 +569,8 @@ def main():
             amap = model.anomaly_map(x_inj)[0].cpu().numpy()
             axes[1, 1].imshow(amap, aspect="auto", origin="upper", cmap="viridis")
             axes[1, 1].set_title("anomaly_map (UDMA, native (nh,nw) grid)")
-            axes[1, 2].axis("off")
+            overlay_anomaly_map(axes[1, 2], snip_inj, amap,
+                                title="anomaly_map (bilinear overlay)")
 
         diff = np.abs(snip_inj - snip_clean)
         axes[0, 1].imshow(diff, aspect="auto", origin="upper", cmap="hot")
