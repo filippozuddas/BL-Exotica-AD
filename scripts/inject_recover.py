@@ -73,10 +73,11 @@ def robust_stats(scores):
     return median, mad * MAD_SCALE
 
 
-def score_snippet(model, snippet, method, device):
+def score_snippet(model, snippet, method, device, topk_frac=None):
     x = torch.from_numpy(snippet).float().unsqueeze(0).unsqueeze(0).to(device)
+    kwargs = {"topk_frac": topk_frac} if method == "topk" and topk_frac is not None else {}
     with torch.no_grad():
-        s = model.anomaly_score(x, method=method)
+        s = model.anomaly_score(x, method=method, **kwargs)
     return float(s.item())
 
 
@@ -137,6 +138,10 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--methods", nargs="+", default=None,
                    help="Scoring methods to test (default: all supported by model)")
+    p.add_argument("--topk_frac", type=float, default=None,
+                   help="Override the model's configured topk_frac for method=topk "
+                        "(e.g. 0.005 -> k~2/384 grid positions for UDMA). Default: "
+                        "use the model's own config value.")
     return p.parse_args()
 
 
@@ -181,6 +186,8 @@ def main():
             except (ValueError, AttributeError):
                 print(f"  (skipping unsupported method '{m}' for this model)")
     print(f"  Methods: {methods}")
+    if args.topk_frac is not None:
+        print(f"  topk_frac override: {args.topk_frac}")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -223,7 +230,7 @@ def main():
         for fs in probe_fstarts:
             snip = preprocess_raw_window(obs_arrays, fs, fchans, preproc)
             for m in methods:
-                probe_scores[m].append(score_snippet(model, snip, m, args.device))
+                probe_scores[m].append(score_snippet(model, snip, m, args.device, args.topk_frac))
         probe_scores = {m: np.array(v) for m, v in probe_scores.items()}
 
         for m in methods:
@@ -262,7 +269,7 @@ def main():
                 snip_inj = preprocess_injected(raw_inj, preproc)
 
                 for m in methods:
-                    s = score_snippet(model, snip_inj, m, args.device)
+                    s = score_snippet(model, snip_inj, m, args.device, args.topk_frac)
                     all_results[m][snr].append(s)
                     cad_inj[m][snr].append(s)
 
@@ -531,7 +538,7 @@ def main():
 
         method_scores = {}
         for m in methods:
-            method_scores[m] = score_snippet(model, snip_inj, m, args.device)
+            method_scores[m] = score_snippet(model, snip_inj, m, args.device, args.topk_frac)
 
         fig, axes = plt.subplots(2, 3, figsize=(18, 10))
         vmin, vmax = np.percentile(snip_clean, [1, 99])
