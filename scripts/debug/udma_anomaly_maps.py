@@ -134,7 +134,7 @@ def main():
         panels = [frame] + [maps[k] for k in MAP_KEYS]
         for col, (img, title) in enumerate(zip(panels, col_titles)):
             ax = axes[row, col]
-            im = ax.imshow(img, aspect="auto", origin="lower", interpolation="nearest")
+            im = ax.imshow(img, aspect="auto", origin="upper", interpolation="nearest")
             if row == 0:
                 ax.set_title(title)
             if col == 0:
@@ -143,7 +143,7 @@ def main():
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
         overlay_ax = axes[row, 5]
-        overlay_anomaly_map(overlay_ax, frame, maps["cob"], origin="lower")
+        overlay_anomaly_map(overlay_ax, frame, maps["cob"], origin="upper")
         if row == 0:
             overlay_ax.set_title(col_titles[5])
         overlay_ax.set_xlabel("freq channel")
