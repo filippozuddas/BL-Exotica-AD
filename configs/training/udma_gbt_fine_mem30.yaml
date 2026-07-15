@@ -1,0 +1,35 @@
+# UDMA training config — memory-capacity experiment (Fase 1, 2026-07-15).
+#
+# Twin of udma_gbt_fine_control_bs256.yaml (the newT-bs256 control recipe,
+# batch256/lr1e-3/60 epochs) pointed at the mem_slots=30 model config instead
+# of udma.yaml (mem_slots=500). Only model: differs — same data, same
+# schedule, same seed, so any change in detection is attributable to the
+# memory-capacity restriction alone.
+#
+# See docs/2026-07-14_paper_alignment_plan.md, Fase 1 (D3, D4, D12).
+
+data: configs/data/gbt_fine.yaml
+model: configs/model/udma_mem30.yaml
+
+training:
+  batch_size: 256
+  epochs: 60
+  learning_rate: 1.0e-3
+  optimizer: adamw
+  weight_decay: 0.01
+  loss: mse            # unused by UDMA (its own compute_loss owns the objective); kept for schema parity
+  seed: 42
+
+  # Early stopping on S-T regression quality only (see UDMA.compute_loss's
+  # "st_sum" = st1+st2, logged as val_st_sum) — NOT val_loss, which also
+  # contains the ss/entropy terms that a degenerate student pair could game.
+  patience: 8
+  min_delta: 1.0e-5
+  monitor: val_st_sum
+
+hardware:
+  num_gpus: 2
+  mixed_precision: true  # bf16-mixed; the frozen ViT teacher has no BatchNorm, LayerNorm is fine in bf16
+  num_workers: 16
+
+output_dir: outputs

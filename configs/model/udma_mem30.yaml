@@ -1,0 +1,54 @@
+# UDMA model config — memory-capacity experiment (Fase 1, 2026-07-15).
+#
+# Tests whether restricting the MemAE-student's memory bank reopens the
+# student disagreement collapsed by the domain-matched teacher (paper §VI:
+# the memory exists to "limit the learning capacity of the student network,
+# thereby increasing the difference between the outputs of the student
+# network and the teacher network on anomalous samples"). Our N=500 slots
+# (vs the paper's Park-2020 M=10-50) may be orders of magnitude too
+# expressive to act as a capacity bottleneck.
+#
+# Single-variable change from udma.yaml: mem_slots 500 -> 30,
+# shrink_threshold 0.002 (=1/500) -> 0.0333 (=1/30, default hard-shrinkage
+# ratio). Teacher (checkpoint + norm_stats), loss weights, scoring, encoder
+# filters and everything else are identical to udma.yaml.
+#
+# See docs/2026-07-14_paper_alignment_plan.md, Fase 1 (D3, D4, D12).
+
+architecture: udma
+
+# --- Teacher (frozen, Q1) --- identical to udma.yaml
+teacher:
+  checkpoint: outputs/training/20260709_205938_4b5660c/checkpoints/epoch=094-val_loss=2.1740.ckpt
+  vit_config: configs/model/vit_mae.yaml
+  teacher_layer: 3
+  norm_stats: outputs/udma_teacher_norm/gbt_fine_exotica_block3_ep094.pt
+
+# --- Students (from-scratch trunk, Q3) ---
+student:
+  encoder:
+    filters: [32, 64, 128, 256]
+    convs_per_block: 2
+    kernel_size: [3, 3]
+    activation: relu
+    use_batchnorm: true
+  bottleneck:
+    latent_dim: 64
+  head_hidden: 128
+  head_context_convs: 2
+  # Fase 1 single variable: capacity-restricted memory bank (paper/Gong 2019
+  # default M/shrink ratio), down from udma.yaml's mem_slots=500/shrink=0.002.
+  mem_slots: 30
+  shrink_threshold: 0.0333
+
+# --- Loss (Q4) --- identical to udma.yaml
+loss:
+  lambda1: 1.0
+  lambda2: 1.0
+  lambda3: 1.0
+  entropy_weight: 2.0e-4
+
+# --- Scoring (Q5) --- identical to udma.yaml
+scoring:
+  weights: [0.5, 0.5, 0.5]
+  topk_frac: 0.02
