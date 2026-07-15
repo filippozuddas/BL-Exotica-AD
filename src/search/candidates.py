@@ -19,7 +19,56 @@ detections of the same event down to one entry.
 import numpy as np
 import pandas as pd
 
-__all__ = ["cluster_candidates", "on_off_contrast", "full_row_hits"]
+__all__ = ["cluster_candidates", "on_off_contrast", "full_row_hits", "off_noise_ceiling"]
+
+
+def off_noise_ceiling(
+    off_values: np.ndarray,
+    quantile: float = 0.999,
+    n_clip_iters: int = 5,
+    clip_sigma: float = 3.0,
+) -> float:
+    """Robust per-cadence detection ceiling from pooled OFF-row cell values.
+
+    A cadence's OFF-target rows carry no target signal by construction, so
+    they are the natural reference for a per-cadence ceiling — any high value
+    there is either noise fluctuation or RFI, never a real detection. A raw
+    high quantile of the pooled OFF values is dominated by the RFI tail
+    (hand-validated on cad02: raw quantile ~31 vs. a Gaussian 3σ threshold of
+    0.16 buried in the noise floor — the RFI tail, not the noise core, sets
+    the raw quantile). This instead iteratively 3σ-clips (median/MAD, same
+    scheme as ``bandpass_correct``) to isolate the noise core, then takes
+    ``quantile`` of the surviving core — replacing the Gaussian
+    ``median + 3*MAD_sigma`` threshold, which is pulled down by the same RFI
+    contamination it's supposed to be robust against once RFI dominates the
+    pool (thresh_3 = 0.16 on cad02, an order of magnitude below the real
+    noise ceiling of ~0.9).
+
+    Args:
+        off_values: 1-D array of anomaly-map cell values pooled from OFF rows
+            (e.g. rows 1, 3, 5 of a UDMA ``(6, 64)`` map) across every scored
+            snippet of one cadence.
+        quantile: quantile of the clipped noise core used as the ceiling.
+        n_clip_iters: max sigma-clipping iterations (stops early on
+            convergence, i.e. no further points removed).
+        clip_sigma: clipping width in robust MAD-sigma units.
+
+    Returns:
+        The ceiling value (float), to be used in place of a pooled Gaussian
+        threshold for per-cadence candidate selection.
+    """
+    values = np.asarray(off_values, dtype=np.float64)
+    mask = np.ones(len(values), dtype=bool)
+    for _ in range(n_clip_iters):
+        median = np.median(values[mask])
+        mad_sigma = np.median(np.abs(values[mask] - median)) * 1.4826
+        if mad_sigma == 0.0:
+            break
+        new_mask = np.abs(values - median) <= clip_sigma * mad_sigma
+        if new_mask.sum() == mask.sum():
+            break
+        mask = new_mask
+    return float(np.quantile(values[mask], quantile))
 
 
 def _summarize_cluster(cluster_idx: np.ndarray, f_starts: np.ndarray,
