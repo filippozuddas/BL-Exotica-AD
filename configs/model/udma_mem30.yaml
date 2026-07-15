@@ -36,8 +36,13 @@ student:
     latent_dim: 64
   head_hidden: 128
   head_context_convs: 2
-  # Fase 1 single variable: capacity-restricted memory bank (paper/Gong 2019
-  # default M/shrink ratio), down from udma.yaml's mem_slots=500/shrink=0.002.
+  # Fase 1 single variable: capacity-restricted memory bank, down from
+  # udma.yaml's mem_slots=500/shrink=0.002. shrink_threshold=1/N is Gong et
+  # al. 2019's own hard-shrinkage default (lambda range [1/N, 3/N], low end);
+  # the UDMA paper (Qi et al. 2024) cites Gong specifically for this formula
+  # (Eq. 13, ref [9]) even though its memory addressing otherwise follows
+  # Park 2020's cosine similarity (ref [10], Eq. 10) — two different papers
+  # for two different pieces of the mechanism, not a single "UDMA default".
   mem_slots: 30
   shrink_threshold: 0.0333
 
