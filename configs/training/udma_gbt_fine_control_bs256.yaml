@@ -1,0 +1,38 @@
+# UDMA control run (2026-07-13): isolates whether the batch512/lr2e-3 change
+# in udma_gbt_fine.yaml (vs. the original batch256/lr1e-3) is responsible for
+# the regression seen in encode_separation_test.py / eti_vs_rfi_separation_test.py
+# / inject_recover.py on the 20260711_110604_4b5660c run (retrained teacher,
+# epoch=094-val_loss=2.1740) relative to the prior student run
+# (20260707_093113_6d0d1ba, old teacher, batch256/lr1e-3).
+#
+# Only training.batch_size/learning_rate differ from udma_gbt_fine.yaml — same
+# new teacher checkpoint (via model: configs/model/udma.yaml), same data,
+# same schedule. If this run recovers the old detection margins, the batch/lr
+# change was the cause; if it stays weak, the retrained teacher/normalization
+# is implicated instead.
+
+data: configs/data/gbt_fine.yaml
+model: configs/model/udma.yaml
+
+training:
+  batch_size: 256
+  epochs: 60
+  learning_rate: 1.0e-3
+  optimizer: adamw
+  weight_decay: 0.01
+  loss: mse            # unused by UDMA (its own compute_loss owns the objective); kept for schema parity
+  seed: 42
+
+  # Early stopping on S-T regression quality only (see UDMA.compute_loss's
+  # "st_sum" = st1+st2, logged as val_st_sum) — NOT val_loss, which also
+  # contains the ss/entropy terms that a degenerate student pair could game.
+  patience: 8
+  min_delta: 1.0e-5
+  monitor: val_st_sum
+
+hardware:
+  num_gpus: 2
+  mixed_precision: true  # bf16-mixed; the frozen ViT teacher has no BatchNorm, LayerNorm is fine in bf16
+  num_workers: 16
+
+output_dir: outputs

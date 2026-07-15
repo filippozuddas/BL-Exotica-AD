@@ -1,0 +1,50 @@
+# UDMA model config — OLD teacher variant (2026-07-13 control experiment).
+#
+# Isolates the last untested variable in the UDMA regression investigation:
+# the 20260707_093113_6d0d1ba student run (batch256/lr1e-3, this teacher) is
+# our only fully-validated UDMA, but its TRAINING data used the pre-fix
+# concat-then-normalize preprocessing (real ON/OFF power steps could survive
+# as spurious contrast). We've only ever tested this teacher/norm_stats pair
+# with the FIXED preprocessing at inference (udma_anomaly_maps.py, clean
+# localization) -- never trained students on it. This config re-trains
+# students on the old (known-good) teacher, but with the current (fixed)
+# preprocessing code, to separate "teacher identity" from "preprocessing bug
+# as an accidental training signal" as the source of the old run's health.
+#
+# Everything below is identical to udma.yaml except the teacher: block.
+
+architecture: udma
+
+teacher:
+  # Original teacher checkpoint (pre-retrain), same one used by the
+  # 20260707_093113_6d0d1ba run and by docs/2026-07-05_udma_design_spec.md Q1.
+  checkpoint: outputs/training/20260624_084754_057f87c/checkpoints/epoch=006-val_loss=2.1715.ckpt
+  vit_config: configs/model/vit_mae.yaml
+  teacher_layer: 3
+  # Original norm_stats fit (2026-07-07) for this teacher -- NOT the
+  # ep094 refit (that one belongs to the retrained teacher above).
+  norm_stats: outputs/udma_teacher_norm/gbt_fine_exotica_block3.pt
+
+student:
+  encoder:
+    filters: [32, 64, 128, 256]
+    convs_per_block: 2
+    kernel_size: [3, 3]
+    activation: relu
+    use_batchnorm: true
+  bottleneck:
+    latent_dim: 64
+  head_hidden: 128
+  head_context_convs: 2
+  mem_slots: 500
+  shrink_threshold: 0.002
+
+loss:
+  lambda1: 1.0
+  lambda2: 1.0
+  lambda3: 1.0
+  entropy_weight: 2.0e-4
+
+scoring:
+  weights: [0.5, 0.5, 0.5]
+  topk_frac: 0.02

@@ -1,0 +1,39 @@
+# UDMA training config — old teacher + fixed preprocessing (2026-07-13 control).
+#
+# Isolates whether the 20260707_093113_6d0d1ba run's health came from the
+# teacher itself (057f87c/epoch006) or was partly an artifact of training on
+# the pre-fix concat-then-normalize preprocessing (real ON/OFF power steps
+# survived as spurious contrast). Same teacher/norm_stats/batch/lr as that
+# run, but on the current (fixed, per-observation) preprocessing code in
+# src/data/torch_dataset.py -- no config flag for that, it's just the code
+# already in the repo (commit 4b5660c).
+#
+# If this run reproduces the 6d0d1ba health (clean udma_anomaly_maps
+# localization, val_ss/val_entropy stable like 6d0d1ba, not drifting like the
+# two teacher_ep094 runs) -> the old teacher is genuinely good and the
+# preprocessing bug wasn't load-bearing for its quality. If it instead drifts
+# like the ep094 runs -> the preprocessing bug itself was somehow helping the
+# old run, which would be a much stranger result worth its own investigation.
+
+data: configs/data/gbt_fine.yaml
+model: configs/model/udma_old_teacher.yaml
+
+training:
+  batch_size: 256
+  epochs: 60
+  learning_rate: 1.0e-3
+  optimizer: adamw
+  weight_decay: 0.01
+  loss: mse            # unused by UDMA (its own compute_loss owns the objective); kept for schema parity
+  seed: 42
+
+  patience: 8
+  min_delta: 1.0e-5
+  monitor: val_st_sum
+
+hardware:
+  num_gpus: 2
+  mixed_precision: true
+  num_workers: 16
+
+output_dir: outputs/training/
