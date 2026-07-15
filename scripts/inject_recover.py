@@ -64,6 +64,7 @@ logger = logging.getLogger("inject_recover")
 def setup_logging(out_dir: Path) -> None:
     """Tee all `log()` output to both stdout and <out_dir>/run.log."""
     logger.setLevel(logging.INFO)
+    logger.propagate = False
     logger.handlers.clear()
     fmt = logging.Formatter("%(message)s")
     stream_handler = logging.StreamHandler(sys.stdout)
