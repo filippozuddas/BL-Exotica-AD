@@ -36,7 +36,13 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from src.data.preprocessing import bandpass_correct, core_transform
+from src.data.synthetic import NarrowbandDriftingGenerator, NarrowbandParams
 from src.models.autoencoder import build_autoencoder
+
+# Bare dataclass defaults match configs/data/gbt_fine.yaml exactly (geometry +
+# narrowband sampling ranges) -- the only product these debug scripts inject
+# into -- so no config file needs loading here.
+_NB_PARAMS = NarrowbandParams()
 
 
 def load_model(checkpoint_path: Path, model_config: dict, device: str = "cpu"):
@@ -52,84 +58,57 @@ def load_model(checkpoint_path: Path, model_config: dict, device: str = "cpu"):
 
 
 def preprocess_raw(raw_snippet: np.ndarray, cfg_preproc: dict) -> np.ndarray:
-    """(n_obs, tchans_per_obs, fchans) raw -> (tchans, fchans) preprocessed."""
+    """(n_obs, tchans_per_obs, fchans) raw -> (tchans, fchans) preprocessed.
+
+    Matches CachedDataset/SpectrogramDataset (src/data/torch_dataset.py,
+    commit 4b5660c): bandpass_correct + core_transform applied per
+    observation, THEN concatenated -- not on the pre-concatenated frame.
+    Concatenating first lets a real ON/OFF power step between observations
+    survive as spurious cross-block contrast.
+    """
     method = cfg_preproc.get("bandpass_method", "polynomial")
     poly_degree = cfg_preproc.get("poly_degree", 3)
     mad_epsilon = cfg_preproc.get("mad_epsilon", 1e-6)
-    frame = np.concatenate(raw_snippet, axis=0)
-    frame = bandpass_correct(frame, method=method, poly_degree=poly_degree)
-    frame = core_transform(frame, mad_epsilon)
+    normed = [
+        core_transform(bandpass_correct(obs, method=method, poly_degree=poly_degree), mad_epsilon)
+        for obs in raw_snippet
+    ]
+    frame = np.concatenate(normed, axis=0)
     return frame.astype(np.float32)
 
 
 def inject_narrowband(raw_snippet: np.ndarray, snr: float = 25.0,
                       drift_rate: float = 0.3, seed: int = 42) -> np.ndarray:
-    """Inject a narrowband drifting signal into raw data (before preprocessing).
+    """Inject a narrowband drifting signal into raw data (before preprocessing),
+    via setigen (``NarrowbandDriftingGenerator.inject_signal`` on the
+    concatenated frame) — spans the whole cadence continuously, no ON/OFF
+    distinction (see ``inject_narrowband_on_only`` for the ON-only variant that
+    mimics a real technosignature)."""
+    raw = np.asarray(raw_snippet, dtype=float)
+    n_obs, tchans_per_obs, fchans = raw.shape
+    frame = np.concatenate(raw, axis=0)  # (n_obs*tchans_per_obs, fchans)
 
-    Adds a simple Gaussian-profile drifting line directly in raw power space.
-    This avoids setigen dependency and works on the concatenated raw frame.
-    """
-    rng = np.random.default_rng(seed)
-    raw = raw_snippet.copy()
-    # Concatenate observations for injection
-    frame = np.concatenate(raw, axis=0)  # (96, 1024)
-    tchans, fchans = frame.shape
+    gen = NarrowbandDriftingGenerator(_NB_PARAMS, seed=seed)
+    out_frame, _ = gen.inject_signal(frame, snr=snr, drift_rate=drift_rate)
 
-    noise_std = np.median(np.abs(frame - np.median(frame))) * 1.4826
-    signal_amplitude = snr * noise_std
-
-    start_chan = rng.integers(100, fchans - 100)
-    width_chans = 3.0  # ~8 Hz at 2.79 Hz/chan
-
-    dt = 18.25361108
-    df = 2.7939677238464355
-    drift_chans_per_bin = (drift_rate * dt) / df
-
-    for t in range(tchans):
-        center = start_chan + t * drift_chans_per_bin
-        chans = np.arange(fchans)
-        profile = signal_amplitude * np.exp(-0.5 * ((chans - center) / width_chans) ** 2)
-        frame[t] += profile
-
-    # Split back into observations
-    n_obs = raw.shape[0]
-    tchans_per_obs = raw.shape[1]
     result = np.zeros_like(raw)
     for i in range(n_obs):
-        result[i] = frame[i * tchans_per_obs:(i + 1) * tchans_per_obs]
-    return result
+        result[i] = out_frame[i * tchans_per_obs:(i + 1) * tchans_per_obs]
+    return result.astype(np.float32)
 
 
 def inject_narrowband_on_only(raw_snippet: np.ndarray, snr: float = 25.0,
                               drift_rate: float = 0.3, seed: int = 42) -> np.ndarray:
-    """Inject narrowband signal into ON observations only (obs 0, 2, 4).
-
-    This mimics a real technosignature: present in ON pointings, absent in OFF.
-    The MAE should NOT be able to predict ON-only structure from OFF observations.
+    """Inject a narrowband signal into ON observations only (obs 0, 2, 4), via
+    setigen (``NarrowbandDriftingGenerator.inject_signal_cadence``): a single
+    coherent drift track spanning the whole cadence (correct drift phase across
+    the real elapsed OFF-observation time too), rendered only into the ON
+    frames — OFF frames come back byte-identical, exactly as a real
+    technosignature would vanish off-source.
     """
-    rng = np.random.default_rng(seed)
-    raw = raw_snippet.copy()
-    n_obs, tchans_per_obs, fchans = raw.shape
-
-    noise_std = np.median(np.abs(raw - np.median(raw))) * 1.4826
-    signal_amplitude = snr * noise_std
-
-    start_chan = rng.integers(100, fchans - 100)
-    width_chans = 3.0
-
-    dt = 18.25361108
-    df = 2.7939677238464355
-    drift_chans_per_bin = (drift_rate * dt) / df
-
-    on_obs = [0, 2, 4]  # ON observations in ABACAD cadence
-    for obs_idx in on_obs:
-        global_t_start = obs_idx * tchans_per_obs
-        for t in range(tchans_per_obs):
-            center = start_chan + (global_t_start + t) * drift_chans_per_bin
-            chans = np.arange(fchans)
-            profile = signal_amplitude * np.exp(-0.5 * ((chans - center) / width_chans) ** 2)
-            raw[obs_idx, t] += profile
-    return raw
+    gen = NarrowbandDriftingGenerator(_NB_PARAMS, seed=seed)
+    out, _ = gen.inject_signal_cadence(raw_snippet, snr=snr, drift_rate=drift_rate)
+    return out
 
 
 def compute_error_map(model, snippet: np.ndarray, device: str = "cpu") -> np.ndarray:

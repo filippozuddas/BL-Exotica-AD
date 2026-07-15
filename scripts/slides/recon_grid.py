@@ -13,7 +13,7 @@ Usage:
         --cache     /path/to/cache_gbt_fine \\
         --ae_checkpoint     outputs/<run>/checkpoints/best.ckpt \\
         --vitmae_checkpoint outputs/<run>/checkpoints/best.ckpt \\
-        --snr_eti 20 --drift_rate 0.3 --width_chans 1.0 \\
+        --snr_eti 20 --drift_rate 0.3 \\
         --out_dir outputs/slides
 """
 
@@ -32,7 +32,13 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from src.data.preprocessing import bandpass_correct, core_transform
+from src.data.synthetic import NarrowbandDriftingGenerator, NarrowbandParams
 from src.models.autoencoder import build_autoencoder
+
+# Bare dataclass defaults match configs/data/gbt_fine.yaml exactly (geometry +
+# narrowband sampling ranges) -- the only product this script injects into --
+# so no config file needs loading here.
+_NB_PARAMS = NarrowbandParams()
 
 
 # --------------------------------------------------------------------------- #
@@ -147,47 +153,27 @@ def select_snippets(
 def _inject_narrowband_on_only(
     raw_obs: np.ndarray,
     preproc_cfg: dict,
-    raw_cfg: dict,
     snr: float,
     drift_rate: float,
-    width_chans: float,
     on_obs: tuple,
     seed: int,
 ) -> np.ndarray:
-    """Inject a drifting narrowband signal in ON observations only.
+    """Inject a drifting narrowband signal in ON observations only, via setigen
+    (``NarrowbandDriftingGenerator.inject_signal_cadence``).
 
     raw_obs : (n_obs, tchans_per_obs, fchans) — raw un-preprocessed
-    Returns  : preprocessed (tchans, fchans) float32 with signal injected
+    Returns : preprocessed (tchans, fchans) float32 with signal injected
 
-    The signal drifts continuously (global time index) so the track is coherent
-    across ON observations even though OFF observations carry no signal.
+    A single coherent drift track spans the whole cadence (correct drift phase
+    across the real elapsed OFF-observation time too), rendered only into
+    ``on_obs`` frames — OFF frames come back byte-identical.
     """
-    rng  = np.random.default_rng(seed)
-    raw  = raw_obs.copy().astype(float)
-    n_obs, tchans_per_obs, fchans = raw.shape
+    gen = NarrowbandDriftingGenerator(_NB_PARAMS, seed=seed)
+    raw_inj, _ = gen.inject_signal_cadence(
+        raw_obs, on_indices=on_obs, snr=snr, drift_rate=drift_rate,
+    )
 
-    noise_std        = np.median(np.abs(raw - np.median(raw))) * 1.4826
-    signal_amplitude = snr * noise_std
-
-    margin     = max(50, int(fchans * 0.10))
-    start_chan = float(rng.integers(margin, fchans - margin))
-
-    dt = raw_cfg["dt"]   # s / time-bin
-    df = raw_cfg["df"]   # Hz / channel
-    drift_chans_per_bin = (drift_rate * dt) / df
-    chans = np.arange(fchans, dtype=float)
-
-    for obs_idx in on_obs:
-        global_t0 = obs_idx * tchans_per_obs
-        for t in range(tchans_per_obs):
-            center  = start_chan + (global_t0 + t) * drift_chans_per_bin
-            profile = signal_amplitude * np.exp(
-                -0.5 * ((chans - center) / width_chans) ** 2
-            )
-            raw[obs_idx, t] += profile
-
-    # Preprocess after injection
-    frame = np.concatenate(raw, axis=0).astype(np.float32)
+    frame = np.concatenate(raw_inj, axis=0).astype(np.float32)
     frame = bandpass_correct(frame,
                              method=preproc_cfg.get("bandpass_method", "polynomial"),
                              poly_degree=preproc_cfg.get("poly_degree", 3))
@@ -209,11 +195,9 @@ def make_examples(
     model: torch.nn.Module,
     raw_snippets: dict,
     preproc_cfg: dict,
-    raw_cfg: dict,
     device: str,
     snr_eti: float,
     drift_rate: float,
-    width_chans: float,
     on_obs: tuple,
     seed: int,
 ) -> list:
@@ -226,8 +210,8 @@ def make_examples(
         examples.append((label, snippet, recon, (snippet - recon) ** 2))
 
     snippet_eti = _inject_narrowband_on_only(
-        raw_snippets["clean2"], preproc_cfg, raw_cfg,
-        snr=snr_eti, drift_rate=drift_rate, width_chans=width_chans,
+        raw_snippets["clean2"], preproc_cfg,
+        snr=snr_eti, drift_rate=drift_rate,
         on_obs=on_obs, seed=seed,
     )
     recon_eti = _reconstruct(model, snippet_eti, device)
@@ -324,8 +308,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--snr_eti",     type=float, default=20.0)
     p.add_argument("--drift_rate",  type=float, default=0.3,
                    help="ETI drift rate in Hz/s")
-    p.add_argument("--width_chans", type=float, default=1.0,
-                   help="ETI Gaussian half-width in channels (default: 1.0)")
     p.add_argument("--on_obs",  default="0,2,4",
                    help="Comma-separated ON observation indices (default: 0,2,4)")
     p.add_argument("--out_dir", type=Path, default=ROOT / "outputs/slides")
@@ -344,7 +326,6 @@ def main() -> None:
     with open(args.data_config) as f:
         data_cfg = yaml.safe_load(f)
     preproc_cfg = data_cfg["preprocessing"]
-    raw_cfg     = data_cfg["raw"]
     on_obs      = tuple(int(x) for x in args.on_obs.split(","))
 
     print(f"\nSelecting snippets from {args.cache} ({args.split}) …")
@@ -367,9 +348,9 @@ def main() -> None:
         model = _load_model(ckpt_path, model_cfg, args.device)
         print(f"[{name}] building examples …")
         examples = make_examples(
-            model, raw_snippets, preproc_cfg, raw_cfg, args.device,
+            model, raw_snippets, preproc_cfg, args.device,
             snr_eti=args.snr_eti, drift_rate=args.drift_rate,
-            width_chans=args.width_chans, on_obs=on_obs, seed=args.seed,
+            on_obs=on_obs, seed=args.seed,
         )
         plot_grid(examples, name, args.out_dir / f"recon_grid_{tag}.png")
 
