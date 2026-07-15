@@ -33,6 +33,7 @@ Usage (run on the server):
 
 import argparse
 import csv
+import logging
 import sys
 import time
 from pathlib import Path
@@ -56,6 +57,25 @@ from src.utils.visualization import overlay_anomaly_map
 INPUT_SHAPE = (96, 1024, 1)
 DEFAULT_METHODS = ["recon", "cadence"]
 MAD_SCALE = 1.4826
+
+logger = logging.getLogger("inject_recover")
+
+
+def setup_logging(out_dir: Path) -> None:
+    """Tee all `log()` output to both stdout and <out_dir>/run.log."""
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    fmt = logging.Formatter("%(message)s")
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(fmt)
+    file_handler = logging.FileHandler(out_dir / "run.log", mode="w")
+    file_handler.setFormatter(fmt)
+    logger.addHandler(stream_handler)
+    logger.addHandler(file_handler)
+
+
+def log(msg: str = "") -> None:
+    logger.info(msg)
 
 
 def load_model(checkpoint_path: Path, model_config: dict, device: str):
@@ -148,6 +168,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    setup_logging(args.out_dir)
     rng = np.random.default_rng(args.seed)
 
     with open(args.data_config) as f:
@@ -172,7 +194,7 @@ def main():
     if args.max_cadences:
         cadence_lines = cadence_lines[:args.max_cadences]
 
-    print(f"\nLoading model from {args.checkpoint}")
+    log(f"\nLoading model from {args.checkpoint}")
     model = load_model(args.checkpoint, model_cfg, args.device)
 
     if args.methods is not None:
@@ -185,12 +207,10 @@ def main():
                 model.anomaly_score(dummy, method=m)
                 methods.append(m)
             except (ValueError, AttributeError):
-                print(f"  (skipping unsupported method '{m}' for this model)")
-    print(f"  Methods: {methods}")
+                log(f"  (skipping unsupported method '{m}' for this model)")
+    log(f"  Methods: {methods}")
     if args.topk_frac is not None:
-        print(f"  topk_frac override: {args.topk_frac}")
-
-    args.out_dir.mkdir(parents=True, exist_ok=True)
+        log(f"  topk_frac override: {args.topk_frac}")
 
     # Collect results across all cadences
     all_results = {m: {snr: [] for snr in args.snr_list} for m in methods}
@@ -207,9 +227,9 @@ def main():
 
     for cad_idx, obs_paths in enumerate(cadence_lines):
         obs_paths = [Path(p) for p in obs_paths]
-        print(f"\n{'='*70}")
-        print(f"Cadence {cad_idx} ({len(obs_paths)} obs)")
-        print(f"{'='*70}")
+        log(f"\n{'='*70}")
+        log(f"Cadence {cad_idx} ({len(obs_paths)} obs)")
+        log(f"{'='*70}")
 
         obs_arrays = []
         try:
@@ -217,11 +237,11 @@ def main():
                 arr = _load_full_obs(obs_path, downsample_factor)
                 obs_arrays.append(arr)
         except OSError as e:
-            print(f"  SKIPPING — corrupt file: {e}")
+            log(f"  SKIPPING — corrupt file: {e}")
             del obs_arrays
             continue
         nchans = obs_arrays[0].shape[1]
-        print(f"  Loaded {len(obs_arrays)} obs, nchans={nchans}")
+        log(f"  Loaded {len(obs_arrays)} obs, nchans={nchans}")
 
         # Full random probe: builds the RFI-inclusive background AND
         # (via the recon score) identifies quiet windows for injection sites.
@@ -242,7 +262,7 @@ def main():
         recon_probe = probe_scores["recon"]
         quiet_mask = recon_probe <= np.median(recon_probe)
         quiet_fstarts = probe_fstarts[quiet_mask]
-        print(f"  Probed {n_probe} windows (background), "
+        log(f"  Probed {n_probe} windows (background), "
               f"{quiet_mask.sum()} quiet (recon <= {np.median(recon_probe):.4f})")
 
         injection_fstarts = rng.choice(quiet_fstarts,
@@ -279,12 +299,12 @@ def main():
                 inj_by_cad[m][snr].append(np.array(cad_inj[m][snr]))
 
         del obs_arrays
-        print(f"  Done cadence {cad_idx}")
+        log(f"  Done cadence {cad_idx}")
 
     # ---- Build RFI-inclusive background from the aggregated probe ----
-    print(f"\n{'='*70}")
-    print(f"RFI-INCLUSIVE BACKGROUND (from {len(cadence_lines)} cadences)")
-    print(f"{'='*70}")
+    log(f"\n{'='*70}")
+    log(f"RFI-INCLUSIVE BACKGROUND (from {len(cadence_lines)} cadences)")
+    log(f"{'='*70}")
 
     bg = {}
     for name in methods:
@@ -294,13 +314,13 @@ def main():
                     "thresh_3s": median + 3 * mad_sigma,
                     "thresh_5s": median + 5 * mad_sigma}
         n_3s = (scores > bg[name]["thresh_3s"]).sum()
-        print(f"  {name}: n={len(scores)}  median={median:.4f}  MAD_s={mad_sigma:.4f}  "
+        log(f"  {name}: n={len(scores)}  median={median:.4f}  MAD_s={mad_sigma:.4f}  "
               f"3s={bg[name]['thresh_3s']:.4f} ({n_3s} candidates in probe)")
 
     # ---- Analysis against RFI-inclusive background ----
-    print(f"\n{'='*70}")
-    print(f"INJECTION RECOVERY vs RFI-INCLUSIVE BACKGROUND")
-    print(f"{'='*70}")
+    log(f"\n{'='*70}")
+    log(f"INJECTION RECOVERY vs RFI-INCLUSIVE BACKGROUND")
+    log(f"{'='*70}")
 
     csv_rows = []
 
@@ -311,11 +331,11 @@ def main():
         thresh_5 = b["thresh_5s"]
         n_bg_candidates = (b["scores"] > thresh_3).sum()
 
-        print(f"\n  {method} (bg: median={median:.4f}, MAD_s={mad_sigma:.4f}, "
+        log(f"\n  {method} (bg: median={median:.4f}, MAD_s={mad_sigma:.4f}, "
               f"3s={thresh_3:.4f}, {n_bg_candidates} RFI candidates)")
-        print(f"  {'SNR':>5s}  {'mean':>8s}  {'std':>8s}  {'sigma':>8s}  "
+        log(f"  {'SNR':>5s}  {'mean':>8s}  {'std':>8s}  {'sigma':>8s}  "
               f"{'det@3s':>8s}  {'det@5s':>8s}  {'rank%':>8s}")
-        print(f"  {'-'*5}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}")
+        log(f"  {'-'*5}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}")
 
         for snr in args.snr_list:
             scores = np.array(all_results[method][snr])
@@ -328,7 +348,7 @@ def main():
             # Rank: what percentile of the background does the mean injection score fall at?
             rank_pct = (b["scores"] < mean_s).mean() * 100
 
-            print(f"  {snr:5.0f}  {mean_s:8.4f}  {std_s:8.4f}  {sigma:8.2f}s  "
+            log(f"  {snr:5.0f}  {mean_s:8.4f}  {std_s:8.4f}  {sigma:8.2f}s  "
                   f"{det_3:7.1f}%  {det_5:7.1f}%  {rank_pct:7.2f}%")
 
             csv_rows.append({
@@ -352,9 +372,9 @@ def main():
     #       injected signals produce almost no disagreement even at high SNR —
     #       a model/representation property no threshold can rescue)?
     #       η² = SS_between / SS_total: →1 between-dominated, →0 within-dominated.
-    print(f"\n{'='*70}")
-    print(f"PER-CADENCE THRESHOLD + VARIANCE DECOMPOSITION")
-    print(f"{'='*70}")
+    log(f"\n{'='*70}")
+    log(f"PER-CADENCE THRESHOLD + VARIANCE DECOMPOSITION")
+    log(f"{'='*70}")
 
     def eta_squared(groups):
         """Fraction of variance explained by cadence identity (one-way ANOVA η²).
@@ -370,6 +390,8 @@ def main():
         return (float(ss_between / ss_total) if ss_total > 0 else float("nan"),
                 len(all_x))
 
+    per_cad_rows = []
+
     for method in methods:
         # Each cadence's own robust threshold from its own background probe.
         cad_thresh3 = []
@@ -379,13 +401,16 @@ def main():
             cad_thresh3.append(med_c + 3 * mad_c)
             cad_thresh5.append(med_c + 5 * mad_c)
         cad_thresh3 = np.array(cad_thresh3)
+        cad_thresh3_min = float(cad_thresh3.min())
+        cad_thresh3_median = float(np.median(cad_thresh3))
+        cad_thresh3_max = float(cad_thresh3.max())
 
-        print(f"\n  {method}: per-cadence 3σ thresholds — "
-              f"min={cad_thresh3.min():.4f}, median={np.median(cad_thresh3):.4f}, "
-              f"max={cad_thresh3.max():.4f}  (pooled 3σ={bg[method]['thresh_3s']:.4f})")
-        print(f"  {'SNR':>5s}  {'det@3s_pool':>11s}  {'det@3s_cad':>11s}  "
+        log(f"\n  {method}: per-cadence 3σ thresholds — "
+              f"min={cad_thresh3_min:.4f}, median={cad_thresh3_median:.4f}, "
+              f"max={cad_thresh3_max:.4f}  (pooled 3σ={bg[method]['thresh_3s']:.4f})")
+        log(f"  {'SNR':>5s}  {'det@3s_pool':>11s}  {'det@3s_cad':>11s}  "
               f"{'det@5s_cad':>11s}  {'eta2(cad)':>9s}")
-        print(f"  {'-'*5}  {'-'*11}  {'-'*11}  {'-'*11}  {'-'*9}")
+        log(f"  {'-'*5}  {'-'*11}  {'-'*11}  {'-'*11}  {'-'*9}")
         for snr in args.snr_list:
             groups3 = inj_by_cad[method][snr]
             # pooled det@3σ (same as table above, recomputed for side-by-side)
@@ -401,9 +426,20 @@ def main():
                 tot += len(inj_arr)
             det_cad3 = 100 * hits3 / tot if tot else float("nan")
             det_cad5 = 100 * hits5 / tot if tot else float("nan")
-            eta2, _ = eta_squared(groups3)
-            print(f"  {snr:5.0f}  {det_pool:10.1f}%  {det_cad3:10.1f}%  "
+            eta2, n_total = eta_squared(groups3)
+            log(f"  {snr:5.0f}  {det_pool:10.1f}%  {det_cad3:10.1f}%  "
                   f"{det_cad5:10.1f}%  {eta2:9.3f}")
+
+            per_cad_rows.append({
+                "method": method, "snr": snr,
+                "det_3s_pool": det_pool, "det_3s_cad": det_cad3, "det_5s_cad": det_cad5,
+                "eta2_cad": eta2, "n_injections": n_total,
+                "n_cadences": len(groups3),
+                "cad_thresh3_min": cad_thresh3_min,
+                "cad_thresh3_median": cad_thresh3_median,
+                "cad_thresh3_max": cad_thresh3_max,
+                "pooled_thresh3": bg[method]["thresh_3s"],
+            })
 
         # High-SNR variance read: if η² stays low at SNR30/50, per-cadence
         # thresholding cannot rescue detection — the spread is within-cadence.
@@ -411,23 +447,30 @@ def main():
         if hi:
             etas = [eta_squared(inj_by_cad[method][s])[0] for s in hi]
             mean_eta = np.nanmean(etas)
-            print(f"  → high-SNR (≥30) mean η² = {mean_eta:.3f}: ", end="")
             if mean_eta > 0.5:
-                print("BETWEEN-cadence variance dominates → per-cadence threshold "
-                      "is the fix (pooled threshold was the artifact).")
+                verdict = ("BETWEEN-cadence variance dominates → per-cadence threshold "
+                           "is the fix (pooled threshold was the artifact).")
             else:
-                print("WITHIN-cadence variance dominates → per-cadence threshold "
-                      "CANNOT rescue detection; some injections yield little "
-                      "disagreement even at high SNR (model/representation, not "
-                      "thresholding).")
+                verdict = ("WITHIN-cadence variance dominates → per-cadence threshold "
+                           "CANNOT rescue detection; some injections yield little "
+                           "disagreement even at high SNR (model/representation, not "
+                           "thresholding).")
+            log(f"  → high-SNR (≥30) mean η² = {mean_eta:.3f}: {verdict}")
 
-    # Save CSV
+    # Save CSVs
     csv_path = args.out_dir / "inject_recovery_results.csv"
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=csv_rows[0].keys())
         writer.writeheader()
         writer.writerows(csv_rows)
-    print(f"\nSaved -> {csv_path}")
+    log(f"\nSaved -> {csv_path}")
+
+    per_cad_csv_path = args.out_dir / "inject_recovery_per_cadence.csv"
+    with open(per_cad_csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=per_cad_rows[0].keys())
+        writer.writeheader()
+        writer.writerows(per_cad_rows)
+    log(f"Saved -> {per_cad_csv_path}")
 
     # ---- Plot 1: Detection rate vs SNR (head-to-head) ----
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
@@ -472,7 +515,7 @@ def main():
     plt.tight_layout()
     plt.savefig(args.out_dir / "inject_recovery_detection.png", dpi=150)
     plt.close()
-    print(f"Saved -> {args.out_dir / 'inject_recovery_detection.png'}")
+    log(f"Saved -> {args.out_dir / 'inject_recovery_detection.png'}")
 
     # ---- Plot 2: Injection scores overlaid on background distribution ----
     fig, axes = plt.subplots(1, max(len(methods), 2), figsize=(7 * max(len(methods), 2), 5),
@@ -499,10 +542,10 @@ def main():
     plt.tight_layout()
     plt.savefig(args.out_dir / "inject_vs_background.png", dpi=150)
     plt.close()
-    print(f"Saved -> {args.out_dir / 'inject_vs_background.png'}")
+    log(f"Saved -> {args.out_dir / 'inject_vs_background.png'}")
 
     # ---- Plot 3: Example candidate plots for select SNR levels ----
-    print("\nGenerating example injection plots...")
+    log("\nGenerating example injection plots...")
     example_dir = args.out_dir / "examples"
     example_dir.mkdir(exist_ok=True)
 
@@ -601,8 +644,8 @@ def main():
         plt.close()
 
     del obs_arrays
-    print(f"Saved example plots -> {example_dir}")
-    print("\nDone.")
+    log(f"Saved example plots -> {example_dir}")
+    log("\nDone.")
 
 
 if __name__ == "__main__":
