@@ -110,7 +110,13 @@ def patch_pixels(frames: np.ndarray, ph: int, pw: int) -> np.ndarray:
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--checkpoint", type=Path, required=True)
+    p.add_argument("--architecture", choices=["vit_mae", "resnet18"], default="vit_mae",
+                   help="Teacher candidate under test. 'resnet18' gates the paper-faithful "
+                        "out-of-domain P (docs/2026-07-14_paper_alignment_plan.md, D6/D7) — "
+                        "ignores --checkpoint/--model_config, no local weights needed "
+                        "(auto-downloads ImageNet weights via torchvision on first use).")
+    p.add_argument("--checkpoint", type=Path, default=None,
+                   help="Required for --architecture vit_mae; ignored for resnet18.")
     p.add_argument("--cache", type=Path, required=True)
     p.add_argument("--split", default="train")
     p.add_argument("--data_config", type=Path, default=ROOT / "configs/data/gbt_fine.yaml")
@@ -143,16 +149,28 @@ def main():
 
     with open(args.data_config) as f:
         preproc = yaml.safe_load(f)["preprocessing"]
-    with open(args.model_config) as f:
-        model_cfg = yaml.safe_load(f)
 
-    print(f"Loading teacher candidate from {args.checkpoint}")
-    model = load_model(args.checkpoint, model_cfg, args.device, require_encode=False)
-    if not (hasattr(model, "patch_embed") and hasattr(model, "encoder")
-            and hasattr(model.encoder, "layers")):
-        raise SystemExit("Teacher test requires the ViT-MAE backbone "
-                         "(architecture: vit_mae in --model_config).")
-    ph, pw = model_cfg["patch_size"]
+    if args.architecture == "resnet18":
+        from scripts.debug.resnet_teacher import ResNetTeacher
+        print("Loading ResNet-18 (ImageNet, frozen) as teacher candidate P")
+        model = ResNetTeacher().to(args.device)
+        ph = INPUT_SHAPE[0] // model.grid_size[0]
+        pw = INPUT_SHAPE[1] // model.grid_size[1]
+        ckpt_tag = "resnet18_imagenet"
+    else:
+        if args.checkpoint is None:
+            raise SystemExit("--checkpoint is required for --architecture vit_mae.")
+        with open(args.model_config) as f:
+            model_cfg = yaml.safe_load(f)
+        print(f"Loading teacher candidate from {args.checkpoint}")
+        model = load_model(args.checkpoint, model_cfg, args.device, require_encode=False)
+        if not (hasattr(model, "patch_embed") and hasattr(model, "encoder")
+                and hasattr(model.encoder, "layers")):
+            raise SystemExit("Teacher test requires the ViT-MAE backbone "
+                             "(architecture: vit_mae in --model_config).")
+        ph, pw = model_cfg["patch_size"]
+        ckpt_tag = args.checkpoint.stem
+
     nh, nw = INPUT_SHAPE[0] // ph, INPUT_SHAPE[1] // pw
     n_tok = nh * nw
     layer_tag = "final" if args.layer == -1 else f"block{args.layer}"
@@ -331,7 +349,7 @@ def main():
         print(f"  G3b (>= 0.60): {'PASS' if g3b else 'FAIL'}")
 
     # ================= verdict =================
-    print(f"\n{'='*64}\nVERDICT (teacher = {args.checkpoint.name}, layer = {layer_tag})\n{'='*64}")
+    print(f"\n{'='*64}\nVERDICT (teacher = {ckpt_tag}, layer = {layer_tag})\n{'='*64}")
     for name, ok in [("G1 collapse", g1), ("G2 responsiveness", g2),
                      ("G3a token residual", g3a), ("G3b frame preview", g3b)]:
         print(f"  {name:22s}: {'PASS' if ok else 'FAIL'}")
@@ -351,7 +369,7 @@ def main():
         print("  -> teacher FIT: proceed with the UDMA build (spec Q1 confirmed).")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    tag = f"{args.checkpoint.stem}_{layer_tag}".replace("=", "").replace(".", "p")
+    tag = f"{ckpt_tag}_{layer_tag}".replace("=", "").replace(".", "p")
     out_npz = args.out_dir / f"teacher_fitness_{tag}.npz"
     np.savez(out_npz,
              rel_std=rel_std, pr_rank_pooled=pr_pooled, pr_rank_content=pr_content,
