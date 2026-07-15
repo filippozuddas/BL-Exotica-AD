@@ -170,6 +170,18 @@ def main():
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
     setup_logging(args.out_dir)
+
+    # Every run is self-describing: without this, two runs whose background
+    # probe happens to coincide (same checkpoint/model_config/seed, only a
+    # downstream arg like topk_frac differing) are indistinguishable from a
+    # stale-state bug when comparing logs after the fact.
+    log(f"{'='*70}")
+    log("RESOLVED ARGS")
+    log(f"{'='*70}")
+    for key, value in sorted(vars(args).items()):
+        log(f"  {key}: {value}")
+    log(f"{'='*70}")
+
     rng = np.random.default_rng(args.seed)
 
     with open(args.data_config) as f:
@@ -189,7 +201,7 @@ def main():
     cadence_lines = [
         line.strip().split()
         for line in args.cadence_list.read_text().splitlines()
-        if line.strip()
+        if line.strip() and not line.strip().startswith("#")
     ]
     if args.max_cadences:
         cadence_lines = cadence_lines[:args.max_cadences]
