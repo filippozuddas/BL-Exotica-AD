@@ -65,10 +65,17 @@ class ResNetTeacher(nn.Module):
     def patch_embed(self, x: torch.Tensor) -> torch.Tensor:
         """``(B, 1, 96, 1024) -> (B, nh*nw, channels)`` token sequence, row-major
         over ``(nh, nw)`` — matches ``patch_pixels()``'s patch ordering."""
+        feat = self.forward(x)
+        b, c, nh, nw = feat.shape
+        return feat.permute(0, 2, 3, 1).reshape(b, nh * nw, c)
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """``(B, 1, 96, 1024) -> (B, channels, nh, nw)`` spatial feature grid —
+        the distillation target for ``scripts/distill_teacher.py``."""
         x3 = x.repeat(1, 3, 1, 1)
         feat = self.stem(x3)  # (B, channels, nh, nw)
-        b, c, nh, nw = feat.shape
-        assert (nh, nw) == self.grid_size, (
-            f"expected grid {self.grid_size} from a (96,1024) input, got {(nh, nw)}"
+        assert feat.shape[-2:] == self.grid_size, (
+            f"expected grid {self.grid_size} from a (96,1024) input, got {tuple(feat.shape[-2:])}"
         )
-        return feat.permute(0, 2, 3, 1).reshape(b, nh * nw, c)
+        return feat

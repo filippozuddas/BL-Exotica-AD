@@ -52,7 +52,7 @@ from .encoder import build_encoder
 from .memory import MemoryUnit
 from .vit_mae import ViTMAE, build_vit_mae
 
-__all__ = ["TeacherViT", "FeatureStudent", "UDMA", "build_udma"]
+__all__ = ["TeacherViT", "TeacherCNN", "FeatureStudent", "UDMA", "build_udma"]
 
 _ROOT = Path(__file__).resolve().parents[2]
 
@@ -102,6 +102,91 @@ class TeacherViT(nn.Module):
         One-shot (Q2/Q7): call once on the training set, then the resulting
         ``mu``/``sigma`` buffers are saved with the UDMA checkpoint.
         """
+        self.eval()
+        total = torch.zeros(self.channels, dtype=torch.float64, device=device)
+        total_sq = torch.zeros(self.channels, dtype=torch.float64, device=device)
+        count = 0
+        for i, x in enumerate(loader):
+            if max_batches is not None and i >= max_batches:
+                break
+            x = x.to(device)
+            raw = self._raw_tokens(x).double()  # (B, D, nh, nw)
+            flat = raw.permute(1, 0, 2, 3).reshape(self.channels, -1)
+            total += flat.sum(dim=1)
+            total_sq += (flat ** 2).sum(dim=1)
+            count += flat.shape[1]
+        mean = total / count
+        var = (total_sq / count - mean ** 2).clamp_min(0.0)
+        self.mu.copy_(mean.to(self.mu.dtype))
+        self.sigma.copy_(var.sqrt().to(self.sigma.dtype))
+
+
+class TeacherCNN(nn.Module):
+    """Frozen CNN teacher distilled from a generic pretrained backbone P
+    (paper-faithful route, Qi et al. 2024 Eq. 2 / Bergmann "Uninformed
+    Students" — teacher feature space anchored out-of-domain by construction;
+    spectrum data enters only as distillation input, never as a learning
+    target for P itself). Trunk = :func:`build_encoder` with the same
+    parametrisation as the UDMA students (``docs/2026-07-14_paper_alignment_plan.md``,
+    D8) — its own ``latent_dim``-channel 1x1 projection already lands on the
+    target channel count, no separate head needed.
+
+    Trained once by ``scripts/distill_teacher.py`` (frozen P, MSE on a
+    (6,64) grid via a distillation-only 1x1 projection D, discarded after
+    training) then loaded here as a fixed teacher — same
+    ``forward``/``grid_size``/``channels``/``mu``/``sigma``/``fit_normalization``
+    interface as :class:`TeacherViT`, so :func:`build_udma` only needs to
+    branch at construction time (``teacher.type: cnn_distilled``).
+    """
+
+    def __init__(
+        self,
+        input_shape: Tuple[int, int, int],
+        filters,
+        latent_dim: int,
+        kernel_size: Tuple[int, int] = (3, 3),
+        activation: str = "relu",
+        use_batchnorm: bool = True,
+        convs_per_block: int = 2,
+    ):
+        super().__init__()
+        self.trunk = build_encoder(
+            input_shape=input_shape,
+            filters=filters,
+            latent_dim=latent_dim,
+            kernel_size=kernel_size,
+            activation=activation,
+            use_batchnorm=use_batchnorm,
+            convs_per_block=convs_per_block,
+            variational=False,
+        )
+        for p in self.trunk.parameters():
+            p.requires_grad_(False)
+
+        n_blocks = len(filters)
+        factor = 2 ** n_blocks
+        th, fw, _ = input_shape
+        self.grid_size = (th // factor, fw // factor)
+        self.channels = latent_dim
+        self.register_buffer("mu", torch.zeros(self.channels))
+        self.register_buffer("sigma", torch.ones(self.channels))
+
+    def train(self, mode: bool = True) -> "TeacherCNN":
+        return super().train(False)
+
+    def _raw_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        """``(B,C,H,W) -> (B, channels, nh, nw)``, before Norm."""
+        return self.trunk(x)
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raw = self._raw_tokens(x)
+        return (raw - self.mu.view(1, -1, 1, 1)) / (self.sigma.view(1, -1, 1, 1) + 1e-6)
+
+    @torch.no_grad()
+    def fit_normalization(self, loader, device: torch.device, max_batches: Optional[int] = None) -> None:
+        """Offline per-channel mean/std of the raw (pre-Norm) feature grid over
+        ``loader`` — identical scheme to :meth:`TeacherViT.fit_normalization`."""
         self.eval()
         total = torch.zeros(self.channels, dtype=torch.float64, device=device)
         total_sq = torch.zeros(self.channels, dtype=torch.float64, device=device)
@@ -299,6 +384,22 @@ def _load_teacher_vit(vit_config_path: Path, checkpoint_path: Path, input_shape:
     return vit
 
 
+def _load_teacher_cnn(teacher_cfg: Dict, input_shape: Tuple[int, int, int]) -> TeacherCNN:
+    """Build a :class:`TeacherCNN` and load a trunk-only checkpoint saved by
+    ``scripts/distill_teacher.py`` (``{"trunk_state_dict", "filters",
+    "latent_dim", "convs_per_block"}`` — no distillation projection D)."""
+    checkpoint_path = _ROOT / teacher_cfg["checkpoint"]
+    ckpt = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+    filters = list(ckpt.get("filters", teacher_cfg.get("filters", [32, 64, 128, 256])))
+    latent_dim = int(ckpt.get("latent_dim", teacher_cfg.get("latent_dim", 128)))
+    convs_per_block = int(ckpt.get("convs_per_block", teacher_cfg.get("convs_per_block", 2)))
+    teacher = TeacherCNN(
+        input_shape, filters=filters, latent_dim=latent_dim, convs_per_block=convs_per_block,
+    )
+    teacher.trunk.load_state_dict(ckpt["trunk_state_dict"])
+    return teacher
+
+
 def build_udma(
     input_shape: Tuple[int, int, int],
     model_config: Dict,
@@ -314,12 +415,20 @@ def build_udma(
             lambdas, and scoring weights/``topk_frac``.
     """
     teacher_cfg = model_config["teacher"]
-    vit_config_path = _ROOT / teacher_cfg["vit_config"]
-    checkpoint_path = _ROOT / teacher_cfg["checkpoint"]
-    teacher_layer = int(teacher_cfg.get("teacher_layer", 3))
-
-    vit = _load_teacher_vit(vit_config_path, checkpoint_path, input_shape)
-    teacher = TeacherViT(vit, teacher_layer=teacher_layer)
+    teacher_type = teacher_cfg.get("type", "vit_mae")
+    if teacher_type == "cnn_distilled":
+        # Paper-faithful route (D6-D8): teacher distilled from an out-of-domain
+        # generic backbone (scripts/distill_teacher.py), not self-supervised
+        # in-domain. See docs/2026-07-14_paper_alignment_plan.md, Fase 2.
+        teacher = _load_teacher_cnn(teacher_cfg, input_shape)
+    elif teacher_type == "vit_mae":
+        vit_config_path = _ROOT / teacher_cfg["vit_config"]
+        checkpoint_path = _ROOT / teacher_cfg["checkpoint"]
+        teacher_layer = int(teacher_cfg.get("teacher_layer", 3))
+        vit = _load_teacher_vit(vit_config_path, checkpoint_path, input_shape)
+        teacher = TeacherViT(vit, teacher_layer=teacher_layer)
+    else:
+        raise ValueError(f"teacher.type must be 'vit_mae' or 'cnn_distilled', got '{teacher_type}'.")
 
     norm_stats_path = teacher_cfg.get("norm_stats")
     if norm_stats_path is not None:
