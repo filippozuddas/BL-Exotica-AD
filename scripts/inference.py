@@ -41,7 +41,12 @@ sys.path.insert(0, str(ROOT))
 from src.models.autoencoder import build_autoencoder
 from src.data.preprocessing import bandpass_correct, core_transform
 from src.data.torch_dataset import _load_full_obs
-from src.search.candidates import cluster_candidates, on_off_contrast, full_row_hits
+from src.search.candidates import (
+    cluster_candidates, on_off_contrast, full_row_hits, off_noise_ceiling,
+)
+
+FAR_QUANTILE = 0.99
+MIN_OFF_POOL = 30
 from src.utils.visualization import overlay_anomaly_map
 
 METHODS = ["recon", "topk", "max", "cadence"]
@@ -403,19 +408,33 @@ def main():
         for method in methods:
             scores = cad_arrs[method]
             median, mad_sigma = robust_stats(scores)
+            # Gaussian 3s/5s kept only as a diagnostic reference line (plots
+            # below) — heavy-tailed disagreement scores put this threshold
+            # inside the OFF noise tail (see inference_threshold_off_null_calibration
+            # in memory: cad02 crossed 0.88% of snippets vs the ~0.13% a
+            # Gaussian 3s implies). It no longer drives candidate selection.
             thresh_3 = median + 3 * mad_sigma
             thresh_5 = median + 5 * mad_sigma
             n_3s = (scores > thresh_3).sum()
             n_5s = (scores > thresh_5).sum()
+
+            # Declared operating point: fixed 1% FAR (empirical quantile of
+            # this cadence's own score pool), replacing the parametric
+            # Gaussian 3s as the threshold that actually forms candidates —
+            # non-parametric, so it does not assume the heavy-tailed score
+            # distribution is Gaussian.
+            far_thresh = float(np.quantile(scores, FAR_QUANTILE))
+            n_far = (scores > far_thresh).sum()
             print(f"  {method}: median={median:.4f}  MAD_s={mad_sigma:.4f}  "
-                  f"3s->{n_3s}  5s->{n_5s}")
+                  f"3s(ref)={thresh_3:.4f}->{n_3s}  5s(ref)={thresh_5:.4f}->{n_5s}  "
+                  f"FAR{100*(1-FAR_QUANTILE):.0f}%={far_thresh:.4f}->{n_far}")
 
             # Frequency-adjacency dedup (src/search/candidates.py): a single
             # wide/strong line triggers many adjacent overlapping windows
             # (stride < fchans) — collapse those into one candidate per event.
-            clusters = cluster_candidates(cad_fstarts_arr, scores, thresh_3, stride, fchans, df)
+            clusters = cluster_candidates(cad_fstarts_arr, scores, far_thresh, stride, fchans, df)
             print(f"  {method}: {len(clusters)} distinct candidates after "
-                  f"frequency-adjacency dedup (from {n_3s} raw threshold-crossings)")
+                  f"frequency-adjacency dedup (from {n_far} raw threshold-crossings)")
 
             # ON/OFF contrast (src/search/candidates.py): UDMA's (6,64) grid
             # has one row per cadence observation (ABACAD order) — reuses the
@@ -425,9 +444,8 @@ def main():
             has_amap = hasattr(model, "anomaly_map")
             amaps_by_cluster = [None] * len(clusters)
             if has_amap and len(clusters) > 0:
-                contrasts, on_means, off_means = [], [], []
-                n_on_hits_l, n_off_hits_l = [], []
-                n_on_hits_full_l, n_off_hits_full_l, off_leak_l, in_short_list_l = [], [], [], []
+                off_rows_default = (1, 3, 5)
+                off_pool = []
                 for i, (_, crow) in enumerate(clusters.iterrows()):
                     fs_c = int(crow["f_start_peak"])
                     snippet_c = _preprocess_at(fs_c)
@@ -435,7 +453,29 @@ def main():
                     with torch.no_grad():
                         amap_c = model.anomaly_map(x_c)[0].cpu().numpy()
                     amaps_by_cluster[i] = amap_c
-                    stats = on_off_contrast(amap_c, threshold=thresh_3)
+                    off_idx = [r for r in off_rows_default if r < amap_c.shape[0]]
+                    if off_idx:
+                        off_pool.append(amap_c[off_idx, :].ravel())
+
+                # Per-cadence OFF-noise-core ceiling (src/search/candidates.py,
+                # Fase 3.1): replaces the Gaussian thresh_3 in the row-hit test
+                # below. Falls back to thresh_3 if the cluster pool is too
+                # small for a robust clip+quantile estimate (rare: needs
+                # >=MIN_OFF_POOL cells; MIN_OFF_POOL/len(off_rows_default)
+                # clusters at minimum, since each contributes ~len(off_rows)*nw cells).
+                if off_pool and sum(len(p) for p in off_pool) >= MIN_OFF_POOL:
+                    off_ceiling = off_noise_ceiling(np.concatenate(off_pool))
+                else:
+                    off_ceiling = thresh_3
+                print(f"  {method}: OFF-noise-core ceiling={off_ceiling:.4f} "
+                      f"(pooled from {len(off_pool)} clusters, "
+                      f"vs Gaussian 3s(ref)={thresh_3:.4f})")
+
+                contrasts, on_means, off_means = [], [], []
+                n_on_hits_l, n_off_hits_l = [], []
+                n_on_hits_full_l, n_off_hits_full_l, off_leak_l, in_short_list_l = [], [], [], []
+                for amap_c in amaps_by_cluster:
+                    stats = on_off_contrast(amap_c, threshold=off_ceiling)
                     contrasts.append(stats["on_off_contrast"])
                     on_means.append(stats["on_mean"])
                     off_means.append(stats["off_mean"])
@@ -444,7 +484,7 @@ def main():
                     # Short-list volume reduction (full_row_hits, no column
                     # restriction) — separate from on_off_contrast, which
                     # still ranks the short-listed candidates for plotting.
-                    fr = full_row_hits(amap_c, threshold=thresh_3)
+                    fr = full_row_hits(amap_c, threshold=off_ceiling)
                     n_on_hits_full_l.append(fr["n_on_hits_full"])
                     n_off_hits_full_l.append(fr["n_off_hits_full"])
                     off_leak_l.append(fr["off_leak"])
