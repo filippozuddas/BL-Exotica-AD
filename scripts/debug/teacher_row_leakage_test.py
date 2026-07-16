@@ -50,6 +50,19 @@ LOCALIZING reference: one "stage" (global attention, no RF sweep). Use it to put
 number on the localization gap that the ResNet stages leave open (2026-07-16: RF
 route refuted, ResNet ratio ~2-3 at every depth — see udma_teacher_rf_leakage_refuted).
 
+``--architecture udma_student`` runs the metric on a trained UDMA STUDENT's own output
+feature grid (not the teacher) — isolates whether the student's CNN trunk (same
+architecture regardless of which teacher trained it) preserves ON/OFF localization, or
+whether it's a property of the teacher target it regressed. Two existing checkpoints
+give a free, cheap corroboration of the domain-mismatch-vs-architecture question
+(2026-07-16, see udma_teacher_rf_leakage_refuted's confound note): the OLD UDMA
+(`configs/model/udma.yaml`, ViT-MAE domain-matched target) vs the cnn_teacher UDMA
+(`configs/model/udma_cnn_teacher.yaml`, ResNet-distilled target) — same student
+architecture (`FeatureStudent`/`build_encoder`) in both, only the training target
+differs. If the old-target student localizes and the new-target student doesn't, that's
+a second, independent confirmation the target's domain (not the CNN architecture) is the
+lever.
+
 Usage (server, not dev machine):
     # out-of-domain P (ResNet-18), RF sweep — default
     CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
@@ -62,6 +75,14 @@ Usage (server, not dev machine):
         --architecture vit_mae --layer 3 \
         --checkpoint outputs/training/20260709_205938_4b5660c/checkpoints/epoch=094-val_loss=2.1740.ckpt \
         --model_config configs/model/vit_mae.yaml \
+        --cache /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine_exotica
+
+    # UDMA student trunk (either checkpoint) — free corroboration, no training
+    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
+    python scripts/debug/teacher_row_leakage_test.py \
+        --architecture udma_student --student ae \
+        --checkpoint outputs/training/20260707_093113_6d0d1ba/checkpoints/last.ckpt \
+        --model_config configs/model/udma.yaml \
         --cache /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine_exotica
 """
 
@@ -178,6 +199,53 @@ class ViTMAEStages(nn.Module):
         return tok.reshape(b, nh, nw, d).permute(0, 3, 1, 2)
 
 
+class UDMAStudentStages(nn.Module):
+    """A trained UDMA student's own output feature grid, exposing the SAME
+    ``features(x, stage) -> (B,C,nh,nw)`` interface as :class:`ResNetStages` /
+    :class:`ViTMAEStages`. One pseudo-stage (the student's final projection
+    head output, ``(B, teacher.channels, 6, 64)``) — no depth sweep, since the
+    question here isn't receptive field, it's "does the SAME student
+    architecture localize when trained against a domain-matched target vs an
+    out-of-domain one" (2026-07-16, see udma_teacher_rf_leakage_refuted's
+    confound note). Loads the full UDMA model (teacher + both students) via
+    ``build_autoencoder`` from ``model_config`` (``architecture: udma``,
+    either ``teacher.type: vit_mae`` or ``cnn_distilled``) and a Lightning
+    checkpoint, exactly like ``encode_separation_test.load_model``, then reads
+    out only the requested student's raw output (``student_ae`` or
+    ``student_mem``'s projection head, ignoring the teacher's own features and
+    the disagreement maps entirely — this measures the STUDENT's learned
+    localization, not the teacher's)."""
+
+    def __init__(self, checkpoint, model_cfg, device, student="ae"):
+        super().__init__()
+        from src.models import build_autoencoder
+        model = build_autoencoder(INPUT_SHAPE, model_cfg, loss="mse")
+        ckpt = torch.load(str(checkpoint), map_location=device, weights_only=False)
+        state = {k.replace("model.", "", 1): v
+                 for k, v in ckpt["state_dict"].items() if k.startswith("model.")}
+        model.load_state_dict(state)
+        model.eval().to(device)
+        if not hasattr(model, "student_ae"):
+            raise SystemExit("--architecture udma_student requires a UDMA checkpoint "
+                             "(architecture: udma in --model_config).")
+        self.model = model
+        self.student = {"ae": model.student_ae, "mem": model.student_mem}[student]
+        self.grid_size = model.teacher.grid_size
+        self.stage_name = f"student_{student}"
+        self.eval()
+
+    def train(self, mode: bool = True) -> "UDMAStudentStages":
+        return super().train(False)
+
+    @torch.no_grad()
+    def features(self, x: torch.Tensor, stage: str = None) -> torch.Tensor:
+        """(B,1,96,1024) -> (B,C,nh,nw) student output feature grid."""
+        out = self.student(x)
+        if isinstance(out, tuple):  # memory student returns (out, attention)
+            out = out[0]
+        return out
+
+
 def row_on_off_masks(nh: int) -> tuple:
     """Boolean (nh,) masks labelling each feature row ON or OFF by which of the
     6 observations it belongs to (ON = obs 0/2/4)."""
@@ -214,17 +282,22 @@ def stage_displacement(model, f_clean, f_inj, stage, device, batch=32):
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--architecture", choices=["resnet18", "vit_mae"], default="resnet18",
+    p.add_argument("--architecture", choices=["resnet18", "vit_mae", "udma_student"], default="resnet18",
                    help="resnet18: out-of-domain P, RF sweep across stem/layer1/2/3 (default). "
                         "vit_mae: domain-matched teacher, single stage at --layer (localizing "
-                        "reference) — requires --checkpoint/--model_config.")
+                        "reference) — requires --checkpoint/--model_config. udma_student: a "
+                        "trained UDMA student's own output grid — requires --checkpoint/"
+                        "--model_config (architecture: udma) and --student.")
     p.add_argument("--checkpoint", type=Path, default=None,
-                   help="Required for --architecture vit_mae; ignored for resnet18.")
+                   help="Required for --architecture vit_mae/udma_student; ignored for resnet18.")
     p.add_argument("--model_config", type=Path, default=ROOT / "configs/model/vit_mae.yaml",
-                   help="ViT-MAE model config (patch_size -> token grid). Used only for vit_mae.")
+                   help="Model config: vit_mae.yaml (patch_size -> token grid) for --architecture "
+                        "vit_mae, or udma.yaml/udma_cnn_teacher.yaml for udma_student.")
     p.add_argument("--layer", type=int, default=3,
                    help="ViT-MAE transformer block to read (1-indexed; -1 = final). Default 3 = "
-                        "the deployed teacher_layer in configs/model/udma.yaml. Ignored for resnet18.")
+                        "the deployed teacher_layer in configs/model/udma.yaml. vit_mae only.")
+    p.add_argument("--student", choices=["ae", "mem"], default="ae",
+                   help="Which UDMA student to read (udma_student only).")
     p.add_argument("--cache", type=Path, required=True)
     p.add_argument("--split", default="train")
     p.add_argument("--data_config", type=Path, default=ROOT / "configs/data/gbt_fine.yaml")
@@ -257,6 +330,18 @@ def main():
         stages = [model.stage_name]
         rf_label = {model.stage_name: "global"}
         print(f"  Token grid: {model.grid_size} — global attention, no RF sweep")
+    elif args.architecture == "udma_student":
+        if args.checkpoint is None:
+            raise SystemExit("--checkpoint is required for --architecture udma_student.")
+        with open(args.model_config) as f:
+            model_cfg = yaml.safe_load(f)
+        teacher_type = model_cfg.get("teacher", {}).get("type", "vit_mae")
+        print(f"Loading UDMA student '{args.student}' from {args.checkpoint} "
+              f"(teacher.type={teacher_type})")
+        model = UDMAStudentStages(args.checkpoint, model_cfg, args.device, student=args.student)
+        stages = [model.stage_name]
+        rf_label = {model.stage_name: f"teacher={teacher_type}"}
+        print(f"  Student output grid: {model.grid_size}")
     else:
         print("Loading ResNet-18 (ImageNet, frozen) — teacher P, all stages")
         model = ResNetStages().to(args.device)
@@ -318,6 +403,14 @@ def main():
               "  deployed block — the apples-to-apples reference for the ResNet stages (which\n"
               "  stayed ~2-3, RF-invariant, 2026-07-16). A markedly higher ratio here confirms\n"
               "  localization is a domain-matching property, not a receptive-field one.")
+    elif args.architecture == "udma_student":
+        print("\n  Read: this is the SAME student CNN architecture (build_encoder trunk), only\n"
+              "  the training TARGET differs by checkpoint (vit_mae domain-matched vs\n"
+              "  cnn_distilled out-of-domain). Compare this ratio against the SAME test run on\n"
+              "  the other checkpoint: if the vit_mae-target student localizes and the\n"
+              "  cnn_distilled-target student doesn't, that's a second, architecture-independent\n"
+              "  confirmation the TARGET's domain (not the CNN trunk) is the lever — corroborates\n"
+              "  the teacher-level finding without any new training.")
     else:
         print("\n  Read: if a shallow stage recovers a high ratio while layer3 is ~1, the RF is\n"
               "  the lever and the small-RF teacher is worth a distill+retrain run. If every\n"
@@ -325,7 +418,10 @@ def main():
               "  dead end (keep the domain-matched teacher / try a shallow anisotropic teacher).")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    out_npz = args.out_dir / f"teacher_row_leakage_{args.architecture}.npz"
+    out_tag = args.architecture
+    if args.architecture == "udma_student":
+        out_tag = f"udma_student_{args.student}_{args.checkpoint.parents[1].name}"
+    out_npz = args.out_dir / f"teacher_row_leakage_{out_tag}.npz"
     np.savez(
         out_npz,
         architecture=args.architecture,
