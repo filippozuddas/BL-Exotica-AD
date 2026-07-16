@@ -44,10 +44,25 @@ teacher as a reported design result, or pursue a shallow anisotropic teacher.
 Cost: ~ (n_frames * len(snr_list) * len(stages)) frozen ResNet forwards — minutes
 on GPU, NO training.
 
+``--architecture vit_mae`` runs the SAME differential metric on the domain-matched
+ViT-MAE teacher (read at its deployed block, ``--layer 3``) as the apples-to-apples
+LOCALIZING reference: one "stage" (global attention, no RF sweep). Use it to put a
+number on the localization gap that the ResNet stages leave open (2026-07-16: RF
+route refuted, ResNet ratio ~2-3 at every depth — see udma_teacher_rf_leakage_refuted).
+
 Usage (server, not dev machine):
+    # out-of-domain P (ResNet-18), RF sweep — default
     CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
     python scripts/debug/teacher_row_leakage_test.py \
-        --cache /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine
+        --cache /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine_exotica
+
+    # domain-matched ViT-MAE teacher (localizing reference), read at block3
+    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
+    python scripts/debug/teacher_row_leakage_test.py \
+        --architecture vit_mae --layer 3 \
+        --checkpoint outputs/training/20260709_205938_4b5660c/checkpoints/epoch=094-val_loss=2.1740.ckpt \
+        --model_config configs/model/vit_mae.yaml \
+        --cache /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine_exotica
 """
 
 import argparse
@@ -65,6 +80,7 @@ sys.path.insert(0, str(ROOT))
 from scripts.debug.injection_vs_rfi_test import preprocess_raw, inject_narrowband_on_only
 
 INPUT_SHAPE = (96, 1024, 1)
+INPUT_HW = (96, 1024)
 N_OBS = 6
 ON_OBS = (0, 2, 4)
 
@@ -114,6 +130,54 @@ class ResNetStages(nn.Module):
         raise ValueError(f"unknown stage {stage!r}")
 
 
+class ViTMAEStages(nn.Module):
+    """Domain-matched ViT-MAE teacher, exposing the SAME ``features(x, stage) ->
+    (B,C,nh,nw)`` interface as :class:`ResNetStages` so it plugs into
+    ``stage_displacement`` unchanged. A ViT has no receptive-field sweep (global
+    attention), so it contributes ONE pseudo-stage read at the deployed
+    transformer block (``layer``, 1-indexed; -1 = final). Token grid comes from
+    the model config's ``patch_size`` — (6,64) for the 0000.fil teacher, rows
+    mapping 1:1 to the 6 observations. Reads tokens exactly as
+    ``teacher_sensitivity_test.encode_tokens_layer`` (patch_embed + pos_embed,
+    blocks 1..k, final norm only when k == depth)."""
+
+    def __init__(self, checkpoint, model_cfg, device, layer=-1):
+        super().__init__()
+        from scripts.debug.encode_separation_test import load_model
+        self.model = load_model(checkpoint, model_cfg, device, require_encode=False)
+        if not (hasattr(self.model, "patch_embed") and hasattr(self.model, "encoder")
+                and hasattr(self.model.encoder, "layers")):
+            raise SystemExit("--architecture vit_mae requires a ViT-MAE checkpoint "
+                             "(architecture: vit_mae in --model_config).")
+        self.layer = layer
+        ph, pw = model_cfg["patch_size"]
+        self.grid_size = (INPUT_HW[0] // ph, INPUT_HW[1] // pw)
+        self.stage_name = "final" if layer == -1 else f"block{layer}"
+        self.eval()
+
+    def train(self, mode: bool = True) -> "ViTMAEStages":
+        return super().train(False)
+
+    @torch.no_grad()
+    def features(self, x: torch.Tensor, stage: str = None) -> torch.Tensor:
+        """(B,1,96,1024) -> (B,C,nh,nw) token-feature grid at ``self.layer``."""
+        m = self.model
+        tok = m.patch_embed(x) + m.pos_embed
+        n_layers = len(m.encoder.layers)
+        k = n_layers if self.layer in (-1, n_layers) else self.layer
+        if not 0 <= k <= n_layers:
+            raise SystemExit(f"--layer must be in 0..{n_layers} or -1, got {self.layer}")
+        for j, blk in enumerate(m.encoder.layers, start=1):
+            if j > k:
+                break
+            tok = blk(tok)
+        if k == n_layers and getattr(m.encoder, "norm", None) is not None:
+            tok = m.encoder.norm(tok)
+        b, n, d = tok.shape
+        nh, nw = self.grid_size
+        return tok.reshape(b, nh, nw, d).permute(0, 3, 1, 2)
+
+
 def row_on_off_masks(nh: int) -> tuple:
     """Boolean (nh,) masks labelling each feature row ON or OFF by which of the
     6 observations it belongs to (ON = obs 0/2/4)."""
@@ -150,13 +214,25 @@ def stage_displacement(model, f_clean, f_inj, stage, device, batch=32):
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--architecture", choices=["resnet18", "vit_mae"], default="resnet18",
+                   help="resnet18: out-of-domain P, RF sweep across stem/layer1/2/3 (default). "
+                        "vit_mae: domain-matched teacher, single stage at --layer (localizing "
+                        "reference) — requires --checkpoint/--model_config.")
+    p.add_argument("--checkpoint", type=Path, default=None,
+                   help="Required for --architecture vit_mae; ignored for resnet18.")
+    p.add_argument("--model_config", type=Path, default=ROOT / "configs/model/vit_mae.yaml",
+                   help="ViT-MAE model config (patch_size -> token grid). Used only for vit_mae.")
+    p.add_argument("--layer", type=int, default=3,
+                   help="ViT-MAE transformer block to read (1-indexed; -1 = final). Default 3 = "
+                        "the deployed teacher_layer in configs/model/udma.yaml. Ignored for resnet18.")
     p.add_argument("--cache", type=Path, required=True)
     p.add_argument("--split", default="train")
     p.add_argument("--data_config", type=Path, default=ROOT / "configs/data/gbt_fine.yaml")
     p.add_argument("--n_frames", type=int, default=200, help="Quiet injection sites.")
     p.add_argument("--snr_list", type=float, nargs="+", default=[10, 20, 40])
     p.add_argument("--drift_rate", type=float, default=0.3)
-    p.add_argument("--stages", nargs="+", default=list(STAGES), choices=STAGES)
+    p.add_argument("--stages", nargs="+", default=list(STAGES), choices=STAGES,
+                   help="ResNet depth stages to sweep (resnet18 only).")
     p.add_argument("--out_dir", type=Path, default=ROOT / "outputs/sweeps/teacher_row_leakage")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=42)
@@ -170,8 +246,22 @@ def main():
     with open(args.data_config) as f:
         preproc = yaml.safe_load(f)["preprocessing"]
 
-    print("Loading ResNet-18 (ImageNet, frozen) — teacher P, all stages")
-    model = ResNetStages().to(args.device)
+    if args.architecture == "vit_mae":
+        if args.checkpoint is None:
+            raise SystemExit("--checkpoint is required for --architecture vit_mae.")
+        with open(args.model_config) as f:
+            model_cfg = yaml.safe_load(f)
+        print(f"Loading domain-matched ViT-MAE teacher from {args.checkpoint} "
+              f"(block {args.layer})")
+        model = ViTMAEStages(args.checkpoint, model_cfg, args.device, layer=args.layer)
+        stages = [model.stage_name]
+        rf_label = {model.stage_name: "global"}
+        print(f"  Token grid: {model.grid_size} — global attention, no RF sweep")
+    else:
+        print("Loading ResNet-18 (ImageNet, frozen) — teacher P, all stages")
+        model = ResNetStages().to(args.device)
+        stages = args.stages
+        rf_label = {s: f"{STAGE_RF[s]}px" for s in stages}
 
     # ---- quiet injection sites (lowest hot-fraction), same selection as the gate ----
     npy_path = Path(args.cache) / f"{args.split}.npy"
@@ -197,7 +287,7 @@ def main():
                 preproc)
             for i in range(len(raw_quiet))
         ])
-        for stage in args.stages:
+        for stage in stages:
             on_resp, off_resp = stage_displacement(model, f_quiet, f_inj, stage, args.device)
             on_m, off_m = float(on_resp.mean()), float(off_resp.mean())
             ratio = on_m / (off_m + 1e-12)
@@ -211,32 +301,39 @@ def main():
     for snr in args.snr_list:
         print(f"\n  SNR = {snr:g}")
         print(f"    {'stage':>8s}  {'vert.RF':>7s}  {'ON_resp':>9s}  {'OFF_resp':>9s}  {'ON/OFF':>7s}")
-        for stage in args.stages:
+        for stage in stages:
             on_m, off_m, ratio = results[(stage, snr)]
-            print(f"    {stage:>8s}  {STAGE_RF[stage]:>6d}px  {on_m:9.4f}  {off_m:9.4f}  {ratio:7.2f}")
+            print(f"    {stage:>8s}  {rf_label[stage]:>7s}  {on_m:9.4f}  {off_m:9.4f}  {ratio:7.2f}")
 
     # Headline: ratio trend across stages at the highest SNR (clearest signal).
     ref_snr = max(args.snr_list)
     print(f"\n{'='*72}\nVERDICT (ratio trend @ SNR {ref_snr:g}, deepest->shallowest)\n{'='*72}")
-    ratios = {s: results[(s, ref_snr)][2] for s in args.stages}
-    for stage in args.stages:
+    ratios = {s: results[(s, ref_snr)][2] for s in stages}
+    for stage in stages:
         tag = ("LOCALIZED" if ratios[stage] >= 3.0
                else "partial" if ratios[stage] >= 1.5 else "DIFFUSE")
-        print(f"  {stage:>8s} (RF~{STAGE_RF[stage]}px): ON/OFF = {ratios[stage]:.2f}  [{tag}]")
-    print("\n  Read: if a shallow stage recovers a high ratio while layer3 is ~1, the RF is\n"
-          "  the lever and the small-RF teacher is worth a distill+retrain run. If every\n"
-          "  stage stays near 1, the ImageNet-P leakage is not RF-driven -> that route is a\n"
-          "  dead end (keep the domain-matched teacher / try a shallow anisotropic teacher).")
+        print(f"  {stage:>8s} (RF~{rf_label[stage]}): ON/OFF = {ratios[stage]:.2f}  [{tag}]")
+    if args.architecture == "vit_mae":
+        print("\n  Read: this is the domain-matched teacher's localizing ON/OFF ratio at its\n"
+              "  deployed block — the apples-to-apples reference for the ResNet stages (which\n"
+              "  stayed ~2-3, RF-invariant, 2026-07-16). A markedly higher ratio here confirms\n"
+              "  localization is a domain-matching property, not a receptive-field one.")
+    else:
+        print("\n  Read: if a shallow stage recovers a high ratio while layer3 is ~1, the RF is\n"
+              "  the lever and the small-RF teacher is worth a distill+retrain run. If every\n"
+              "  stage stays near 1, the ImageNet-P leakage is not RF-driven -> that route is a\n"
+              "  dead end (keep the domain-matched teacher / try a shallow anisotropic teacher).")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    out_npz = args.out_dir / "teacher_row_leakage.npz"
+    out_npz = args.out_dir / f"teacher_row_leakage_{args.architecture}.npz"
     np.savez(
         out_npz,
-        stages=np.array(args.stages),
+        architecture=args.architecture,
+        stages=np.array(stages),
         snr_list=np.array(args.snr_list),
-        on_resp=np.array([[results[(s, snr)][0] for s in args.stages] for snr in args.snr_list]),
-        off_resp=np.array([[results[(s, snr)][1] for s in args.stages] for snr in args.snr_list]),
-        ratio=np.array([[results[(s, snr)][2] for s in args.stages] for snr in args.snr_list]),
+        on_resp=np.array([[results[(s, snr)][0] for s in stages] for snr in args.snr_list]),
+        off_resp=np.array([[results[(s, snr)][1] for s in stages] for snr in args.snr_list]),
+        ratio=np.array([[results[(s, snr)][2] for s in stages] for snr in args.snr_list]),
     )
     print(f"\nSaved -> {out_npz}")
 
