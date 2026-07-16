@@ -63,6 +63,20 @@ differs. If the old-target student localizes and the new-target student doesn't,
 a second, independent confirmation the target's domain (not the CNN architecture) is the
 lever.
 
+``--architecture convnextv2_fcmae`` runs the metric on ``convnextv2_tiny.fcmae`` (timm,
+requires ``pip install timm``) — the domain-vs-OBJECTIVE isolating control (2026-07-16).
+SAME domain (ImageNet) and SAME family (CNN) as resnet18, but pretrained via masked-patch
+RECONSTRUCTION (FCMAE, self-supervised, no classification head) instead of classification.
+This separates the two variables the resnet18-vs-vit_mae comparison confounds: domain
+(ImageNet vs GBT) AND pretraining objective (classification vs reconstruction) changed
+together there. If convnextv2_fcmae localizes markedly better than resnet18 despite the
+SAME wrong domain, the objective is the lever (not domain) — opening a route to a
+paper-faithful (out-of-domain, generic) CNN teacher that still localizes, no
+audio/domain-closer backbone search needed. If it stays diffuse like resnet18, domain-
+matching is confirmed necessary regardless of objective. Fully convolutional like resnet18
+— no positional-embedding interpolation needed for the non-224x224 input (unlike a
+ViT-MAE-on-ImageNet alternative, which was considered and rejected for this reason).
+
 Usage (server, not dev machine):
     # out-of-domain P (ResNet-18), RF sweep — default
     CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
@@ -83,6 +97,13 @@ Usage (server, not dev machine):
         --architecture udma_student --student ae \
         --checkpoint outputs/training/20260707_093113_6d0d1ba/checkpoints/last.ckpt \
         --model_config configs/model/udma.yaml \
+        --cache /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine_exotica
+
+    # ConvNeXt V2 / FCMAE (domain-vs-objective isolating control) — needs timm
+    pip install timm
+    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
+    python scripts/debug/teacher_row_leakage_test.py \
+        --architecture convnextv2_fcmae \
         --cache /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine_exotica
 """
 
@@ -147,6 +168,62 @@ class ResNetStages(nn.Module):
             return h
         h = self.layer3(h)
         if stage == "layer3":
+            return h
+        raise ValueError(f"unknown stage {stage!r}")
+
+
+CONVNEXT_STAGES = ("stem", "stage0", "stage1", "stage2")
+# Downsampling factor labels only (not pixel RF — ConvNeXt's 7x7 depthwise
+# kernels stacked over variable block counts [3,3,9,3] make a precise
+# theoretical pixel RF non-trivial to state correctly; the /N factor is what
+# actually matters for reading this alongside ResNetStages, since stage2's
+# grid (6,64) at /16 lines up with ResNet's layer3, the direct comparison
+# point). stage3 (/32) is excluded: its (3,32) grid has fewer rows than the
+# 6 cadence observations, incompatible with row_on_off_masks.
+CONVNEXT_RF = {"stem": "/4", "stage0": "/4", "stage1": "/8", "stage2": "/16"}
+
+
+class ConvNeXtV2Stages(nn.Module):
+    """Frozen ConvNeXt V2 (``convnextv2_tiny.fcmae``, timm) exposing features at
+    each depth stage — the domain-vs-objective isolating control
+    (2026-07-16): SAME domain (ImageNet) and SAME family (CNN) as
+    :class:`ResNetStages`, but pretrained via masked-patch RECONSTRUCTION
+    (FCMAE, self-supervised, no classification head) instead of
+    classification. If this localizes where ResNet-18 doesn't, the deciding
+    variable is the pretraining OBJECTIVE, not the domain; if it stays
+    diffuse like ResNet-18, domain-matching is confirmed necessary regardless
+    of objective. Input (B,1,96,1024) replicated to 3 channels, no ImageNet
+    mean/std renorm — same simplification as :class:`ResNetStages`, and
+    fully convolutional (no positional embeddings to reconcile with a
+    non-224x224 input, unlike a ViT-MAE-on-ImageNet alternative)."""
+
+    def __init__(self, model_name: str = "convnextv2_tiny.fcmae"):
+        super().__init__()
+        import timm
+        m = timm.create_model(model_name, pretrained=True, num_classes=0)
+        self.stem = m.stem
+        self.stages_list = m.stages
+        for p in self.parameters():
+            p.requires_grad_(False)
+        self.eval()
+
+    def train(self, mode: bool = True) -> "ConvNeXtV2Stages":
+        return super().train(False)
+
+    @torch.no_grad()
+    def features(self, x: torch.Tensor, stage: str) -> torch.Tensor:
+        """(B,1,96,1024) -> (B,C,nh,nw) at the requested stage."""
+        h = self.stem(x.repeat(1, 3, 1, 1))
+        if stage == "stem":
+            return h
+        h = self.stages_list[0](h)
+        if stage == "stage0":
+            return h
+        h = self.stages_list[1](h)
+        if stage == "stage1":
+            return h
+        h = self.stages_list[2](h)
+        if stage == "stage2":
             return h
         raise ValueError(f"unknown stage {stage!r}")
 
@@ -282,14 +359,19 @@ def stage_displacement(model, f_clean, f_inj, stage, device, batch=32):
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--architecture", choices=["resnet18", "vit_mae", "udma_student"], default="resnet18",
+    p.add_argument("--architecture",
+                   choices=["resnet18", "convnextv2_fcmae", "vit_mae", "udma_student"],
+                   default="resnet18",
                    help="resnet18: out-of-domain P, RF sweep across stem/layer1/2/3 (default). "
+                        "convnextv2_fcmae: SAME domain+family as resnet18, but masked-"
+                        "reconstruction pretraining instead of classification — isolates "
+                        "objective from domain (needs `pip install timm` on the runner). "
                         "vit_mae: domain-matched teacher, single stage at --layer (localizing "
                         "reference) — requires --checkpoint/--model_config. udma_student: a "
                         "trained UDMA student's own output grid — requires --checkpoint/"
                         "--model_config (architecture: udma) and --student.")
     p.add_argument("--checkpoint", type=Path, default=None,
-                   help="Required for --architecture vit_mae/udma_student; ignored for resnet18.")
+                   help="Required for --architecture vit_mae/udma_student; ignored otherwise.")
     p.add_argument("--model_config", type=Path, default=ROOT / "configs/model/vit_mae.yaml",
                    help="Model config: vit_mae.yaml (patch_size -> token grid) for --architecture "
                         "vit_mae, or udma.yaml/udma_cnn_teacher.yaml for udma_student.")
@@ -306,6 +388,9 @@ def parse_args():
     p.add_argument("--drift_rate", type=float, default=0.3)
     p.add_argument("--stages", nargs="+", default=list(STAGES), choices=STAGES,
                    help="ResNet depth stages to sweep (resnet18 only).")
+    p.add_argument("--convnext_stages", nargs="+", default=list(CONVNEXT_STAGES),
+                   choices=CONVNEXT_STAGES,
+                   help="ConvNeXt V2 depth stages to sweep (convnextv2_fcmae only).")
     p.add_argument("--out_dir", type=Path, default=ROOT / "outputs/sweeps/teacher_row_leakage")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=42)
@@ -342,6 +427,12 @@ def main():
         stages = [model.stage_name]
         rf_label = {model.stage_name: f"teacher={teacher_type}"}
         print(f"  Student output grid: {model.grid_size}")
+    elif args.architecture == "convnextv2_fcmae":
+        print("Loading ConvNeXt V2 (ImageNet, FCMAE self-supervised, frozen) — "
+              "domain-vs-objective isolating control")
+        model = ConvNeXtV2Stages().to(args.device)
+        stages = args.convnext_stages
+        rf_label = {s: CONVNEXT_RF[s] for s in stages}
     else:
         print("Loading ResNet-18 (ImageNet, frozen) — teacher P, all stages")
         model = ResNetStages().to(args.device)
@@ -411,6 +502,16 @@ def main():
               "  cnn_distilled-target student doesn't, that's a second, architecture-independent\n"
               "  confirmation the TARGET's domain (not the CNN trunk) is the lever — corroborates\n"
               "  the teacher-level finding without any new training.")
+    elif args.architecture == "convnextv2_fcmae":
+        print("\n  Read: this is the domain-vs-objective isolating control (2026-07-16) — SAME\n"
+              "  domain (ImageNet) and family (CNN) as resnet18, but pretrained via masked-patch\n"
+              "  RECONSTRUCTION (FCMAE) instead of classification. Compare stage2 (/16 grid,\n"
+              "  matches resnet18's layer3) directly against resnet18 layer3's ratio (~2.17):\n"
+              "  if this localizes markedly better, the pretraining OBJECTIVE is the lever, not\n"
+              "  domain -> a CNN teacher distilled from THIS backbone could be paper-faithful\n"
+              "  (out-of-domain, generic) AND localizing, no audio/domain-closer backbone hunt\n"
+              "  needed. If it stays diffuse like resnet18, domain-matching is confirmed\n"
+              "  necessary regardless of pretraining objective.")
     else:
         print("\n  Read: if a shallow stage recovers a high ratio while layer3 is ~1, the RF is\n"
               "  the lever and the small-RF teacher is worth a distill+retrain run. If every\n"
