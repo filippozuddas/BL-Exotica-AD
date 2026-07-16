@@ -247,6 +247,12 @@ def parse_args():
                         "regardless of in_short_list (off_leak). The full CSV always "
                         "contains every candidate with the short-list columns either way; "
                         "this only affects which ones get a plot.")
+    p.add_argument("--off_ceiling_probe", type=int, default=300,
+                   help="Extra background snippets sampled across the whole cadence "
+                        "(beyond the candidate clusters) to build the off_noise_ceiling "
+                        "pool, so the ceiling reflects the cadence-wide OFF noise floor "
+                        "rather than only the OFF-row cells co-located with already-"
+                        "flagged candidates (a small, detection-biased sample).")
     return p.parse_args()
 
 
@@ -472,19 +478,44 @@ def main():
                     if off_idx:
                         off_pool.append(amap_c[off_idx, :].ravel())
 
+                # Broaden the pool beyond the (small, detection-biased) candidate
+                # clusters: sample background snippets spread across the whole
+                # cadence so the ceiling reflects the true cadence-wide OFF noise
+                # floor. Without this, the pool only contains OFF-row cells
+                # co-located in frequency with already-flagged candidates, which
+                # is neither representative nor guaranteed to be quiet — on a
+                # real Voyager-1 run this produced an unstable, too-low ceiling
+                # that killed the real candidate via off_leak (see
+                # udma_voyager_shortlist_off_leak_concern in memory).
+                if args.off_ceiling_probe > 0:
+                    rng = np.random.default_rng(cad_idx)
+                    n_bg = min(args.off_ceiling_probe, len(cad_fstarts_arr))
+                    bg_fstarts = rng.choice(cad_fstarts_arr, size=n_bg, replace=False)
+                    bg_snippets = [_preprocess_at(int(fs)) for fs in bg_fstarts]
+                    for bstart in range(0, len(bg_snippets), args.batch_size):
+                        chunk = bg_snippets[bstart:bstart + args.batch_size]
+                        x_bg = torch.from_numpy(np.stack(chunk)).float().unsqueeze(1).to(args.device)
+                        with torch.no_grad():
+                            amap_bg = model.anomaly_map(x_bg).cpu().numpy()
+                        off_idx = [r for r in off_rows_default if r < amap_bg.shape[1]]
+                        if off_idx:
+                            off_pool.append(amap_bg[:, off_idx, :].ravel())
+
                 # Per-cadence OFF-noise-core ceiling (src/search/candidates.py,
                 # Fase 3.1): replaces the Gaussian thresh_3 in the row-hit test
                 # below. Falls back to thresh_3 if the cluster pool is too
                 # small for a robust clip+quantile estimate (rare: needs
                 # >=MIN_OFF_POOL cells; MIN_OFF_POOL/len(off_rows_default)
                 # clusters at minimum, since each contributes ~len(off_rows)*nw cells).
-                if off_pool and sum(len(p) for p in off_pool) >= MIN_OFF_POOL:
+                off_pool_n = sum(len(p) for p in off_pool)
+                if off_pool and off_pool_n >= MIN_OFF_POOL:
                     off_ceiling = off_noise_ceiling(np.concatenate(off_pool))
                 else:
                     off_ceiling = thresh_3
                 print(f"  {method}: OFF-noise-core ceiling={off_ceiling:.4f} "
-                      f"(pooled from {len(off_pool)} clusters, "
-                      f"vs Gaussian 3s(ref)={thresh_3:.4f})")
+                      f"(pooled from {len(clusters)} clusters + "
+                      f"{n_bg if args.off_ceiling_probe > 0 else 0} background snippets, "
+                      f"{off_pool_n} cells, vs Gaussian 3s(ref)={thresh_3:.4f})")
 
                 contrasts, on_means, off_means = [], [], []
                 n_on_hits_l, n_off_hits_l = [], []
