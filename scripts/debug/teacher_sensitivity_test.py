@@ -73,6 +73,27 @@ AFFECTED_THR = 0.5
 UNAFFECTED_THR = 0.05
 
 
+class _TeacherCNNGateAdapter:
+    """Minimal ``patch_embed``/``pos_embed``/``encoder.layers`` wrapper so
+    ``encode_tokens_layer()`` runs on a distilled :class:`TeacherCNN`
+    unmodified — same trick as ``ResNetTeacher``: T has no transformer blocks
+    of its own, ``patch_embed`` does the whole conv stack and ``encoder.layers``
+    is empty. Uses T's RAW (pre-Norm) output — ``fit_udma_teacher_norm.py``
+    hasn't run yet at gate time, ``mu``/``sigma`` are still identity."""
+
+    def __init__(self, teacher_cnn):
+        from scripts.debug.resnet_teacher import _EmptyEncoder
+        self._t = teacher_cnn
+        self.grid_size = teacher_cnn.grid_size
+        self.pos_embed = 0.0
+        self.encoder = _EmptyEncoder()
+
+    def patch_embed(self, x: torch.Tensor) -> torch.Tensor:
+        raw = self._t._raw_tokens(x)  # (B, C, nh, nw)
+        b, c, nh, nw = raw.shape
+        return raw.permute(0, 2, 3, 1).reshape(b, nh * nw, c)
+
+
 @torch.no_grad()
 def encode_tokens_layer(model, frames: np.ndarray, device: str,
                         layer: int = -1, batch: int = 64) -> np.ndarray:
@@ -110,13 +131,15 @@ def patch_pixels(frames: np.ndarray, ph: int, pw: int) -> np.ndarray:
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--architecture", choices=["vit_mae", "resnet18"], default="vit_mae",
+    p.add_argument("--architecture", choices=["vit_mae", "resnet18", "cnn_distilled"], default="vit_mae",
                    help="Teacher candidate under test. 'resnet18' gates the paper-faithful "
                         "out-of-domain P (docs/2026-07-14_paper_alignment_plan.md, D6/D7) — "
                         "ignores --checkpoint/--model_config, no local weights needed "
-                        "(auto-downloads ImageNet weights via torchvision on first use).")
+                        "(auto-downloads ImageNet weights via torchvision on first use). "
+                        "'cnn_distilled' gates T after distillation (5.2, scripts/distill_teacher.py) "
+                        "— --checkpoint is T's trunk-only checkpoint.")
     p.add_argument("--checkpoint", type=Path, default=None,
-                   help="Required for --architecture vit_mae; ignored for resnet18.")
+                   help="Required for --architecture vit_mae/cnn_distilled; ignored for resnet18.")
     p.add_argument("--cache", type=Path, required=True)
     p.add_argument("--split", default="train")
     p.add_argument("--data_config", type=Path, default=ROOT / "configs/data/gbt_fine.yaml")
@@ -157,6 +180,19 @@ def main():
         ph = INPUT_SHAPE[0] // model.grid_size[0]
         pw = INPUT_SHAPE[1] // model.grid_size[1]
         ckpt_tag = "resnet18_imagenet"
+    elif args.architecture == "cnn_distilled":
+        from src.models.udma import _load_teacher_cnn
+        if args.checkpoint is None:
+            raise SystemExit("--checkpoint is required for --architecture cnn_distilled "
+                             "(T's trunk-only checkpoint from scripts/distill_teacher.py).")
+        print(f"Loading distilled CNN teacher T from {args.checkpoint}")
+        # Reuse build_udma's own loader (not a re-implementation): single
+        # source of truth for the checkpoint schema/fallback rules.
+        t_model = _load_teacher_cnn({"checkpoint": str(args.checkpoint)}, INPUT_SHAPE).to(args.device)
+        model = _TeacherCNNGateAdapter(t_model)
+        ph = INPUT_SHAPE[0] // model.grid_size[0]
+        pw = INPUT_SHAPE[1] // model.grid_size[1]
+        ckpt_tag = args.checkpoint.stem
     else:
         if args.checkpoint is None:
             raise SystemExit("--checkpoint is required for --architecture vit_mae.")
