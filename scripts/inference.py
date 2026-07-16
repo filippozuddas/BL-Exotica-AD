@@ -507,9 +507,21 @@ def main():
                 # small for a robust clip+quantile estimate (rare: needs
                 # >=MIN_OFF_POOL cells; MIN_OFF_POOL/len(off_rows_default)
                 # clusters at minimum, since each contributes ~len(off_rows)*nw cells).
+                #
+                # Floored at thresh_3 (2026-07-16, udma_voyager_shortlist_off_leak_concern):
+                # off_ceiling is a small (~15-cluster + probe), detection-biased sample and
+                # can compute BELOW thresh_3 on some cadences (observed on Voyager-1/topk:
+                # ceiling 0.29 < thresh_3 0.36), loosening the row-hit bar below what the
+                # candidate-selection threshold itself required and letting scattered,
+                # unrelated marginal cells (score ~ FAR1% line) count as coherent hits. This
+                # max() only ever tightens relative to the un-floored ceiling — the original
+                # cad02 rationale for off_ceiling (thresh_3 buried far below real OFF noise)
+                # is unaffected since there off_ceiling >> thresh_3 already. Unlike the
+                # column-coherence gate tried and rejected the same day, this is a level-only
+                # threshold change — no bias against fast/nonlinear drifters.
                 off_pool_n = sum(len(p) for p in off_pool)
                 if off_pool and off_pool_n >= MIN_OFF_POOL:
-                    off_ceiling = off_noise_ceiling(np.concatenate(off_pool))
+                    off_ceiling = max(off_noise_ceiling(np.concatenate(off_pool)), thresh_3)
                 else:
                     off_ceiling = thresh_3
                 print(f"  {method}: OFF-noise-core ceiling={off_ceiling:.4f} "
