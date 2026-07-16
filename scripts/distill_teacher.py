@@ -11,14 +11,11 @@ P: scripts/debug/resnet_teacher.py's ResNetTeacher (gate PASSED 2026-07-15,
 see memory: udma_resnet_teacher_gate) — frozen, forward through layer3,
 256ch on the (6,64) grid.
 
-T: TeacherCNN (src/models/udma.py) — build_encoder with the same
+T: TeacherCNN's trunk (src/models/udma.py) — build_encoder with the same
 parametrisation as the UDMA students (filters [32,64,128,256],
-convs_per_block 2), latent_dim=128 (D8). Trained here; D (a 1x1 conv
-128->256, D8) aligns T's channel count to P's for the loss only and is
-discarded afterward — only T's trunk is saved.
-
-Loss: L = ||D(T(x)) - P(x)||^2, MSE over the full (6,64) grid, no
-normalization (raw feature values on both sides).
+convs_per_block 2), latent_dim=128 (D8). Training itself lives in
+src/training/distill.py; this script is a thin CLI wrapper (loads data/P,
+calls distill_teacher(), saves the result).
 
 Usage (server, not dev machine):
     CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \\
@@ -30,15 +27,13 @@ Usage (server, not dev machine):
 
 import argparse
 import sys
-import time
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import pytorch_lightning as pl
 import torch
-import torch.nn.functional as F
-from torch import nn
 from torch.utils.data import DataLoader
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,21 +41,23 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.debug.resnet_teacher import ResNetTeacher
 from src.data.torch_dataset import build_datasets
-from src.models.encoder import build_encoder
+from src.training.distill import distill_teacher
 from src.utils.config import load_config
 
 DEFAULT_FILTERS = [32, 64, 128, 256]
 T_LATENT_DIM = 128
-P_CHANNELS = 256
+T_KERNEL_SIZE = (3, 3)
+T_ACTIVATION = "relu"
+T_USE_BATCHNORM = True
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--config", type=Path, default=ROOT / "configs/training/udma_gbt_fine_control_bs256.yaml",
-                   help="Training config referencing configs/data (cadence_list/frame/preprocessing). "
-                        "Only data/hardware sections are used -- model architecture is fixed below "
-                        "(distillation doesn't touch the student/memory config).")
+                   help="Training config referencing configs/data (cadence_list/frame/preprocessing) "
+                        "and hardware (num_gpus, used to pick --device by default). Model architecture "
+                        "is fixed below (distillation doesn't touch the student/memory config).")
     p.add_argument("--epochs", type=int, default=2,
                    help="1-2 epochs over the full train cache (plan default).")
     p.add_argument("--lr", type=float, default=1e-3)
@@ -71,7 +68,9 @@ def parse_args():
     p.add_argument("--convs_per_block", type=int, default=2)
     p.add_argument("--out", type=Path, required=True,
                    help="Output checkpoint path for T's trunk (no D, no optimizer state).")
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", default=None,
+                   help="Default: config-driven from --config's hardware.num_gpus "
+                        "('cuda' if > 0, else 'cpu').")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--log_every_n_steps", type=int, default=50)
     return p.parse_args()
@@ -79,9 +78,11 @@ def parse_args():
 
 def main():
     args = parse_args()
-    torch.manual_seed(args.seed)
+    pl.seed_everything(args.seed)
 
     cfg = load_config(args.config)
+    device = args.device or ("cuda" if cfg["hardware"].get("num_gpus", 0) > 0 else "cpu")
+
     data_cfg = cfg["data"]
     frame = data_cfg["frame"]
     input_shape = (frame["tchans"], frame["fchans"], 1)
@@ -97,7 +98,7 @@ def main():
     )
     if hasattr(val_ds, "close"):
         val_ds.close()
-    print(f"Distilling on {len(train_ds)} train snippets, input_shape={input_shape}")
+    print(f"Distilling on {len(train_ds)} train snippets, input_shape={input_shape}, device={device}")
 
     batch_size = args.batch_size or cfg["training"]["batch_size"]
     loader = DataLoader(
@@ -105,61 +106,29 @@ def main():
         num_workers=cfg["hardware"].get("num_workers", 4), drop_last=True,
     )
 
-    device = args.device
     print(f"Loading P (frozen ResNet-18, ImageNet, layer3) on {device}")
     P = ResNetTeacher().to(device)
     P.eval()
 
-    print(f"Building T (trainable, filters={args.filters}, latent_dim={T_LATENT_DIM}) "
-          f"+ D (1x1 {T_LATENT_DIM}->{P_CHANNELS}, distillation-only)")
-    T = build_encoder(
-        input_shape=input_shape, filters=args.filters, latent_dim=T_LATENT_DIM,
-        convs_per_block=args.convs_per_block, variational=False,
-    ).to(device)
-    D = nn.Conv2d(T_LATENT_DIM, P_CHANNELS, 1).to(device)
-
-    n_blocks = len(args.filters)
-    t_grid = (input_shape[0] // (2 ** n_blocks), input_shape[1] // (2 ** n_blocks))
-    if t_grid != P.grid_size:
-        raise ValueError(
-            f"T's trunk grid {t_grid} (input {input_shape[:2]} / {2**n_blocks}) must match "
-            f"P's grid {P.grid_size} -- adjust --filters."
-        )
-
-    optimizer = torch.optim.AdamW(
-        list(T.parameters()) + list(D.parameters()), lr=args.lr, weight_decay=args.weight_decay,
+    print(f"Distilling T (filters={args.filters}, latent_dim={T_LATENT_DIM}) "
+          f"+ D (1x1 {T_LATENT_DIM}->{P.channels}, distillation-only)")
+    T, losses = distill_teacher(
+        P, loader, input_shape, device,
+        filters=args.filters, latent_dim=T_LATENT_DIM, p_channels=P.channels,
+        kernel_size=T_KERNEL_SIZE, activation=T_ACTIVATION, use_batchnorm=T_USE_BATCHNORM,
+        convs_per_block=args.convs_per_block,
+        epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
+        log_every_n_steps=args.log_every_n_steps,
     )
-
-    losses = []
-    step = 0
-    t0 = time.time()
-    for epoch in range(args.epochs):
-        for x in loader:
-            x = x.to(device)
-            with torch.no_grad():
-                target = P(x)  # (B, 256, 6, 64), frozen
-
-            pred = D(T(x))  # (B, 256, 6, 64)
-            loss = F.mse_loss(pred, target)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            losses.append(float(loss.item()))
-            if step % args.log_every_n_steps == 0:
-                elapsed = time.time() - t0
-                print(f"  epoch {epoch} step {step}  loss={loss.item():.4f}  "
-                      f"({elapsed:.0f}s elapsed)")
-            step += 1
-
-        print(f"Epoch {epoch} done, {step} steps, last loss={losses[-1]:.4f}")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "trunk_state_dict": T.state_dict(),
         "filters": args.filters,
         "latent_dim": T_LATENT_DIM,
+        "kernel_size": T_KERNEL_SIZE,
+        "activation": T_ACTIVATION,
+        "use_batchnorm": T_USE_BATCHNORM,
         "convs_per_block": args.convs_per_block,
         "final_loss": losses[-1],
     }, args.out)
