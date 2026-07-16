@@ -73,9 +73,13 @@ def main():
         "teacher(x) shape == (B, channels, nh, nw)",
         tuple(target.shape) == (BATCH, model.teacher.channels, *model.teacher.grid_size),
     )
-    tok_default = model.teacher.vit.encode_tokens(x)
-    tok_final = model.teacher.vit.encode_tokens_at(x, -1)
-    _check("encode_tokens(x) == encode_tokens_at(x, -1)", torch.allclose(tok_default, tok_final))
+    if hasattr(model.teacher, "vit"):
+        tok_default = model.teacher.vit.encode_tokens(x)
+        tok_final = model.teacher.vit.encode_tokens_at(x, -1)
+        _check("encode_tokens(x) == encode_tokens_at(x, -1)", torch.allclose(tok_default, tok_final))
+    else:
+        print(f"  [SKIP] encode_tokens/_at(-1) regression check "
+              f"({type(model.teacher).__name__} has no ViT-MAE internals to check)")
 
     print("3. Student forward shapes...")
     s_ae = model.student_ae(x)
