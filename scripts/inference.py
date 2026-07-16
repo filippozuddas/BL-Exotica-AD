@@ -9,7 +9,9 @@ Each cadence gets its own output folder named:
     cad{idx}_{target}_{fch1_MHz}MHz_{date}
 
 Candidate snippets are saved with per-candidate plots showing
-original | reconstruction | error map.
+original | reconstruction | error map, either as one multi-page PDF per
+cadence per method (default, fast vetting) or individual PNGs
+(--plot_format png/both).
 
 Usage (run on the server):
     CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
@@ -31,6 +33,7 @@ import h5py
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 import numpy as np
 import torch
 import yaml
@@ -163,8 +166,12 @@ def make_cadence_dirname(cad_idx: int, meta: dict) -> str:
 
 
 def plot_candidate(original, reconstruction, score, sigma, method, cad_idx,
-                   target, f_start, df, out_path, anomaly_map=None):
-    """``reconstruction``/error panels for pixel-decoder backbones; if
+                   target, f_start, df, anomaly_map=None):
+    """Build (but don't save) the original|reconstruction|error figure for one
+    candidate; caller decides whether to write it to PNG, a per-cadence PDF,
+    or both (see ``--plot_format``).
+
+    ``reconstruction``/error panels for pixel-decoder backbones; if
     ``reconstruction`` is None (UDMA, no pixel decoder), ``anomaly_map`` — its
     native (nh,nw) disagreement grid — is shown instead (see
     ``UDMA.anomaly_map`` / ``scripts/debug/udma_anomaly_maps.py``)."""
@@ -208,8 +215,7 @@ def plot_candidate(original, reconstruction, score, sigma, method, cad_idx,
         fontsize=11,
     )
     plt.tight_layout()
-    plt.savefig(out_path, dpi=120, bbox_inches="tight")
-    plt.close()
+    return fig
 
 
 def parse_args():
@@ -227,6 +233,10 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=16)
     p.add_argument("--top_k", type=int, default=30,
                    help="Number of top candidates to plot per cadence per method")
+    p.add_argument("--plot_format", default="pdf", choices=["pdf", "png", "both"],
+                   help="Candidate plot output: one multi-page PDF per cadence per "
+                        "method (fast vetting, default), individual PNGs (old "
+                        "behaviour), or both.")
     p.add_argument("--methods", nargs="+", default=["recon"], choices=METHODS,
                    help="Anomaly scoring methods to run. The plain Autoencoder/MAE/VAE "
                         "only support 'recon'/'topk'; 'cadence' requires the ViT-MAE "
@@ -527,6 +537,10 @@ def main():
 
             top_clusters = clusters_ranked.head(args.top_k).reset_index(drop=True)
             n_plots += len(top_clusters)
+            want_pdf = args.plot_format in ("pdf", "both")
+            want_png = args.plot_format in ("png", "both")
+            pdf = (PdfPages(cad_dir / f"{method}_candidates.pdf") if want_pdf and
+                   len(top_clusters) > 0 else None)
             for rank, row in top_clusters.iterrows():
                 fs = int(row["f_start_peak"])
                 score = float(row["peak_score"])
@@ -536,15 +550,22 @@ def main():
                 recon = None
                 if amap is None:
                     recon = reconstruct_batch(model, [snippet], args.device)[0]
-                out_path = cad_dir / f"{method}_rank{rank:02d}_f{fs}.png"
-                plot_candidate(
+                fig = plot_candidate(
                     original=snippet,
                     reconstruction=recon,
                     score=score, sigma=sigma, method=method,
                     cad_idx=cad_idx, target=target_name,
-                    f_start=fs, df=df, out_path=out_path,
+                    f_start=fs, df=df,
                     anomaly_map=amap,
                 )
+                if pdf is not None:
+                    pdf.savefig(fig, bbox_inches="tight")
+                if want_png:
+                    fig.savefig(cad_dir / f"{method}_rank{rank:02d}_f{fs}.png",
+                                dpi=120, bbox_inches="tight")
+                plt.close(fig)
+            if pdf is not None:
+                pdf.close()
 
         # Per-cadence frequency profile, one per method
         for method in methods:
