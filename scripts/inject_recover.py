@@ -261,18 +261,31 @@ def main():
         n_probe = min(args.n_background_probe, nchans - fchans)
         probe_fstarts = rng.choice((nchans - fchans), size=n_probe, replace=False)
         probe_scores = {m: [] for m in methods}
+        # Quiet-site selection below always needs a "recon" score, regardless
+        # of which methods the user asked to benchmark (--methods topk alone
+        # used to crash here with KeyError('recon') — 2026-07-16 fix): compute
+        # it unconditionally, reusing the already-scored value when "recon" is
+        # itself one of the requested methods instead of a redundant forward.
+        need_recon_probe = "recon" not in methods
+        recon_probe_list = [] if need_recon_probe else None
         for fs in probe_fstarts:
             snip = preprocess_raw_window(obs_arrays, fs, fchans, preproc)
             for m in methods:
                 probe_scores[m].append(score_snippet(model, snip, m, args.device, args.topk_frac))
+            if need_recon_probe:
+                recon_probe_list.append(score_snippet(model, snip, "recon", args.device))
         probe_scores = {m: np.array(v) for m, v in probe_scores.items()}
 
         for m in methods:
             bg_scores[m].extend(probe_scores[m].tolist())
             bg_by_cad[m].append(probe_scores[m])
 
-        # Use the quietest 50% (by recon score) as injection sites
-        recon_probe = probe_scores["recon"]
+        # Use the quietest 50% (by recon score) as injection sites — recon is
+        # the selection criterion regardless of --methods (see fix above): the
+        # smoothest/most robust quiet-site detector (mean aggregation), kept
+        # constant so injection-site selection doesn't vary with topk_frac
+        # sweeps or other --methods choices.
+        recon_probe = np.array(recon_probe_list) if need_recon_probe else probe_scores["recon"]
         quiet_mask = recon_probe <= np.median(recon_probe)
         quiet_fstarts = probe_fstarts[quiet_mask]
         log(f"  Probed {n_probe} windows (background), "
