@@ -231,6 +231,7 @@ def full_row_hits(
     threshold: float,
     on_rows=(0, 2, 4),
     off_rows=(1, 3, 5),
+    leak_frac: float = 0.3,
 ) -> dict:
     """Row-level ON/OFF hit counts with no column restriction, for short-list
     volume reduction (separate from ``on_off_contrast``, which still drives
@@ -249,9 +250,16 @@ def full_row_hits(
 
     Short-list rule: ``n_on_hits_full >= 2`` (out of ``len(on_rows)``, mirrors
     ``on_off_contrast``'s existing per-row hit counting) AND not ``off_leak``,
-    where ``off_leak`` requires >=2 of ``len(off_rows)`` OFF rows to
-    independently clear ``threshold`` (a single OFF hit can be a coincidental
-    unrelated blip; two independent OFF pointings agreeing is not).
+    where ``off_leak`` requires >=2 of ``len(off_rows)`` OFF rows to clear
+    ``threshold`` AND reach at least ``leak_frac`` of the weakest ON row's own
+    peak. The magnitude gate (added 2026-07-16, Voyager-1 real-signal check)
+    stops a couple of low-amplitude OFF blips — barely above ``threshold``
+    but tiny next to the ON signal — from binary-rejecting an otherwise
+    overwhelming candidate (observed: real Voyager-1 carrier, on_off_contrast
+    32x, killed by 2 OFF blips averaging ~3% of the ON magnitude). Persistent
+    RFI or a fast chirp visible in every block (the cases this filter exists
+    to catch) still trips ``off_leak`` because its OFF-row magnitude is
+    comparable to its own ON-row magnitude, not just above the noise floor.
 
     Args:
         anomaly_map: ``(6, 64)`` map from ``UDMA.anomaly_map`` /
@@ -260,6 +268,9 @@ def full_row_hits(
             ``on_off_contrast``.
         on_rows: grid row indices corresponding to ON-target observations.
         off_rows: grid row indices corresponding to OFF-target observations.
+        leak_frac: minimum fraction of the weakest ON row's peak an OFF row's
+            peak must reach (in addition to clearing ``threshold``) to count
+            as a leak hit.
 
     Returns:
         dict with ``n_on_hits_full``, ``n_off_hits_full``, ``off_leak``,
@@ -272,7 +283,10 @@ def full_row_hits(
     off_row_max = anomaly_map[off_idx, :].max(axis=1) if off_idx else np.array([])
 
     n_on_hits_full = int((on_row_max > threshold).sum())
-    n_off_hits_full = int((off_row_max > threshold).sum())
+
+    on_ref = float(on_row_max.min()) if on_row_max.size else 0.0
+    leak_mask = (off_row_max > threshold) & (off_row_max >= leak_frac * on_ref)
+    n_off_hits_full = int(leak_mask.sum())
     off_leak = n_off_hits_full >= 2
     in_short_list = (n_on_hits_full >= 2) and not off_leak
 
