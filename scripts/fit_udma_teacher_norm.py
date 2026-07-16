@@ -74,7 +74,9 @@ def main():
     )
     model.to(args.device)
 
-    print(f"Teacher layer: {model.teacher.teacher_layer}, channels: {model.teacher.channels}")
+    teacher_layer = getattr(model.teacher, "teacher_layer", None)
+    layer_info = f"layer {teacher_layer}" if teacher_layer is not None else type(model.teacher).__name__
+    print(f"Teacher: {layer_info}, channels: {model.teacher.channels}, grid: {model.teacher.grid_size}")
     model.teacher.fit_normalization(loader, args.device, max_batches=args.max_batches)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
