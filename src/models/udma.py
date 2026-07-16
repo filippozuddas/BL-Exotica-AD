@@ -57,38 +57,27 @@ __all__ = ["TeacherViT", "TeacherCNN", "FeatureStudent", "UDMA", "build_udma"]
 _ROOT = Path(__file__).resolve().parents[2]
 
 
-class TeacherViT(nn.Module):
-    """Frozen ViT-MAE encoder, read at an intermediate transformer block.
-
-    Wraps a checkpointed :class:`ViTMAE` (never trained further — parameters
-    have ``requires_grad=False`` and the module is pinned in ``eval()`` mode
-    regardless of the parent Lightning module's train/eval state, since it has
-    no BatchNorm to need train-mode statistics). ``forward`` returns the
-    Norm-ed token grid ``(B, 128, 6, 64)`` that is the UDMA students' regression
-    target.
+class _FrozenTokenTeacher(nn.Module):
+    """Shared base for a frozen, Norm-ed token-grid teacher: buffers
+    (``mu``/``sigma``), eval-mode pinning, ``forward``, and
+    ``fit_normalization`` are identical regardless of what produces the raw
+    ``(B, channels, nh, nw)`` grid (a ViT-MAE block or a distilled CNN trunk)
+    — subclasses set ``self.channels``/``self.grid_size`` and implement
+    ``_raw_tokens`` in ``__init__``, and MUST call ``self.eval()`` at the end
+    of their own ``__init__`` (registering the ``mu``/``sigma`` buffers here
+    doesn't pin eval mode by itself — a subclass with BatchNorm layers left
+    in the default ``training=True`` state would normalize with per-batch
+    stats instead of the frozen running stats until something up the module
+    hierarchy calls ``.train()``/``.eval()``, which does not happen for
+    standalone use like the teacher-sensitivity gate scripts).
     """
 
-    def __init__(self, vit: ViTMAE, teacher_layer: int = 3):
-        super().__init__()
-        self.vit = vit
-        self.teacher_layer = teacher_layer
-        for p in self.vit.parameters():
-            p.requires_grad_(False)
-        nh, nw = self.vit.grid_size
-        self.grid_size = (nh, nw)
-        self.channels = self.vit.patch_embed.proj.out_channels
-        self.register_buffer("mu", torch.zeros(self.channels))
-        self.register_buffer("sigma", torch.ones(self.channels))
-
-    def train(self, mode: bool = True) -> "TeacherViT":
+    def train(self, mode: bool = True) -> "_FrozenTokenTeacher":
         return super().train(False)
 
     def _raw_tokens(self, x: torch.Tensor) -> torch.Tensor:
-        """``(B,C,H,W) -> (B, channels, nh, nw)``, before Norm."""
-        nh, nw = self.grid_size
-        tokens = self.vit.encode_tokens_at(x, layer=self.teacher_layer)  # (B, nh*nw, D)
-        b, n, d = tokens.shape
-        return tokens.reshape(b, nh, nw, d).permute(0, 3, 1, 2)  # (B, D, nh, nw)
+        """``(B,C,H,W) -> (B, channels, nh, nw)``, before Norm. Override in subclasses."""
+        raise NotImplementedError
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -97,7 +86,8 @@ class TeacherViT(nn.Module):
 
     @torch.no_grad()
     def fit_normalization(self, loader, device: torch.device, max_batches: Optional[int] = None) -> None:
-        """Offline per-channel mean/std of the raw (pre-Norm) token grid over ``loader``.
+        """Offline per-channel mean/std of the raw (pre-Norm) token/feature grid
+        over ``loader``.
 
         One-shot (Q2/Q7): call once on the training set, then the resulting
         ``mu``/``sigma`` buffers are saved with the UDMA checkpoint.
@@ -121,7 +111,39 @@ class TeacherViT(nn.Module):
         self.sigma.copy_(var.sqrt().to(self.sigma.dtype))
 
 
-class TeacherCNN(nn.Module):
+class TeacherViT(_FrozenTokenTeacher):
+    """Frozen ViT-MAE encoder, read at an intermediate transformer block.
+
+    Wraps a checkpointed :class:`ViTMAE` (never trained further — parameters
+    have ``requires_grad=False`` and the module is pinned in ``eval()`` mode
+    regardless of the parent Lightning module's train/eval state, since it has
+    no BatchNorm to need train-mode statistics). ``forward`` returns the
+    Norm-ed token grid ``(B, 128, 6, 64)`` that is the UDMA students' regression
+    target.
+    """
+
+    def __init__(self, vit: ViTMAE, teacher_layer: int = 3):
+        super().__init__()
+        self.vit = vit
+        self.teacher_layer = teacher_layer
+        for p in self.vit.parameters():
+            p.requires_grad_(False)
+        nh, nw = self.vit.grid_size
+        self.grid_size = (nh, nw)
+        self.channels = self.vit.patch_embed.proj.out_channels
+        self.register_buffer("mu", torch.zeros(self.channels))
+        self.register_buffer("sigma", torch.ones(self.channels))
+        self.eval()
+
+    def _raw_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        """``(B,C,H,W) -> (B, channels, nh, nw)``, before Norm."""
+        nh, nw = self.grid_size
+        tokens = self.vit.encode_tokens_at(x, layer=self.teacher_layer)  # (B, nh*nw, D)
+        b, n, d = tokens.shape
+        return tokens.reshape(b, nh, nw, d).permute(0, 3, 1, 2)  # (B, D, nh, nw)
+
+
+class TeacherCNN(_FrozenTokenTeacher):
     """Frozen CNN teacher distilled from a generic pretrained backbone P
     (paper-faithful route, Qi et al. 2024 Eq. 2 / Bergmann "Uninformed
     Students" — teacher feature space anchored out-of-domain by construction;
@@ -135,8 +157,9 @@ class TeacherCNN(nn.Module):
     (6,64) grid via a distillation-only 1x1 projection D, discarded after
     training) then loaded here as a fixed teacher — same
     ``forward``/``grid_size``/``channels``/``mu``/``sigma``/``fit_normalization``
-    interface as :class:`TeacherViT`, so :func:`build_udma` only needs to
-    branch at construction time (``teacher.type: cnn_distilled``).
+    interface as :class:`TeacherViT` (both via :class:`_FrozenTokenTeacher`),
+    so :func:`build_udma` only needs to branch at construction time
+    (``teacher.type: cnn_distilled``).
     """
 
     def __init__(
@@ -170,40 +193,16 @@ class TeacherCNN(nn.Module):
         self.channels = latent_dim
         self.register_buffer("mu", torch.zeros(self.channels))
         self.register_buffer("sigma", torch.ones(self.channels))
-
-    def train(self, mode: bool = True) -> "TeacherCNN":
-        return super().train(False)
+        # Required: trunk has BatchNorm (use_batchnorm=True by default) and
+        # this class is also used standalone (e.g. teacher_sensitivity_test.py
+        # --architecture cnn_distilled), which never calls .eval() itself —
+        # without this, BatchNorm normalizes with per-batch stats instead of
+        # the running stats learned during distillation. See class docstring.
+        self.eval()
 
     def _raw_tokens(self, x: torch.Tensor) -> torch.Tensor:
         """``(B,C,H,W) -> (B, channels, nh, nw)``, before Norm."""
         return self.trunk(x)
-
-    @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raw = self._raw_tokens(x)
-        return (raw - self.mu.view(1, -1, 1, 1)) / (self.sigma.view(1, -1, 1, 1) + 1e-6)
-
-    @torch.no_grad()
-    def fit_normalization(self, loader, device: torch.device, max_batches: Optional[int] = None) -> None:
-        """Offline per-channel mean/std of the raw (pre-Norm) feature grid over
-        ``loader`` — identical scheme to :meth:`TeacherViT.fit_normalization`."""
-        self.eval()
-        total = torch.zeros(self.channels, dtype=torch.float64, device=device)
-        total_sq = torch.zeros(self.channels, dtype=torch.float64, device=device)
-        count = 0
-        for i, x in enumerate(loader):
-            if max_batches is not None and i >= max_batches:
-                break
-            x = x.to(device)
-            raw = self._raw_tokens(x).double()  # (B, D, nh, nw)
-            flat = raw.permute(1, 0, 2, 3).reshape(self.channels, -1)
-            total += flat.sum(dim=1)
-            total_sq += (flat ** 2).sum(dim=1)
-            count += flat.shape[1]
-        mean = total / count
-        var = (total_sq / count - mean ** 2).clamp_min(0.0)
-        self.mu.copy_(mean.to(self.mu.dtype))
-        self.sigma.copy_(var.sqrt().to(self.sigma.dtype))
 
 
 class FeatureStudent(nn.Module):
@@ -387,14 +386,35 @@ def _load_teacher_vit(vit_config_path: Path, checkpoint_path: Path, input_shape:
 def _load_teacher_cnn(teacher_cfg: Dict, input_shape: Tuple[int, int, int]) -> TeacherCNN:
     """Build a :class:`TeacherCNN` and load a trunk-only checkpoint saved by
     ``scripts/distill_teacher.py`` (``{"trunk_state_dict", "filters",
-    "latent_dim", "convs_per_block"}`` — no distillation projection D)."""
+    "latent_dim", "convs_per_block", ...}`` — no distillation projection D).
+
+    Architecture comes from the checkpoint itself (self-describing — the
+    single source of truth for what was actually distilled), never silently
+    from ``teacher_cfg``: a stale/mismatched config value could otherwise
+    load a checkpoint's weights into the wrong architecture without any
+    shape error (e.g. ``activation`` differs but produces identical tensor
+    shapes). ``kernel_size``/``activation``/``use_batchnorm`` fall back to
+    :class:`TeacherCNN`'s own defaults only for checkpoints saved before
+    2026-07-16 (when those keys were added) — their true value was always
+    that default.
+    """
     checkpoint_path = _ROOT / teacher_cfg["checkpoint"]
     ckpt = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
-    filters = list(ckpt.get("filters", teacher_cfg.get("filters", [32, 64, 128, 256])))
-    latent_dim = int(ckpt.get("latent_dim", teacher_cfg.get("latent_dim", 128)))
-    convs_per_block = int(ckpt.get("convs_per_block", teacher_cfg.get("convs_per_block", 2)))
+    missing = [k for k in ("filters", "latent_dim", "convs_per_block") if k not in ckpt]
+    if missing:
+        raise KeyError(
+            f"Distilled-teacher checkpoint {checkpoint_path} is missing required "
+            f"architecture key(s) {missing} — was it saved by scripts/distill_teacher.py? "
+            f"Re-run distillation."
+        )
     teacher = TeacherCNN(
-        input_shape, filters=filters, latent_dim=latent_dim, convs_per_block=convs_per_block,
+        input_shape,
+        filters=list(ckpt["filters"]),
+        latent_dim=int(ckpt["latent_dim"]),
+        kernel_size=tuple(ckpt.get("kernel_size", (3, 3))),
+        activation=ckpt.get("activation", "relu"),
+        use_batchnorm=bool(ckpt.get("use_batchnorm", True)),
+        convs_per_block=int(ckpt["convs_per_block"]),
     )
     teacher.trunk.load_state_dict(ckpt["trunk_state_dict"])
     return teacher
