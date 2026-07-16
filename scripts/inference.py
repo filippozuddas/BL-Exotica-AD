@@ -242,6 +242,11 @@ def parse_args():
                         "only support 'recon'/'topk'; 'cadence' requires the ViT-MAE "
                         "backbone; UDMA supports 'recon'/'topk'/'max' (its own topk_frac "
                         "default, no 'cadence').")
+    p.add_argument("--ignore_short_list", action="store_true",
+                   help="Diagnostic only: plot the top_k candidates by on_off_contrast "
+                        "regardless of in_short_list (off_leak). The full CSV always "
+                        "contains every candidate with the short-list columns either way; "
+                        "this only affects which ones get a plot.")
     return p.parse_args()
 
 
@@ -524,7 +529,7 @@ def main():
             # (full_row_hits: n_on_hits_full>=2 AND not off_leak). The full
             # CSV below still has every candidate — this only shrinks what
             # gets plotted for manual vetting.
-            if has_amap and len(clusters) > 0:
+            if has_amap and len(clusters) > 0 and not args.ignore_short_list:
                 short_mask = clusters["in_short_list"].to_numpy()
                 short_idx = np.nonzero(short_mask)[0]
                 order = short_idx[np.argsort(-clusters["on_off_contrast"].to_numpy()[short_idx])]
@@ -532,6 +537,12 @@ def main():
                 amaps_by_cluster = [amaps_by_cluster[i] for i in order]
                 print(f"  {method}: {len(order)}/{len(clusters)} candidates "
                       f"in short list after ON/OFF full-row filter")
+            elif has_amap and len(clusters) > 0:
+                order = np.argsort(-clusters["on_off_contrast"].to_numpy())
+                clusters_ranked = clusters.iloc[order].reset_index(drop=True)
+                amaps_by_cluster = [amaps_by_cluster[i] for i in order]
+                print(f"  {method}: --ignore_short_list set, plotting top {args.top_k} "
+                      f"by on_off_contrast regardless of off_leak")
             else:
                 clusters_ranked = clusters
 
