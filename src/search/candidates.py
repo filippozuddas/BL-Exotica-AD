@@ -248,6 +248,17 @@ def full_row_hits(
     short-list membership (candidate shown for manual vetting vs. kept in the
     full CSV only), never for ranking or as a silent discard.
 
+    A column-coherence gate (require each row's hit to land near the
+    strongest ON row's peak column) was tried and REJECTED (2026-07-16): at
+    this product's grid resolution (~45 Hz/column) and the ~600s gap between
+    ON blocks, even the project's *median* drift rate (0.3 Hz/s) already
+    shifts the peak by ~4 columns block-to-block — a tight column tolerance
+    would silently reject genuine drifting technosignatures (this pipeline's
+    stated differentiator vs. narrowband-only turboSETI), trading a handful
+    of visually-obvious noise blips (cheap for a human reviewer to dismiss)
+    for silent false negatives on the exact signals being searched for. See
+    [[udma_voyager_shortlist_off_leak_concern]] for the full reasoning.
+
     Short-list rule: ``n_on_hits_full >= 2`` (out of ``len(on_rows)``, mirrors
     ``on_off_contrast``'s existing per-row hit counting) AND not ``off_leak``,
     where ``off_leak`` requires >=2 of ``len(off_rows)`` OFF rows to clear

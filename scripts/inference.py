@@ -508,26 +508,39 @@ def main():
                 # >=MIN_OFF_POOL cells; MIN_OFF_POOL/len(off_rows_default)
                 # clusters at minimum, since each contributes ~len(off_rows)*nw cells).
                 #
-                # Floored at thresh_3 (2026-07-16, udma_voyager_shortlist_off_leak_concern):
+                # Floored at thresh_5 (2026-07-16, udma_voyager_shortlist_off_leak_concern):
                 # off_ceiling is a small (~15-cluster + probe), detection-biased sample and
-                # can compute BELOW thresh_3 on some cadences (observed on Voyager-1/topk:
-                # ceiling 0.29 < thresh_3 0.36), loosening the row-hit bar below what the
-                # candidate-selection threshold itself required and letting scattered,
-                # unrelated marginal cells (score ~ FAR1% line) count as coherent hits. This
-                # max() only ever tightens relative to the un-floored ceiling — the original
-                # cad02 rationale for off_ceiling (thresh_3 buried far below real OFF noise)
-                # is unaffected since there off_ceiling >> thresh_3 already. Unlike the
+                # can compute BELOW the Gaussian reference on some cadences (observed on
+                # Voyager-1/topk: ceiling 0.29 < thresh_3 0.36), loosening the row-hit bar
+                # below what candidate-selection itself required and letting scattered,
+                # unrelated marginal cells (score ~ FAR1% line) count as coherent hits — a
+                # multiple-comparisons artifact over ~2000 snippets x 6 rows x several
+                # clusters. Flooring at thresh_3 first (empirically tested on Voyager-1)
+                # still let 1 residual noise candidate through (score right at the 3sigma
+                # line); thresh_5 (5*MAD_sigma, ~2.9e-7 nominal tail under the Gaussian
+                # reference, i.e. the standard many-comparisons response of raising the
+                # per-test significance bar) gives a clean 3/3 real candidates, 0 noise.
+                # Raising the row-hit floor does NOT reduce raw detection sensitivity: which
+                # candidates get flagged at all is still governed by FAR1% clustering
+                # upstream (cluster_candidates) — this floor only affects whether an already-
+                # flagged candidate also earns automatic short-list membership; anything it
+                # excludes still survives in the full per-cadence CSV for human review, so a
+                # genuine but fainter signal is not silently dropped from the pipeline, only
+                # from the auto-shortlist convenience view. This max() only ever tightens
+                # relative to the un-floored ceiling — the original cad02 rationale for
+                # off_ceiling (Gaussian reference buried far below real OFF noise) is
+                # unaffected since there off_ceiling >> thresh_5 already. Unlike the
                 # column-coherence gate tried and rejected the same day, this is a level-only
                 # threshold change — no bias against fast/nonlinear drifters.
                 off_pool_n = sum(len(p) for p in off_pool)
                 if off_pool and off_pool_n >= MIN_OFF_POOL:
-                    off_ceiling = max(off_noise_ceiling(np.concatenate(off_pool)), thresh_3)
+                    off_ceiling = max(off_noise_ceiling(np.concatenate(off_pool)), thresh_5)
                 else:
-                    off_ceiling = thresh_3
+                    off_ceiling = thresh_5
                 print(f"  {method}: OFF-noise-core ceiling={off_ceiling:.4f} "
                       f"(pooled from {len(clusters)} clusters + "
                       f"{n_bg if args.off_ceiling_probe > 0 else 0} background snippets, "
-                      f"{off_pool_n} cells, vs Gaussian 3s(ref)={thresh_3:.4f})")
+                      f"{off_pool_n} cells, vs Gaussian 3s(ref)={thresh_3:.4f}, 5s(ref)={thresh_5:.4f})")
 
                 contrasts, on_means, off_means = [], [], []
                 n_on_hits_l, n_off_hits_l = [], []
