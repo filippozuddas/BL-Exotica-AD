@@ -47,4 +47,4 @@ loss:
 
 scoring:
   weights: [0.5, 0.5, 0.5]
-  topk_frac: 0.02
+  topk_frac: 0.01
