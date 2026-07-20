@@ -50,7 +50,7 @@ from src.search.candidates import (
 
 FAR_QUANTILE = 0.99
 MIN_OFF_POOL = 30
-from src.utils.visualization import overlay_anomaly_map
+from src.utils.visualization import plot_candidate
 
 METHODS = ["recon", "topk", "max", "cadence"]
 MAD_SCALE = 1.4826
@@ -163,59 +163,6 @@ def read_cadence_meta(h5_path: Path) -> dict:
 def make_cadence_dirname(cad_idx: int, meta: dict) -> str:
     fch1_str = f"{meta['fch1_mhz']:.1f}MHz"
     return f"cad{cad_idx:02d}_{meta['source']}_{fch1_str}_{meta['date']}"
-
-
-def plot_candidate(original, reconstruction, score, sigma, method, cad_idx,
-                   target, f_start, df, anomaly_map=None):
-    """Build (but don't save) the original|reconstruction|error figure for one
-    candidate; caller decides whether to write it to PNG, a per-cadence PDF,
-    or both (see ``--plot_format``).
-
-    ``reconstruction``/error panels for pixel-decoder backbones; if
-    ``reconstruction`` is None (UDMA, no pixel decoder), ``anomaly_map`` — its
-    native (nh,nw) disagreement grid — is shown instead (see
-    ``UDMA.anomaly_map`` / ``scripts/debug/udma_anomaly_maps.py``)."""
-    vmin, vmax = np.percentile(original, [1, 99])
-
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-
-    im0 = axes[0].imshow(original, aspect="auto", origin="upper",
-                          vmin=vmin, vmax=vmax, cmap="viridis")
-    axes[0].set_title("Original")
-    axes[0].set_ylabel("Time bin")
-    axes[0].set_xlabel("Freq channel")
-    plt.colorbar(im0, ax=axes[0], fraction=0.046)
-
-    if reconstruction is not None:
-        im1 = axes[1].imshow(reconstruction, aspect="auto", origin="upper",
-                              vmin=vmin, vmax=vmax, cmap="viridis")
-        axes[1].set_title("Reconstruction")
-        axes[1].set_xlabel("Freq channel")
-        plt.colorbar(im1, ax=axes[1], fraction=0.046)
-
-        error = np.abs(original - reconstruction)
-        im2 = axes[2].imshow(error, aspect="auto", origin="upper", cmap="hot")
-        axes[2].set_title("Residual |orig - recon|")
-        axes[2].set_xlabel("Freq channel")
-        plt.colorbar(im2, ax=axes[2], fraction=0.046)
-    else:
-        im1 = axes[1].imshow(anomaly_map, aspect="auto", origin="upper", cmap="viridis")
-        axes[1].set_title("anomaly_map (UDMA, native (nh,nw) grid)")
-        axes[1].set_xlabel("Freq patch col")
-        axes[1].set_ylabel("Time patch row")
-        plt.colorbar(im1, ax=axes[1], fraction=0.046)
-        overlay_anomaly_map(axes[2], original, anomaly_map,
-                             title="anomaly_map (bilinear overlay)")
-
-    f_center_mhz = f_start * df / 1e6
-    fig.suptitle(
-        f"Candidate: cad={cad_idx} ({target})  f_start={f_start}  "
-        f"f~{f_center_mhz:.4f} MHz\n"
-        f"{method} score={score:.4f} ({sigma:.1f}s)",
-        fontsize=11,
-    )
-    plt.tight_layout()
-    return fig
 
 
 def parse_args():

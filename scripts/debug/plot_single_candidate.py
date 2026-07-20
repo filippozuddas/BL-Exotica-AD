@@ -1,6 +1,7 @@
 """
-Plot one specific candidate from an already-run inference pass, without
-re-running the full sliding-window scan over the cadence.
+Plot one specific candidate snippet (cadence + f_start) from an already-run
+inference pass, without re-running the full sliding-window scan and without
+loading any model — just extracts and plots the raw + preprocessed snippet.
 
 Two ways to pick the candidate:
 
@@ -9,33 +10,30 @@ Two ways to pick the candidate:
    resolved automatically:
 
     python scripts/debug/plot_single_candidate.py \
-        --checkpoint outputs/<run>/checkpoints/best.ckpt \
-        --model_config configs/model/udma.yaml \
         --data_config configs/data/gbt_fine.yaml \
         --cadence_list data/processed/inference_cadences.txt \
         --cad_idx 3 \
         --candidates_csv outputs/inference/<run>/cad03_.../topk_candidates.csv \
         --rank 1 \
-        --out_dir outputs/inference/<run>/cad03_.../inspect \
-        --method topk
+        --out_dir outputs/inference/<run>/cad03_.../inspect
 
 2. Manually, by explicit obs paths + f_start:
 
     python scripts/debug/plot_single_candidate.py \
-        --checkpoint outputs/<run>/checkpoints/best.ckpt \
-        --model_config configs/model/udma.yaml \
         --data_config configs/data/gbt_fine.yaml \
         --obs_paths <6 space-separated .h5 paths for the cadence> \
         --f_start 42123264 \
-        --out_dir outputs/inference/<run>/cad03_.../inspect \
-        --method topk
+        --out_dir outputs/inference/<run>/cad03_.../inspect
 """
 import argparse
 import csv
 import sys
 from pathlib import Path
 
-import torch
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -43,19 +41,15 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from src.data.torch_dataset import _load_full_obs
-from src.search.candidates import on_off_contrast
+from src.data.preprocessing import bandpass_correct, core_transform
 import inference as inf
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--checkpoint", type=Path, required=True)
-    p.add_argument("--model_config", type=Path, required=True)
     p.add_argument("--data_config", type=Path, required=True)
     p.add_argument("--out_dir", type=Path, required=True)
-    p.add_argument("--method", default="topk", choices=inf.METHODS)
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
     p.add_argument("--obs_paths", nargs=6, default=None,
                     help="6 space-separated .h5 paths for the cadence (manual mode)")
@@ -118,52 +112,39 @@ def main():
     fchans, tchans = frame["fchans"], frame["tchans"]
     downsample_factor = frame.get("downsample_factor", 1)
     df = data_cfg["raw"]["df"]
-
-    with open(args.model_config) as f:
-        model_cfg = yaml.safe_load(f)
-
-    input_shape = (tchans, fchans, 1)
-    model = inf.load_model(args.checkpoint, model_cfg, input_shape, args.device)
+    method = preproc.get("bandpass_method", "polynomial")
+    poly_degree = preproc.get("poly_degree", 3)
+    mad_epsilon = preproc.get("mad_epsilon", 1e-6)
 
     obs_arrays = [_load_full_obs(p, downsample_factor) for p in obs_paths]
-    file_specs = []
+    raw_frames = [obs[:, f_start:f_start + fchans] for obs in obs_arrays]
+    normed_frames = [
+        core_transform(bandpass_correct(f, method=method, poly_degree=poly_degree), mad_epsilon)
+        for f in raw_frames
+    ]
+    raw = np.concatenate(raw_frames, axis=0)[:tchans, :]
+    snippet = np.concatenate(normed_frames, axis=0)[:tchans, :]
+
+    f_center_mhz = f_start * df / 1e6
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    for ax, arr, title in zip(axes, [raw, snippet], ["Raw power", "Preprocessed"]):
+        vmin, vmax = np.percentile(arr, [1, 99])
+        im = ax.imshow(arr, aspect="auto", origin="upper", vmin=vmin, vmax=vmax, cmap="viridis")
+        ax.set_title(title)
+        ax.set_xlabel("Freq channel")
+        ax.set_ylabel("Time bin (ABACAD)")
+        plt.colorbar(im, ax=ax, fraction=0.046)
+    fig.suptitle(
+        f"cad={args.cad_idx if args.cad_idx is not None else '-'} ({target})  "
+        f"f_start={f_start}  f~{f_center_mhz:.4f} MHz",
+        fontsize=11,
+    )
+    plt.tight_layout()
+
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    scratch = args.out_dir / "_scratch"
-    scratch.mkdir(exist_ok=True)
-    for i, arr in enumerate(obs_arrays):
-        path = scratch / f"obs{i}.f32"
-        arr.tofile(str(path))
-        file_specs.append((str(path), arr.shape, arr.dtype))
-
-    try:
-        inf._worker_init(file_specs, fchans, tchans, preproc)
-        snippet = inf._preprocess_at(f_start)
-
-        x = torch.from_numpy(snippet).float().unsqueeze(0).unsqueeze(0).to(args.device)
-        with torch.no_grad():
-            score = float(model.anomaly_score(x, method=args.method)[0])
-            amap = None
-            recon = None
-            if hasattr(model, "anomaly_map"):
-                amap = model.anomaly_map(x)[0].cpu().numpy()
-                stats = on_off_contrast(amap)
-                print(f"on_off_contrast={stats['on_off_contrast']:.3f}  "
-                      f"on_mean={stats['on_mean']:.3f}  off_mean={stats['off_mean']:.3f}")
-            else:
-                recon = model(x).squeeze(1)[0].cpu().numpy()
-
-        fig = inf.plot_candidate(
-            original=snippet, reconstruction=recon,
-            score=score, sigma=0.0, method=args.method,
-            cad_idx=args.cad_idx if args.cad_idx is not None else 0, target=target,
-            f_start=f_start, df=df, anomaly_map=amap,
-        )
-        out_path = args.out_dir / f"{args.method}_f{f_start}_inspect.png"
-        fig.savefig(out_path, dpi=150)
-        print(f"Saved -> {out_path}")
-    finally:
-        for spec in file_specs:
-            Path(spec[0]).unlink()
+    out_path = args.out_dir / f"f{f_start}_snippet.png"
+    fig.savefig(out_path, dpi=150)
+    print(f"Saved -> {out_path}")
 
 
 if __name__ == "__main__":
