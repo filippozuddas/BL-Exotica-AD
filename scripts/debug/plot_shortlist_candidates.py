@@ -1,14 +1,15 @@
 """
 Re-plot short-listed candidates from an already-run inference pass as
-individual high-resolution PNGs.
+individual high-resolution PNGs, showing raw power + preprocessed waterfall
+(no model needed — just extracts and plots the snippet, like
+``scripts/debug/plot_single_candidate.py`` but for the whole short list at
+once).
 
 Takes the per-cadence ``{method}_candidates.csv`` written by
 ``scripts/inference.py`` (e.g. ``topk_candidates.csv``), filters to
 ``in_short_list == True`` (when that column is present — UDMA only; falls
-back to all rows otherwise), and re-generates the same
-original|reconstruction/anomaly-map|error figure as ``inference.py``'s PDF,
-at higher DPI and with the 6-observation ABACAD divider lines on the
-waterfall panels.
+back to all rows otherwise), and plots each with the 6-observation ABACAD
+divider lines on the waterfall.
 
 ``cad_idx`` and the target name are parsed from the CSV's parent directory
 name (``cad{idx}_{target}_{fch1}MHz_{date}``, as written by
@@ -19,8 +20,6 @@ Usage:
         --candidates_csv outputs/inference/<run>/cad03_.../topk_candidates.csv \
         --cadence_list data/processed/inference_cadences.txt \
         --data_config configs/data/gbt_fine.yaml \
-        --model_config configs/model/udma.yaml \
-        --checkpoint outputs/training/<run>/checkpoints/best.ckpt \
         --out_dir outputs/inference/<run>/cad03_.../shortlist_png
 """
 import argparse
@@ -33,16 +32,14 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from src.models.autoencoder import build_autoencoder
 from src.data.preprocessing import bandpass_correct, core_transform
 from src.data.torch_dataset import _load_full_obs
-from src.utils.visualization import plot_candidate
+from src.utils.visualization import add_obs_dividers
 
 CAD_DIR_RE = re.compile(r"cad(\d+)_(.+?)_[\d.]+MHz_\d+$")
 
@@ -59,26 +56,13 @@ def parse_args():
                    help="0-based line into --cadence_list; parsed from "
                         "--candidates_csv's parent directory name if omitted")
     p.add_argument("--data_config", type=Path, default=ROOT / "configs/data/gbt_fine.yaml")
-    p.add_argument("--model_config", type=Path, required=True)
-    p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--out_dir", type=Path, required=True)
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dpi", type=int, default=300, help="PNG resolution")
     p.add_argument("--all", action="store_true",
                    help="Plot every candidate in the CSV, ignoring in_short_list "
                         "(default: short list only, or all rows if the CSV has "
                         "no in_short_list column)")
     return p.parse_args()
-
-
-def load_model(checkpoint_path, model_config, input_shape, device):
-    model = build_autoencoder(input_shape, model_config, loss="mse")
-    ckpt = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
-    state = {k.replace("model.", "", 1): v
-             for k, v in ckpt["state_dict"].items() if k.startswith("model.")}
-    model.load_state_dict(state)
-    model.eval().to(device)
-    return model
 
 
 def main():
@@ -128,43 +112,44 @@ def main():
     poly_degree = preproc.get("poly_degree", 3)
     mad_epsilon = preproc.get("mad_epsilon", 1e-6)
 
-    with open(args.model_config) as f:
-        model_cfg = yaml.safe_load(f)
-    input_shape = (tchans, fchans, 1)
-    model = load_model(args.checkpoint, model_cfg, input_shape, args.device)
-    has_amap = hasattr(model, "anomaly_map")
-
     print(f"Loading {len(obs_paths)} obs files for cadence {cad_idx}...")
     obs_arrays = [_load_full_obs(p, downsample_factor) for p in obs_paths]
 
-    def preprocess_at(f_start):
-        frames = [obs[:, f_start:f_start + fchans] for obs in obs_arrays]
-        normed = [
+    def extract_at(f_start):
+        raw_frames = [obs[:, f_start:f_start + fchans] for obs in obs_arrays]
+        normed_frames = [
             core_transform(bandpass_correct(fr, method=method_bp, poly_degree=poly_degree),
                             mad_epsilon)
-            for fr in frames
+            for fr in raw_frames
         ]
-        return np.concatenate(normed, axis=0)[:tchans, :]
+        raw = np.concatenate(raw_frames, axis=0)[:tchans, :]
+        snippet = np.concatenate(normed_frames, axis=0)[:tchans, :]
+        return raw, snippet
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     for rank, row in enumerate(selected):
         fs = int(float(row["f_start_peak"]))
         score = float(row["peak_score"])
-        snippet = preprocess_at(fs)
-        x = torch.from_numpy(snippet).float().unsqueeze(0).unsqueeze(0).to(args.device)
-        recon = None
-        amap = None
-        with torch.no_grad():
-            if has_amap:
-                amap = model.anomaly_map(x)[0].cpu().numpy()
-            else:
-                recon = model(x).squeeze(1)[0].cpu().numpy()
+        raw, snippet = extract_at(fs)
+        f_center_mhz = fs * df / 1e6
 
-        fig = plot_candidate(
-            original=snippet, reconstruction=recon, score=score, sigma=None,
-            method=method, cad_idx=cad_idx, target=target or "unknown",
-            f_start=fs, df=df, anomaly_map=amap,
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        for ax, arr, title in zip(axes, [raw, snippet], ["Raw power", "Preprocessed"]):
+            vmin, vmax = np.percentile(arr, [1, 99])
+            im = ax.imshow(arr, aspect="auto", origin="upper", vmin=vmin, vmax=vmax,
+                            cmap="viridis")
+            ax.set_title(title)
+            ax.set_xlabel("Freq channel")
+            ax.set_ylabel("Time bin (ABACAD)")
+            add_obs_dividers(ax, arr.shape[0])
+            plt.colorbar(im, ax=ax, fraction=0.046)
+        fig.suptitle(
+            f"cad={cad_idx} ({target or 'unknown'})  f_start={fs}  "
+            f"f~{f_center_mhz:.4f} MHz  {method} score={score:.4f}",
+            fontsize=11,
         )
+        plt.tight_layout()
+
         out_path = args.out_dir / f"{method}_rank{rank:02d}_f{fs}.png"
         fig.savefig(out_path, dpi=args.dpi, bbox_inches="tight")
         plt.close(fig)
