@@ -516,6 +516,14 @@ def main():
                 clusters["n_off_hits_full"] = n_off_hits_full_l
                 clusters["off_leak"] = off_leak_l
                 clusters["in_short_list"] = in_short_list_l
+                # Persist the thresholds themselves, not just their verdicts:
+                # off_ceiling was previously print-only, so a run whose logs
+                # were lost left no way to audit why a candidate did or did not
+                # make the short list (the CSV carries the hit counts but not
+                # the bar they were measured against). Constant per cadence.
+                clusters["off_ceiling"] = off_ceiling
+                clusters["thresh_3"] = thresh_3
+                clusters["thresh_5"] = thresh_5
 
             clusters.to_csv(cad_dir / f"{method}_candidates.csv", index=False)
 
