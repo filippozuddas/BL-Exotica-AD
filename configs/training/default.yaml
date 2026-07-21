@@ -1,14 +1,16 @@
 # Training configuration
 # Merges with a data config and model config at runtime
 
-data: configs/data/synthetic.yaml
+data: configs/data/gbt_fine.yaml
 model: configs/model/convae.yaml
 
 training:
-  batch_size: 64
+  batch_size: 256
   epochs: 100
+  warmup_epochs: 10
   learning_rate: 1.0e-3
   optimizer: adam
+  gradient_clip_val: 1.0
   loss: mse            # mse | ssim | mse+ssim
   seed: 42
 

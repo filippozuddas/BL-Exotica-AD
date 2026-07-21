@@ -9,7 +9,7 @@ model: configs/model/vit_mae.yaml
 training:
   batch_size: 1024
   epochs: 200
-  warmup_epochs: 20
+  warmup_epochs: 5
   learning_rate: 3.0e-4
   optimizer: adam
   loss: mse
