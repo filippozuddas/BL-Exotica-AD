@@ -2,7 +2,7 @@
 + D (discardable 1x1 channel-alignment head).
 
 Business logic for ``scripts/distill_teacher.py`` (thin CLI wrapper) — Fase 2
-of ``docs/2026-07-14_paper_alignment_plan.md`` (5.2), the paper-faithful
+of ``docs/design/udma-paper-alignment.md`` (5.2), the paper-faithful
 teacher route (Qi et al. 2024, Eq. 2 / Bergmann "Uninformed Students"): a
 small CNN is trained to reproduce a frozen, out-of-domain generic backbone's
 features on in-domain data.

@@ -32,15 +32,14 @@ def mse_loss(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
 def topk_mse(y_true: torch.Tensor, y_pred: torch.Tensor, frac: float = 0.02) -> torch.Tensor:
     """Per-sample mean squared error over only the top ``frac`` of pixels by error.
 
-    Anomaly score alternative to full-frame mean MSE. Motivated by the MemAE
-    noise-floor diagnostic: a real injected signal can triple the local peak
-    squared-error while the whole-frame mean barely moves, because the
-    incompressible background noise (~1e5 pixels) dilutes a residual that is
-    only elevated over a few dozen of them. Restricting the average to the
-    top-``frac`` fraction preserves the local signal while still averaging
-    over enough pixels to not be a single-outlier statistic (unlike a raw
-    per-pixel max, which is already confounded by heavy-tailed background
-    residual — see [[eti_vs_rfi_occupancy_diagnostic]] / handoff 2026-07-01).
+    Anomaly score alternative to full-frame mean MSE: a real injected signal
+    can triple the local peak squared-error while the whole-frame mean barely
+    moves, since ~1e5 background pixels dilute a residual elevated over only a
+    few dozen. Averaging the top fraction keeps the local signal without
+    degenerating into a single-outlier statistic like a per-pixel max.
+
+    Production value is ``frac=0.01``. See ``docs/decisions/scoring-history.md``
+    §5.
     """
     sq_err = (y_true - y_pred) ** 2
     b = sq_err.shape[0]
