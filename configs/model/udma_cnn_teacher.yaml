@@ -1,0 +1,50 @@
+# UDMA model config — distilled CNN teacher (Fase 2, 2026-07-15).
+#
+# Paper-faithful teacher route (Qi et al. 2024, Eq. 2 / Bergmann "Uninformed
+# Students"): teacher = TeacherCNN distilled from a frozen, out-of-domain
+# ImageNet ResNet-18 (scripts/distill_teacher.py) — never trained on spectrum
+# data itself, unlike the retired in-domain self-supervised ViT-MAE teacher
+# whose too-learnable target collapsed student disagreement.
+#
+# Gate results (docs/design/udma-paper-alignment.md, 5.1/5.2, memory
+# udma_resnet_teacher_gate): P and T both PASS all 4 gates (G1/G2/G3a/G3b)
+# with the corrected setigen injector and a widened SNR sweep.
+#
+# student.mem_slots stays 500 (NOT 30) -- Fase 1 (mem_slots=30) was KILLED
+# 2026-07-15 (docs/decisions/teacher-localization.md §7), no capacity restriction
+# carried over into this arm.
+
+architecture: udma
+
+# --- Teacher (frozen, distilled) ---
+teacher:
+  type: cnn_distilled
+  checkpoint: outputs/udma_teacher_distill/cnn_distilled_resnet18.pt
+  norm_stats: outputs/udma_teacher_norm/cnn_distilled_block3.pt
+
+# --- Students (from-scratch trunk, Q3) --- identical to udma.yaml
+student:
+  encoder:
+    filters: [32, 64, 128, 256]
+    convs_per_block: 2
+    kernel_size: [3, 3]
+    activation: relu
+    use_batchnorm: true
+  bottleneck:
+    latent_dim: 64
+  head_hidden: 128
+  head_context_convs: 2
+  mem_slots: 500
+  shrink_threshold: 0.002
+
+# --- Loss (Q4) --- identical to udma.yaml
+loss:
+  lambda1: 1.0
+  lambda2: 1.0
+  lambda3: 1.0
+  entropy_weight: 2.0e-4
+
+# --- Scoring (Q5) --- identical to udma.yaml
+scoring:
+  weights: [0.5, 0.5, 0.5]
+  topk_frac: 0.02

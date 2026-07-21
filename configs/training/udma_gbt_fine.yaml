@@ -5,16 +5,23 @@
 # ours is ~560k train snippets). batch 256: target (128,6,64) feature maps are
 # far lighter than pixel-space (96,1024) reconstructions, so this is a much
 # smaller per-step footprint than memae_gbt_fine's batch 1024 despite the extra
-# teacher forward pass. max 30 epochs — the pixel MemAE converged by ~epoch 20
-# and UDMA's students regress a fixed, cheap-to-fit target.
+# teacher forward pass.
+#
+# epochs raised 30->60 (2026-07-07, real-GBT rerun): the SRT run
+# (outputs/20260705_224358_e8411e9) hit the 30-epoch cap WITHOUT early
+# stopping ever triggering -- val_st_sum was still slowly improving at
+# epoch 30. Dataset size is comparable here (~1M frames), so the same cap
+# would likely cut this run short again. patience=8 on val_st_sum is the
+# real stopping criterion now; 60 is just a higher ceiling to let it find
+# its own plateau instead of being truncated by the schedule.
 
 data: configs/data/gbt_fine.yaml
 model: configs/model/udma.yaml
 
 training:
-  batch_size: 256
-  epochs: 30
-  learning_rate: 1.0e-3
+  batch_size: 512
+  epochs: 60
+  learning_rate: 2.0e-3
   optimizer: adamw
   weight_decay: 0.01
   loss: mse            # unused by UDMA (its own compute_loss owns the objective); kept for schema parity

@@ -6,7 +6,7 @@
 # schedule, same seed, so any change in detection is attributable to the
 # memory-capacity restriction alone.
 #
-# See docs/2026-07-14_paper_alignment_plan.md, Fase 1 (D3, D4, D12).
+# See docs/design/udma-paper-alignment.md, Fase 1 (D3, D4, D12).
 
 data: configs/data/gbt_fine.yaml
 model: configs/model/udma_mem30.yaml

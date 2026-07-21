@@ -50,6 +50,17 @@ loader:
   overlap: 16               # Overlapping bins between chunks
 
 dataset:
-  cadence_list: data/raw/srt_0000_cadences.txt  # one cadence per line, 6 space-separated paths
-  cache_dir: /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine  # directory with train.npy, val.npy, meta.json
+  # Real Exotica GBT batch (905 complete cadences, stratified train/val/held-out
+  # split from scripts/build_gbt_cadence_manifest.py, 2026-07-06) — replaces the
+  # SRT-derived cadence_list/cache_dir below. cadence_list is read unconditionally
+  # by scripts/train.py before it checks cache_dir, so it must stay valid even
+  # though build_datasets() ignores it once cache_dir exists on disk.
+  cadence_list: data/raw/gbt_0000_train_cadences.txt  # one cadence per line, 6 space-separated paths
+  # Built via: scripts/preprocess_cache.py --train-cadence-list/--val-cadence-list/
+  # --heldout-cadence-list (see data/raw/gbt_0000_*_cadences.txt), --snippets-per-cadence 2200
+  # (452/452 train + 89/89 val cadences all included -- see docs/decisions/scoring-history.md
+  # for why 2200 not the 18000 default: between-cadence diversity > within-cadence redundancy).
+  # Old SRT-derived cache deleted 2026-07-06 to make room (was blocking build_datasets() from
+  # ever seeing this real cache, since it silently wins whenever cache_dir exists on disk).
+  cache_dir: /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine_exotica  # directory with train.npy, val.npy, meta.json
   seed: 42

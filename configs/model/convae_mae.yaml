@@ -1,4 +1,4 @@
-# Convolutional Masked Autoencoder (CNN-MAE) — primary backbone per CLAUDE.md.
+# Convolutional Masked Autoencoder (CNN-MAE) — CNN masked-patch backbone.
 # Same conv stack as convae.yaml; mae: true switches build_autoencoder() to the
 # masked-patch training path (mask_ratio fraction of patches zeroed during
 # training, loss on masked positions only). At inference, no masking.

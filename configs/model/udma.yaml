@@ -2,7 +2,7 @@
 # 5th build_autoencoder backbone. architecture: udma routes build_autoencoder()
 # to build_udma(), bypassing the CNN encoder/bottleneck/decoder top-level config
 # keys (the student section below reuses that schema, but nested under `student:`).
-# See src/models/udma.py and docs/2026-07-05_udma_design_spec.md (Q1-Q10).
+# See src/models/udma.py and docs/design/udma-spec.md (Q1-Q10).
 #
 # Frozen ViT-MAE teacher (self-supervised, read at an intermediate transformer
 # block) supplies a (128, 6, 64) token-feature target; two CNN students (one
@@ -17,7 +17,10 @@ teacher:
   # Canonical checkpoint (loss_mode: generative, matches vit_mae.yaml below).
   # Pinned for comparability with the B3/teacher_sensitivity_test diagnostics —
   # do not swap without re-running the Q1 gate (scripts/debug/teacher_sensitivity_test.py).
-  checkpoint: outputs/training/20260624_084754_057f87c/checkpoints/epoch=006-val_loss=2.1715.ckpt
+  # Retrained 2026-07-10 on corrected per-observation normalization + real GBT
+  # exotica data; G1-G3b gate PASSED 2026-07-11 on both final layer and block3
+  # (block3 dominates: G2 0.984, G3a 0.831, G3b 0.865 vs 0.972/0.791/0.861 final).
+  checkpoint: outputs/training/20260709_205938_4b5660c/checkpoints/epoch=094-val_loss=2.1740.ckpt
   vit_config: configs/model/vit_mae.yaml
   # Transformer block the teacher reads tokens from (1-indexed; -1 = final
   # block). block3 dominates/ties every gate metric and has the lowest
@@ -28,7 +31,12 @@ teacher:
   # scripts/fit_udma_teacher_norm.py and loaded here. REQUIRED before training:
   # without it TeacherViT.mu/sigma default to identity (0/1) and the students
   # regress raw, unnormalized teacher features (invalid run, violates Q2).
-  # norm_stats: outputs/udma_teacher_norm/gbt_fine_block3.pt
+  # Refit 2026-07-11 for the retrained teacher (epoch=094-val_loss=2.1740,
+  # trained on corrected per-observation normalization + real GBT exotica
+  # data) -- supersedes the 2026-07-07 stats fit for the prior teacher
+  # (ckpt 057f87c/epoch006). Both G1-G3b gates (final layer and block3)
+  # re-confirmed PASS for this checkpoint on 2026-07-11.
+  norm_stats: outputs/udma_teacher_norm/gbt_fine_exotica_block3_ep094.pt
 
 # --- Students (from-scratch trunk, Q3) ---
 # Same CNN conv stack as convae.yaml/memae.yaml (4 blocks -> 16x spatial

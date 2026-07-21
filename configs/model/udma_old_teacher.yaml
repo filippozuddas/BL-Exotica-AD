@@ -17,7 +17,7 @@ architecture: udma
 
 teacher:
   # Original teacher checkpoint (pre-retrain), same one used by the
-  # 20260707_093113_6d0d1ba run and by docs/2026-07-05_udma_design_spec.md Q1.
+  # 20260707_093113_6d0d1ba run and by docs/design/udma-spec.md Q1.
   checkpoint: outputs/training/20260624_084754_057f87c/checkpoints/epoch=006-val_loss=2.1715.ckpt
   vit_config: configs/model/vit_mae.yaml
   teacher_layer: 3

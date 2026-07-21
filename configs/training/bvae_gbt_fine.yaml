@@ -10,7 +10,7 @@
 # Evaluate with:
 #   python scripts/debug/encode_separation_test.py \
 #       --checkpoint outputs/<run_id>/checkpoints/<best>.ckpt \
-#       --cache /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine \
+#       --cache /path/to/data/processed/cache_gbt_fine \
 #       --model_config configs/model/convae_vae.yaml \
 #       --n_samples 1000
 
