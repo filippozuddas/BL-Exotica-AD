@@ -3,8 +3,7 @@
 build_gbt_cadence_manifest.py — split the real Exotica `.0000.h5` cadence
 census into train / val / held-out manifests for `configs/data/gbt_fine.yaml`.
 
-Decisions (from the 2026-07-06 /grill-me session, see memory
-`exotica_0000_dist_analysis`):
+Decisions (2026-07-06):
 
   - Scope: `.0000.fil` only.
   - Real GBT data fully replaces SRT/synthetic as the training source.

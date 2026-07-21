@@ -15,7 +15,7 @@ Sort within cadence: by the seconds field in the filename.
 
 Usage:
     PYTHONPATH=. python scripts/build_cadence_manifest.py \\
-        --scan /content/nvme_esterno/filippo/ \\
+        --scan /path/to/data/ \\
         --output data/raw/ \\
         --product 0000
 
