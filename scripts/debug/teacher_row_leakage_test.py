@@ -1,110 +1,51 @@
-"""ON->OFF row-leakage probe for the out-of-domain teacher P (ResNet-18),
-per depth stage — the cheap, training-free experiment that decides whether the
-Q1 "small-RF teacher" mitigation (docs/2026-07-14_paper_alignment_plan.md, Fase 2)
-can work at all, BEFORE spending a distillation + student-retrain run.
+"""ON->OFF row-leakage probe for a UDMA teacher's feature grid.
 
-Motivation (2026-07-16): the distilled CNN teacher (read at ResNet layer3)
-produces DIFFUSE UDMA anomaly maps — an ON-only signal (Voyager-1) bleeds into
-the OFF rows, collapsing on_off_contrast from ~32 (old ViT-MAE teacher) to ~2.3
-and breaking every ON/OFF short-list filter. The mechanism is specifically
-CROSS-OBSERVATION leakage: the (96,1024) input stacks 6 observations of 16 time
-bins each, so for the teacher's feature at an OFF row to move when a signal is
-injected only into ON observations, the teacher's VERTICAL receptive field must
-cross the 16-bin observation boundary. layer3's vertical RF (~211 px) spans the
-whole input; earlier stages have smaller RF:
+Measures, without any training, whether a candidate teacher LOCALIZES an
+ON-only signal or bleeds it into the OFF rows. Inject a narrowband line into
+obs {0,2,4} of a quiet frame, take the feature displacement
+``||P(x+s) - P(x)||`` per (row, col) cell, and compare ON feature-rows against
+OFF feature-rows. A localizing teacher keeps the displacement in ON rows (high
+ratio); a leaky one spreads it (ratio -> 1).
 
-    stage           grid      vertical RF   spans (obs of 16px)
-    stem(conv1+mp)  (24,256)  ~11 px        < 1  -> no cross-obs leak (in theory)
-    layer1          (24,256)  ~43 px        ~2.7 -> partial
-    layer2          (12,128)  ~99 px        ~6   -> whole cadence
-    layer3 (now)    (6,64)    ~211 px       all  -> maximal
+The measurement is clean because ``inject_narrowband_on_only`` leaves OFF
+frames byte-identical and ``preprocess_raw`` normalizes per observation, so any
+OFF-row motion is pure receptive-field leakage.
 
-This probe measures the leakage DIRECTLY on P's features (no students, no
-distillation): inject an ON-only line into a quiet frame, take the teacher
-feature displacement ||P(x+s) - P(x)|| per (row, col) cell, and compare the
-response in ON feature-rows vs OFF feature-rows. A localizing teacher keeps the
-displacement in ON rows (high ON/OFF ratio); a leaky one spreads it (ratio ->1).
+``--architecture`` selects the target under test, each isolating one variable:
 
-The test is clean because (a) inject_narrowband_on_only renders the signal ONLY
-into obs 0/2/4 (OFF frames byte-identical) and (b) preprocess_raw normalizes
-PER OBSERVATION (gbt_fine_normalization_bug fix), so an ON injection cannot shift
-OFF pixels via renormalization — any OFF-row feature motion is pure RF leakage.
+    resnet18 (default)  out-of-domain CNN, swept across stem/layer1/layer2/
+                        layer3 -- tests the receptive-field hypothesis
+    vit_mae             domain-matched teacher, the localizing reference
+    udma_student        a trained student's own trunk -- tests architecture
+                        vs. training target
+    convnextv2_fcmae    ImageNet domain, reconstruction pretraining -- tests
+                        objective vs. domain (needs ``pip install timm``)
 
-Feature rows map to observations by the stage's vertical downsampling: obs i
-occupies feature rows [i*(nh/6) : (i+1)*(nh/6)); ON = obs {0,2,4}. No column
-window / morphology assumption is used (row max over the full frequency axis).
+Cost: n_frames * len(snr_list) * len(stages) frozen forwards. No training.
 
-Decision: if an early stage keeps the ON/OFF ratio high (localized), the RF is
-the lever -> the small-RF teacher path is worth a training run (distill from
-that stage + pool to (6,64)). If even the smallest useful stage stays diffuse
-(ratio ->1), the leakage is not RF-driven (likely the domain-matching of the old
-ViT-MAE teacher) and the ImageNet-P route is a dead end -> keep the domain-matched
-teacher as a reported design result, or pursue a shallow anisotropic teacher.
+Outcome (2026-07-16): all three hypotheses refuted; only domain-matched
+training localizes. Full record in ``docs/decisions/teacher-localization.md``.
 
-Cost: ~ (n_frames * len(snr_list) * len(stages)) frozen ResNet forwards — minutes
-on GPU, NO training.
+Usage (run on the data host; --cache must point at a preprocessed cache):
 
-``--architecture vit_mae`` runs the SAME differential metric on the domain-matched
-ViT-MAE teacher (read at its deployed block, ``--layer 3``) as the apples-to-apples
-LOCALIZING reference: one "stage" (global attention, no RF sweep). Use it to put a
-number on the localization gap that the ResNet stages leave open (2026-07-16: RF
-route refuted, ResNet ratio ~2-3 at every depth — see udma_teacher_rf_leakage_refuted).
+    # out-of-domain CNN, receptive-field sweep -- default
+    python scripts/debug/teacher_row_leakage_test.py --cache <cache_dir>
 
-``--architecture udma_student`` runs the metric on a trained UDMA STUDENT's own output
-feature grid (not the teacher) — isolates whether the student's CNN trunk (same
-architecture regardless of which teacher trained it) preserves ON/OFF localization, or
-whether it's a property of the teacher target it regressed. Two existing checkpoints
-give a free, cheap corroboration of the domain-mismatch-vs-architecture question
-(2026-07-16, see udma_teacher_rf_leakage_refuted's confound note): the OLD UDMA
-(`configs/model/udma.yaml`, ViT-MAE domain-matched target) vs the cnn_teacher UDMA
-(`configs/model/udma_cnn_teacher.yaml`, ResNet-distilled target) — same student
-architecture (`FeatureStudent`/`build_encoder`) in both, only the training target
-differs. If the old-target student localizes and the new-target student doesn't, that's
-a second, independent confirmation the target's domain (not the CNN architecture) is the
-lever.
-
-``--architecture convnextv2_fcmae`` runs the metric on ``convnextv2_tiny.fcmae`` (timm,
-requires ``pip install timm``) — the domain-vs-OBJECTIVE isolating control (2026-07-16).
-SAME domain (ImageNet) and SAME family (CNN) as resnet18, but pretrained via masked-patch
-RECONSTRUCTION (FCMAE, self-supervised, no classification head) instead of classification.
-This separates the two variables the resnet18-vs-vit_mae comparison confounds: domain
-(ImageNet vs GBT) AND pretraining objective (classification vs reconstruction) changed
-together there. If convnextv2_fcmae localizes markedly better than resnet18 despite the
-SAME wrong domain, the objective is the lever (not domain) — opening a route to a
-paper-faithful (out-of-domain, generic) CNN teacher that still localizes, no
-audio/domain-closer backbone search needed. If it stays diffuse like resnet18, domain-
-matching is confirmed necessary regardless of objective. Fully convolutional like resnet18
-— no positional-embedding interpolation needed for the non-224x224 input (unlike a
-ViT-MAE-on-ImageNet alternative, which was considered and rejected for this reason).
-
-Usage (server, not dev machine):
-    # out-of-domain P (ResNet-18), RF sweep — default
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
-    python scripts/debug/teacher_row_leakage_test.py \
-        --cache /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine_exotica
-
-    # domain-matched ViT-MAE teacher (localizing reference), read at block3
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
+    # domain-matched ViT-MAE teacher, read at block 3
     python scripts/debug/teacher_row_leakage_test.py \
         --architecture vit_mae --layer 3 \
-        --checkpoint outputs/training/20260709_205938_4b5660c/checkpoints/epoch=094-val_loss=2.1740.ckpt \
-        --model_config configs/model/vit_mae.yaml \
-        --cache /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine_exotica
+        --checkpoint <vit_mae.ckpt> \
+        --model_config configs/model/vit_mae.yaml --cache <cache_dir>
 
-    # UDMA student trunk (either checkpoint) — free corroboration, no training
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
+    # a trained UDMA student's trunk
     python scripts/debug/teacher_row_leakage_test.py \
         --architecture udma_student --student ae \
-        --checkpoint outputs/training/20260707_093113_6d0d1ba/checkpoints/last.ckpt \
-        --model_config configs/model/udma.yaml \
-        --cache /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine_exotica
+        --checkpoint <udma.ckpt> \
+        --model_config configs/model/udma.yaml --cache <cache_dir>
 
-    # ConvNeXt V2 / FCMAE (domain-vs-objective isolating control) — needs timm
-    pip install timm
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
+    # ConvNeXt V2 / FCMAE control
     python scripts/debug/teacher_row_leakage_test.py \
-        --architecture convnextv2_fcmae \
-        --cache /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine_exotica
+        --architecture convnextv2_fcmae --cache <cache_dir>
 """
 
 import argparse

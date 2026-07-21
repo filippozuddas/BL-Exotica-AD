@@ -1,8 +1,16 @@
-# Outputs — never commit artifacts
+# Outputs and data — never commit artifacts
 outputs/
-scripts/debug/archive/
 data/processed/
 data/raw/
+
+# Superseded diagnostic scripts (failed/abandoned approaches, kept locally)
+scripts/debug/archive/
+
+# Agent tooling — local workflow only, not part of the published project
+CLAUDE.md
+.claude/
+.scratch/
+docs/agents/
 
 # Python
 __pycache__/
@@ -12,7 +20,7 @@ __pycache__/
 dist/
 build/
 *.egg
-.pytest_cache
+.pytest_cache/
 
 # Environments
 .env
@@ -22,9 +30,7 @@ env/
 # Jupyter
 .ipynb_checkpoints/
 
-# OS
+# Editors / OS
+.vscode/
+.idea/
 .DS_Store
-
-CLAUDE.md
-
-.vscode

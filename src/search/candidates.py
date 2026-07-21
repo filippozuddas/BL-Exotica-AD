@@ -1,19 +1,11 @@
 """
-Candidate post-processing: frequency-adjacency deduplication of anomaly scores.
+Candidate post-processing: deduplication, ON/OFF diagnostics, short-list rules.
 
-Ports the connected-component clustering pattern validated in the sibling
-``rst`` project (``rst_seti.inference.engine.InferenceEngine.cluster_detections``,
-same sliding-window geometry: snippet width 1024 channels, stride 512) to this
-project's continuous anomaly score (instead of a binary ETI/RFI probability).
+Operates on UDMA's ``(6, 64)`` anomaly map, whose rows correspond 1:1, in
+order, to the 6 observations of an ABACAD cadence (ON, OFF, ON, OFF, ON, OFF).
 
-Pure deduplication of the model's own score — no new discriminating logic:
-``scripts/inference.py`` scans each cadence with overlapping windows
-(``stride_infer < fchans``), so a single wide or strong line triggers many
-adjacent windows above threshold. This groups those into one candidate per
-contiguous run, keeping the peak-scoring snippet. This is exactly the
-"spatial deduplication" post-processing stage named in CLAUDE.md's Phase 3 —
-it does not decide RFI vs. technosignature, it only collapses duplicate
-detections of the same event down to one entry.
+Design rationale, hand-validated thresholds and rejected alternatives:
+``docs/decisions/candidate-filtering.md``.
 """
 
 import numpy as np
@@ -30,19 +22,15 @@ def off_noise_ceiling(
 ) -> float:
     """Robust per-cadence detection ceiling from pooled OFF-row cell values.
 
-    A cadence's OFF-target rows carry no target signal by construction, so
-    they are the natural reference for a per-cadence ceiling — any high value
-    there is either noise fluctuation or RFI, never a real detection. A raw
-    high quantile of the pooled OFF values is dominated by the RFI tail
-    (hand-validated on cad02: raw quantile ~31 vs. a Gaussian 3σ threshold of
-    0.16 buried in the noise floor — the RFI tail, not the noise core, sets
-    the raw quantile). This instead iteratively 3σ-clips (median/MAD, same
-    scheme as ``bandpass_correct``) to isolate the noise core, then takes
-    ``quantile`` of the surviving core — replacing the Gaussian
-    ``median + 3*MAD_sigma`` threshold, which is pulled down by the same RFI
-    contamination it's supposed to be robust against once RFI dominates the
-    pool (thresh_3 = 0.16 on cad02, an order of magnitude below the real
-    noise ceiling of ~0.9).
+    OFF-target rows carry no target signal by construction, so any high value
+    there is noise or RFI, never a real detection. Iteratively 3σ-clips the
+    pooled values (median/MAD, same scheme as ``bandpass_correct``) to isolate
+    the noise core, then takes ``quantile`` of the surviving core.
+
+    Replaces a Gaussian ``median + 3*MAD_sigma`` threshold; a raw high quantile
+    of the unclipped values is not a valid substitute either. See
+    ``docs/decisions/candidate-filtering.md`` §3 for both failure modes, and
+    §3.1 for a known scale limitation of the derived short-list floor.
 
     Args:
         off_values: 1-D array of anomaly-map cell values pooled from OFF rows
@@ -102,8 +90,10 @@ def cluster_candidates(
     Two snippets belong to the same cluster if their ``f_start`` differs by at
     most ``stride`` (i.e. they are adjacent/overlapping in the sliding-window
     grid); a below-threshold snippet breaks the chain — a 1D connected-component
-    grouping on the frequency axis, identical in spirit to
-    ``InferenceEngine.cluster_detections`` in the ``rst`` project.
+    grouping on the frequency axis.
+
+    Pure deduplication of the model's own score: it collapses repeat detections
+    of one event, and never decides RFI vs. technosignature.
 
     Args:
         f_starts: ``(N,)`` window start channel for every scored snippet in
@@ -159,30 +149,18 @@ def on_off_contrast(
     eps: float = 1e-8,
     threshold: float = None,
 ) -> dict:
-    """ON/OFF contrast + consistency diagnostic for one snippet's UDMA anomaly map.
+    """ON/OFF contrast + consistency diagnostic for one snippet's anomaly map.
 
-    UDMA's ``(6, 64)`` feature grid comes from a ``(16, 16)`` patch on the
-    ``(96, 1024)`` input, i.e. one grid row per 16-row observation — so grid
-    rows correspond 1:1, in order, to the 6 observations of the cadence
-    (standard ABACAD: ON, OFF, ON, OFF, ON, OFF). A real signal present only
-    when the telescope points at the target scores high on ON rows and low
-    on OFF rows; persistent RFI scores similarly on both. But ON-mean vs
-    OFF-mean alone can't tell "present in every ON pointing" apart from "one
-    transient event that happened to land inside a single ON block by
-    coincidence" — a single-scan RFI burst can produce a high contrast too
-    (observed 2026-07-06: the top-contrast SRT candidate turned out to be a
-    broadband feature confined to one ON block, absent from the other two).
-    ``n_on_hits``/``n_off_hits`` (only computed if ``threshold`` is given)
-    count how many *individual* ON/OFF rows independently clear the same
-    per-cadence detection threshold used for clustering — a real target-locked
-    signal should hit most/all ON rows and no OFF rows, not just one.
+    A signal present only when the telescope points at the target scores high
+    on ON rows and low on OFF rows; persistent RFI scores similarly on both.
+    ``n_on_hits``/``n_off_hits`` (computed only if ``threshold`` is given)
+    additionally count how many *individual* rows clear the threshold, which
+    separates a target-locked signal from a single-scan RFI burst that mimics
+    high contrast. Searches a small column window around the peak column to
+    tolerate drift between observations minutes apart.
 
-    Searches a small column window around the snippet's peak column (rather
-    than the exact column) to tolerate the signal drifting a few channels
-    between observations taken minutes apart.
-
-    Pure diagnostic: computes numbers, does not threshold or filter
-    anything — the decision stays with the human reviewer.
+    Pure diagnostic — ranks plots, never thresholds or discards. See
+    ``docs/decisions/candidate-filtering.md`` §4.
 
     Args:
         anomaly_map: ``(6, 64)`` map from ``UDMA.anomaly_map`` /
@@ -234,43 +212,20 @@ def full_row_hits(
     leak_frac: float = 0.3,
 ) -> dict:
     """Row-level ON/OFF hit counts with no column restriction, for short-list
-    volume reduction (separate from ``on_off_contrast``, which still drives
-    plot ranking).
+    volume reduction.
 
-    ``on_off_contrast``'s ``col_window`` is anchored to a single peak column
-    shared by all 6 rows, so a fast or non-linear drifter that shifts columns
-    block-to-block can fall outside the window and be misread as OFF-absent
-    (documented case: a satellite-like chirp visible in all 6 blocks scored
-    ``n_off_hits=0``). This function drops the column restriction entirely —
-    each row's own max over the whole frequency axis — trading that blind
-    spot for a different one (an unrelated OFF-row event anywhere in the
-    snippet's frequency span now also counts as a hit). Used only to decide
-    short-list membership (candidate shown for manual vetting vs. kept in the
-    full CSV only), never for ranking or as a silent discard.
+    Unlike ``on_off_contrast``, each row is reduced by its own max over the
+    whole frequency axis, so a fast drifter that shifts columns block-to-block
+    is not misread as OFF-absent. Used *only* to decide short-list membership
+    (shown for manual vetting vs. kept in the full CSV), never for ranking and
+    never as a silent discard.
 
-    A column-coherence gate (require each row's hit to land near the
-    strongest ON row's peak column) was tried and REJECTED (2026-07-16): at
-    this product's grid resolution (~45 Hz/column) and the ~600s gap between
-    ON blocks, even the project's *median* drift rate (0.3 Hz/s) already
-    shifts the peak by ~4 columns block-to-block — a tight column tolerance
-    would silently reject genuine drifting technosignatures (this pipeline's
-    stated differentiator vs. narrowband-only turboSETI), trading a handful
-    of visually-obvious noise blips (cheap for a human reviewer to dismiss)
-    for silent false negatives on the exact signals being searched for. See
-    [[udma_voyager_shortlist_off_leak_concern]] for the full reasoning.
+    Short-list rule: ``n_on_hits_full >= 2`` AND not ``off_leak``, where
+    ``off_leak`` requires >=2 OFF rows to clear ``threshold`` *and* reach at
+    least ``leak_frac`` of the weakest ON row's peak.
 
-    Short-list rule: ``n_on_hits_full >= 2`` (out of ``len(on_rows)``, mirrors
-    ``on_off_contrast``'s existing per-row hit counting) AND not ``off_leak``,
-    where ``off_leak`` requires >=2 of ``len(off_rows)`` OFF rows to clear
-    ``threshold`` AND reach at least ``leak_frac`` of the weakest ON row's own
-    peak. The magnitude gate (added 2026-07-16, Voyager-1 real-signal check)
-    stops a couple of low-amplitude OFF blips — barely above ``threshold``
-    but tiny next to the ON signal — from binary-rejecting an otherwise
-    overwhelming candidate (observed: real Voyager-1 carrier, on_off_contrast
-    32x, killed by 2 OFF blips averaging ~3% of the ON magnitude). Persistent
-    RFI or a fast chirp visible in every block (the cases this filter exists
-    to catch) still trips ``off_leak`` because its OFF-row magnitude is
-    comparable to its own ON-row magnitude, not just above the noise floor.
+    See ``docs/decisions/candidate-filtering.md`` §5 for the blind-spot trade,
+    the magnitude gate's motivation, and the rejected column-coherence gate.
 
     Args:
         anomaly_map: ``(6, 64)`` map from ``UDMA.anomaly_map`` /
