@@ -1,7 +1,7 @@
 """
 Re-plot short-listed candidates from an already-run inference pass as
-individual high-resolution PNGs, showing raw power + preprocessed waterfall
-(no model needed — just extracts and plots the snippet, like
+individual high-resolution PNGs, showing the preprocessed waterfall (no
+model needed — just extracts and plots the snippet, like
 ``scripts/debug/plot_single_candidate.py`` but for the whole short list at
 once).
 
@@ -122,27 +122,24 @@ def main():
                             mad_epsilon)
             for fr in raw_frames
         ]
-        raw = np.concatenate(raw_frames, axis=0)[:tchans, :]
-        snippet = np.concatenate(normed_frames, axis=0)[:tchans, :]
-        return raw, snippet
+        return np.concatenate(normed_frames, axis=0)[:tchans, :]
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     for rank, row in enumerate(selected):
         fs = int(float(row["f_start_peak"]))
         score = float(row["peak_score"])
-        raw, snippet = extract_at(fs)
+        snippet = extract_at(fs)
         f_center_mhz = fs * df / 1e6
 
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-        for ax, arr, title in zip(axes, [raw, snippet], ["Raw power", "Preprocessed"]):
-            vmin, vmax = np.percentile(arr, [1, 99])
-            im = ax.imshow(arr, aspect="auto", origin="upper", vmin=vmin, vmax=vmax,
-                            cmap="viridis")
-            ax.set_title(title)
-            ax.set_xlabel("Freq channel")
-            ax.set_ylabel("Time bin (ABACAD)")
-            add_obs_dividers(ax, arr.shape[0])
-            plt.colorbar(im, ax=ax, fraction=0.046)
+        fig, ax = plt.subplots(figsize=(9, 5))
+        vmin, vmax = np.percentile(snippet, [1, 99])
+        im = ax.imshow(snippet, aspect="auto", origin="upper", vmin=vmin, vmax=vmax,
+                        cmap="viridis")
+        ax.set_title("Preprocessed")
+        ax.set_xlabel("Freq channel")
+        ax.set_ylabel("Time bin (ABACAD)")
+        add_obs_dividers(ax, snippet.shape[0])
+        plt.colorbar(im, ax=ax, fraction=0.046)
         fig.suptitle(
             f"cad={cad_idx} ({target or 'unknown'})  f_start={fs}  "
             f"f~{f_center_mhz:.4f} MHz  {method} score={score:.4f}",
