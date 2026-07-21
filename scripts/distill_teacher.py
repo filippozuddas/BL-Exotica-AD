@@ -1,5 +1,5 @@
 """Distill T (CNN teacher) from P (frozen ImageNet ResNet-18) — Fase 2 of
-docs/2026-07-14_paper_alignment_plan.md (5.2), the paper-faithful teacher
+docs/design/udma-paper-alignment.md (5.2), the paper-faithful teacher
 route (Qi et al. 2024, Eq. 2 / Bergmann "Uninformed Students"): a small CNN
 is trained to reproduce a frozen, out-of-domain generic backbone's features
 on in-domain data. Spectrum data enters only as distillation input — P is
@@ -7,8 +7,8 @@ never trained on it, so its feature space stays anchored outside the domain
 by construction (unlike the retired in-domain self-supervised ViT-MAE
 teacher, whose too-learnable target collapsed student disagreement).
 
-P: scripts/debug/resnet_teacher.py's ResNetTeacher (gate PASSED 2026-07-15,
-see memory: udma_resnet_teacher_gate) — frozen, forward through layer3,
+P: scripts/debug/resnet_teacher.py's ResNetTeacher (gate PASSED 2026-07-15)
+— frozen, forward through layer3,
 256ch on the (6,64) grid.
 
 T: TeacherCNN's trunk (src/models/udma.py) — build_encoder with the same
@@ -18,7 +18,7 @@ src/training/distill.py; this script is a thin CLI wrapper (loads data/P,
 calls distill_teacher(), saves the result).
 
 Usage (server, not dev machine):
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \\
+    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/path/to/BL-Exotica-AD \\
     python scripts/distill_teacher.py \\
         --config configs/training/udma_gbt_fine_control_bs256.yaml \\
         --epochs 2 --lr 1e-3 \\

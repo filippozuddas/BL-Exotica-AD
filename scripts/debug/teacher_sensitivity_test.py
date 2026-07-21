@@ -1,5 +1,5 @@
 """Teacher-fitness pre-flight for the UDMA build — is the frozen ViT-MAE a
-usable teacher? (docs/2026-07-05_udma_design_spec.md, Q1 gate; run BEFORE
+usable teacher? (docs/design/udma-spec.md, Q1 gate; run BEFORE
 implementing/training anything.)
 
 For the UDMA student-teacher mechanism, "good feature extractor" does NOT mean
@@ -41,10 +41,10 @@ Decision branches printed at the end:
 Cost: ~1.5k teacher forwards + one 257x257 solve — minutes on GPU, no training.
 
 Usage (server, not dev machine):
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
+    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/path/to/BL-Exotica-AD \
     python scripts/debug/teacher_sensitivity_test.py \
         --checkpoint outputs/training/20260624_084754_057f87c/checkpoints/epoch=006-val_loss=2.1715.ckpt \
-        --cache /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine
+        --cache /path/to/data/processed/cache_gbt_fine
 """
 
 import argparse
@@ -133,7 +133,7 @@ def parse_args():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--architecture", choices=["vit_mae", "resnet18", "cnn_distilled"], default="vit_mae",
                    help="Teacher candidate under test. 'resnet18' gates the paper-faithful "
-                        "out-of-domain P (docs/2026-07-14_paper_alignment_plan.md, D6/D7) — "
+                        "out-of-domain P (docs/design/udma-paper-alignment.md, D6/D7) — "
                         "ignores --checkpoint/--model_config, no local weights needed "
                         "(auto-downloads ImageNet weights via torchvision on first use). "
                         "'cnn_distilled' gates T after distillation (5.2, scripts/distill_teacher.py) "

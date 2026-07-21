@@ -1,12 +1,12 @@
 """One-shot: fit the UDMA teacher's per-channel token normalization (Q2/Q7).
 
-Checklist step 3 (docs/2026-07-05_udma_design_spec.md) — MUST run before any
+Checklist step 3 (docs/design/udma-spec.md) — MUST run before any
 UDMA training launch. ``TeacherViT.mu``/``sigma`` default to identity (0/1);
 without this step the students would regress raw, unnormalized teacher
 features, which violates Q2 and invalidates the run.
 
 Usage (server, not dev machine):
-    PYTHONPATH=/content/filippo/BL-Exotica-AD python scripts/fit_udma_teacher_norm.py \\
+    PYTHONPATH=/path/to/BL-Exotica-AD python scripts/fit_udma_teacher_norm.py \\
         --config configs/training/udma_gbt_fine.yaml \\
         --out outputs/udma_teacher_norm/gbt_fine_block3.pt
 

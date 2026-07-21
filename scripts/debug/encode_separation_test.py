@@ -32,18 +32,18 @@ anomalous — while on real RFI (seen by both in training) they should agree.
 Runs the same R1/R2 blocks, so the readout is directly comparable to recon.
 
 Usage (server, not dev machine):
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
+    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/path/to/BL-Exotica-AD \
     python scripts/debug/encode_separation_test.py \
         --checkpoint outputs/training/20260624_084754_057f87c/checkpoints/epoch=006-val_loss=2.1715.ckpt \
-        --cache /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine \
+        --cache /path/to/data/processed/cache_gbt_fine \
         --out_dir outputs/sweeps/encode_separation
 
     # UDMA student-disagreement probe (no --checkpoint needed):
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
+    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/path/to/BL-Exotica-AD \
     python scripts/debug/encode_separation_test.py --scoring disagree \
         --ae_checkpoint outputs/training/<ae_run>/checkpoints/<best>.ckpt \
         --memae_checkpoint outputs/training/<memae_run>/checkpoints/<best>.ckpt \
-        --cache /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine \
+        --cache /path/to/data/processed/cache_gbt_fine \
         --out_dir outputs/sweeps/encode_separation
 """
 

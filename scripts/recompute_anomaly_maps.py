@@ -36,7 +36,7 @@ without a second full scan — the answer lives precisely in the band between
 the two quantiles.
 
 Usage (run on the server):
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
+    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/path/to/BL-Exotica-AD \
     python scripts/recompute_anomaly_maps.py \
         --checkpoint outputs/training/20260707_093113_6d0d1ba/checkpoints/epoch=057*.ckpt \
         --cadence_list data/raw/gbt_0000_heldout_cadences.txt \

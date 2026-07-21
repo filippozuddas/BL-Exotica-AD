@@ -1,5 +1,5 @@
 """One-shot CPU smoke test for the UDMA backbone (checklist step 4,
-docs/2026-07-05_udma_design_spec.md).
+docs/design/udma-spec.md).
 
 Random input only — no real dataset — but DOES need the pinned ViT-MAE
 checkpoint (``build_udma`` loads it via a strict ``state_dict``), so this is a
@@ -23,7 +23,7 @@ Checks, in order:
   6. ``model(x)`` raises ``NotImplementedError`` (no pixel decoder, by design).
 
 Usage (server, torch + the pinned checkpoint required):
-    PYTHONPATH=/content/filippo/BL-Exotica-AD python scripts/debug/smoke_test_udma.py \\
+    PYTHONPATH=/path/to/BL-Exotica-AD python scripts/debug/smoke_test_udma.py \\
         --model_config configs/model/udma.yaml
 """
 

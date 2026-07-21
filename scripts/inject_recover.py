@@ -24,7 +24,7 @@ This test establishes the model's detection capability and must run before
 scripts/inference.py — it no longer depends on a prior inference run.
 
 Usage (run on the server):
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
+    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/path/to/BL-Exotica-AD \
     python scripts/inject_recover.py \
         --checkpoint outputs/training/<run>/checkpoints/best.ckpt \
         --cadence_list data/processed/inject_recovery_cadences.txt \

@@ -8,7 +8,7 @@ Reports:
   4. Score distribution plots per cadence
 
 Usage (run on the server):
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
+    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/path/to/BL-Exotica-AD \
     python scripts/debug/analyze_inference_fp.py \
         --csv outputs/inference/full_8cad_run/inference_scores.csv \
         --checkpoint outputs/training/.../checkpoints/best.ckpt \

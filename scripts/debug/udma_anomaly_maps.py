@@ -1,5 +1,5 @@
 """Qualitative UDMA anomaly-map inspection (Q9 "characterization without bar",
-docs/2026-07-05_udma_design_spec.md) — the last, non-gating item of the UDMA
+docs/design/udma-spec.md) — the last, non-gating item of the UDMA
 eval checklist (step 6).
 
 Plots the input spectrogram next to the four disagreement maps
@@ -18,10 +18,10 @@ grid via the teacher's global attention (the Q1 risk: "se le mappe risultano
 diffuse -> v2: teacher CNN a receptive field piccolo").
 
 Usage (server):
-    PYTHONPATH=/content/filippo/BL-Exotica-AD python scripts/debug/udma_anomaly_maps.py \\
+    PYTHONPATH=/path/to/BL-Exotica-AD python scripts/debug/udma_anomaly_maps.py \\
         --checkpoint outputs/20260705_224358_e8411e9/checkpoints/epoch=029-val_loss=0.6381.ckpt \\
         --model_config configs/model/udma.yaml \\
-        --cache /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine \\
+        --cache /path/to/data/processed/cache_gbt_fine \\
         --out_dir outputs/sweeps/udma_anomaly_maps
 """
 

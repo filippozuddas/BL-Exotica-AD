@@ -14,7 +14,7 @@ cadence per method (default, fast vetting) or individual PNGs
 (--plot_format png/both).
 
 Usage (run on the server):
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
+    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/path/to/BL-Exotica-AD \
     python scripts/inference.py \
         --checkpoint outputs/training/<run>/checkpoints/best.ckpt \
         --cadence_list data/processed/inference_cadences.txt \

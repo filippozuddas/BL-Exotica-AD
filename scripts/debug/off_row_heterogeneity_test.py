@@ -1,11 +1,10 @@
 """ON-row vs OFF-row anomaly-map diagnostic (UDMA, real held-out cadences).
 
 Motivation: SRT cadences repeat the SAME OFF target 3x per cadence; the real
-Exotica GBT batch uses 3 DIFFERENT OFF targets per cadence (see memory
-exotica_0000_dist_analysis). UDMA's teacher token grid has shape (nh=6, nw=64)
+Exotica GBT batch uses 3 DIFFERENT OFF targets per cadence. UDMA's teacher token grid has shape (nh=6, nw=64)
 where each grid ROW corresponds 1:1 to one of the 6 stacked observations
 (ON1, OFF1, ON2, OFF2, ON3, OFF3) — patch height == one block, so no patch
-ever mixes content from two blocks (see udma_full_design_spec, "lucky 16x/16px
+ever mixes content from two blocks (see docs/design/udma-spec.md, "lucky 16x/16px
 alignment"). This lets us cleanly attribute anomaly-map activation to ON rows
 (0,2,4 -- always the same target, familiar) vs OFF rows (1,3,5 -- three
 different sky pointings in GBT, unlike SRT).
@@ -27,7 +26,7 @@ For a large pool of real background probe windows (no injection), this script:
      the heterogeneity hypothesis is supported.
 
 Usage (server):
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \\
+    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/path/to/BL-Exotica-AD \\
     python scripts/debug/off_row_heterogeneity_test.py \\
         --checkpoint outputs/training/20260707_093113_6d0d1ba/checkpoints/last.ckpt \\
         --cadence_list data/raw/gbt_0000_heldout_cadences.txt \\

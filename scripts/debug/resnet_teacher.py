@@ -1,4 +1,4 @@
-"""ResNet-18 (ImageNet, frozen) — "P" in docs/2026-07-14_paper_alignment_plan.md, Fase 2
+"""ResNet-18 (ImageNet, frozen) — "P" in docs/design/udma-paper-alignment.md, Fase 2
 (D6/D7): the out-of-domain generic backbone the UDMA paper (Qi et al. 2024, Eq. 2) distills
 its teacher CNN from. Read at ``layer3`` (256 ch, stride /16 -> native (6,64) grid on a
 (96,1024) input) so its token grid matches the ViT-MAE teacher's without any downstream
@@ -35,7 +35,7 @@ class ResNetTeacher(nn.Module):
     Input: ``(B, 1, 96, 1024)`` standardized snippets (this repo's median/MAD
     ``core_transform``) — replicated to 3 channels, with NO ImageNet mean/std
     renormalization. That is a deliberate simplification the gate itself is
-    meant to validate (docs/2026-07-14_paper_alignment_plan.md, §5 assumptions),
+    meant to validate (docs/design/udma-paper-alignment.md, §5 assumptions),
     not an oversight.
     """
 

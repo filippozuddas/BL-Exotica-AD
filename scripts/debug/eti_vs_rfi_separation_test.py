@@ -40,15 +40,15 @@ Decisive readout:
     this distinction; only true cross-observation cadence context could, and
     that is barred by the no-ON/OFF-training-objective constraint).
   - supervised AUC high -> the information IS genuinely present in a single
-    frame (drift/tilt is a real single-frame cue, see CLAUDE.md dt/df) -> B3
+    frame (drift/tilt is a real single-frame cue given this product's dt/df) -> B3
     was not purely an artifact -> the problem is unsupervised extraction, not
     a structural ceiling, and 0000.fil is still alive.
 
 Usage (server, not dev machine):
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/content/filippo/BL-Exotica-AD \
+    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/path/to/BL-Exotica-AD \
     python scripts/debug/eti_vs_rfi_separation_test.py \
         --checkpoint outputs/training/<run_id>/checkpoints/<best>.ckpt \
-        --cache /content/nvme_esterno/filippo/BL-Exotica-AD/data/processed/cache_gbt_fine \
+        --cache /path/to/data/processed/cache_gbt_fine \
         --out_dir outputs/sweeps/eti_vs_rfi
 
     # add the disagreement scorer (with or without --checkpoint):
