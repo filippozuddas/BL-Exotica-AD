@@ -1,5 +1,5 @@
 """Teacher-fitness pre-flight for the UDMA build — is the frozen ViT-MAE a
-usable teacher? (docs/design/udma-spec.md, Q1 gate; run BEFORE
+usable teacher? (docs/02_udma-architecture.md §2.1 gates; run BEFORE
 implementing/training anything.)
 
 For the UDMA student-teacher mechanism, "good feature extractor" does NOT mean
@@ -133,7 +133,7 @@ def parse_args():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--architecture", choices=["vit_mae", "resnet18", "cnn_distilled"], default="vit_mae",
                    help="Teacher candidate under test. 'resnet18' gates the paper-faithful "
-                        "out-of-domain P (docs/design/udma-paper-alignment.md, D6/D7) — "
+                        "out-of-domain P (docs/02_udma-architecture.md §11) — "
                         "ignores --checkpoint/--model_config, no local weights needed "
                         "(auto-downloads ImageNet weights via torchvision on first use). "
                         "'cnn_distilled' gates T after distillation (5.2, scripts/distill_teacher.py) "

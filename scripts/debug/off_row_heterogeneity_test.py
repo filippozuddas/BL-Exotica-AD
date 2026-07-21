@@ -4,7 +4,7 @@ Motivation: SRT cadences repeat the SAME OFF target 3x per cadence; the real
 Exotica GBT batch uses 3 DIFFERENT OFF targets per cadence. UDMA's teacher token grid has shape (nh=6, nw=64)
 where each grid ROW corresponds 1:1 to one of the 6 stacked observations
 (ON1, OFF1, ON2, OFF2, ON3, OFF3) — patch height == one block, so no patch
-ever mixes content from two blocks (see docs/design/udma-spec.md, "lucky 16x/16px
+ever mixes content from two blocks (see docs/02_udma-architecture.md, "lucky 16x/16px
 alignment"). This lets us cleanly attribute anomaly-map activation to ON rows
 (0,2,4 -- always the same target, familiar) vs OFF rows (1,3,5 -- three
 different sky pointings in GBT, unlike SRT).

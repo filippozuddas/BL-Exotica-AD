@@ -1,5 +1,5 @@
 """Qualitative UDMA anomaly-map inspection (Q9 "characterization without bar",
-docs/design/udma-spec.md) — the last, non-gating item of the UDMA
+docs/02_udma-architecture.md) — the last, non-gating item of the UDMA
 eval checklist (step 6).
 
 Plots the input spectrogram next to the four disagreement maps

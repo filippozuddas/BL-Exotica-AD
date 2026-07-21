@@ -17,7 +17,7 @@ anomalousness — the RFI tail swamps the operating point below SNR 10) by
 moving the score off the pixel manifold where that tail lives.
 
 Full design rationale, gate results, and pre-registered acceptance bars:
-``docs/design/udma-spec.md`` (Q1-Q10). Teacher fitness (G1-G3b) was
+``docs/02_udma-architecture.md`` (Q1-Q10). Teacher fitness (G1-G3b) was
 verified before this module was written (``scripts/debug/teacher_sensitivity_test.py``);
 do not skip that gate for a new teacher checkpoint/layer.
 
@@ -149,8 +149,7 @@ class TeacherCNN(_FrozenTokenTeacher):
     Students" — teacher feature space anchored out-of-domain by construction;
     spectrum data enters only as distillation input, never as a learning
     target for P itself). Trunk = :func:`build_encoder` with the same
-    parametrisation as the UDMA students (``docs/design/udma-paper-alignment.md``,
-    D8) — its own ``latent_dim``-channel 1x1 projection already lands on the
+    parametrisation as the UDMA students (``docs/02_udma-architecture.md §11D8) — its own ``latent_dim``-channel 1x1 projection already lands on the
     target channel count, no separate head needed.
 
     Trained once by ``scripts/distill_teacher.py`` (frozen P, MSE on a
@@ -439,7 +438,7 @@ def build_udma(
     if teacher_type == "cnn_distilled":
         # Paper-faithful route (D6-D8): teacher distilled from an out-of-domain
         # generic backbone (scripts/distill_teacher.py), not self-supervised
-        # in-domain. See docs/design/udma-paper-alignment.md, Fase 2.
+        # in-domain. See docs/03_teacher-localization.md
         teacher = _load_teacher_cnn(teacher_cfg, input_shape)
     elif teacher_type == "vit_mae":
         vit_config_path = _ROOT / teacher_cfg["vit_config"]

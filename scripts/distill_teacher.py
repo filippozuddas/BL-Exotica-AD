@@ -1,5 +1,5 @@
 """Distill T (CNN teacher) from P (frozen ImageNet ResNet-18) — Fase 2 of
-docs/design/udma-paper-alignment.md (5.2), the paper-faithful teacher
+docs/02_udma-architecture.md §11, the paper-faithful teacher
 route (Qi et al. 2024, Eq. 2 / Bergmann "Uninformed Students"): a small CNN
 is trained to reproduce a frozen, out-of-domain generic backbone's features
 on in-domain data. Spectrum data enters only as distillation input — P is

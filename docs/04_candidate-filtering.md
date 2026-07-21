@@ -4,9 +4,9 @@ Rationale behind `src/search/candidates.py`. The code there carries API
 documentation only; the reasoning, the hand-validated numbers, and the
 explicitly rejected alternatives live here.
 
-**Related:** [`scoring-history.md`](scoring-history.md) ·
-[`teacher-localization.md`](teacher-localization.md) ·
-[`../design/udma-spec.md`](../design/udma-spec.md)
+**Related:** [`01_scoring-history.md`](01_scoring-history.md) ·
+[`03_teacher-localization.md`](03_teacher-localization.md) ·
+[`05_results.md`](05_results.md)
 
 ---
 

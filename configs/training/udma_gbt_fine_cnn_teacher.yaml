@@ -6,7 +6,7 @@
 # same schedule, same seed, so any change in detection is attributable to the
 # teacher swap alone.
 #
-# See docs/design/udma-paper-alignment.md, Fase 2 (5.2, 5.3).
+# See docs/03_teacher-localization.md.
 
 data: configs/data/gbt_fine.yaml
 model: configs/model/udma_cnn_teacher.yaml

@@ -1,48 +1,36 @@
 # Documentation
 
-Design rationale, decision records, and mentor-facing reports for BL-Exotica-AD.
+Design rationale and results for BL-Exotica-AD.
 
 Code carries API documentation only. The *why* — rejected alternatives,
-hand-validated numbers, failed experiments worth not repeating — lives here.
+hand-validated numbers, and experiments worth not repeating — lives here.
 
-## Start here
+Read in order. Each document answers one question and is kept current; there is
+no dated correspondence and no superseded material in this directory.
 
-If you are reading this repository for the first time, read
-[`decisions/scoring-history.md`](decisions/scoring-history.md). Five scorer
-families failed before the current one worked, and that history explains almost
-every design choice in `src/`.
+| # | Document | Answers |
+|---|---|---|
+| 01 | [Scoring history](01_scoring-history.md) | Why does this project not just use reconstruction error? |
+| 02 | [UDMA architecture](02_udma-architecture.md) | What is the production model, and how does it relate to the paper it adapts? |
+| 03 | [Teacher localization](03_teacher-localization.md) | Why is the teacher domain-matched instead of paper-faithful? |
+| 04 | [Candidate filtering](04_candidate-filtering.md) | How does a scored snippet become a candidate a human looks at? |
+| 05 | [Results and limitations](05_results.md) | Does it work, and what is still broken? |
 
-## Decision records
+**If you only read one:** [`01_scoring-history.md`](01_scoring-history.md). Five
+scorer families failed before the current one worked, and that history explains
+almost every design choice in `src/`.
 
-Grouped by topic, kept current as decisions change.
+**If you want the honest status:** [`05_results.md`](05_results.md) §6, which
+lists known limitations rather than resolved ones.
 
-| Document | Covers |
-|---|---|
-| [`decisions/scoring-history.md`](decisions/scoring-history.md) | Why reconstruction-error scoring fails; the five failed scorer families; the disagreement probe; how UDMA was reached; standing architectural constraints |
-| [`decisions/teacher-localization.md`](decisions/teacher-localization.md) | Domain-matched vs. out-of-domain teacher; the receptive-field/architecture/objective hypotheses and their refutation; detection vs. localization trade-off |
-| [`decisions/candidate-filtering.md`](decisions/candidate-filtering.md) | Detection thresholds and the OFF-noise ceiling; ON/OFF contrast and short-list rules; the rejected column-coherence gate |
+## Conventions
 
-## Design specifications
-
-| Document | Covers |
-|---|---|
-| [`design/udma-spec.md`](design/udma-spec.md) | UDMA-GBT specification (Q1–Q10), with acceptance bars pre-registered before any run |
-| [`design/udma-paper-alignment.md`](design/udma-paper-alignment.md) | Equation-by-equation audit against Qi et al. 2024; the three structural deviations and the plan that addressed them |
-
-## Reports
-
-Point-in-time writeups. Not maintained — read them as dated.
-
-| Document | Date |
-|---|---|
-| [`reports/2026-07-06_mentor-report.md`](reports/2026-07-06_mentor-report.md) | 2026-07-06 — architecture choices, implementation, and results (Italian) |
-| [`reports/2026-06-25_scoring-diagnosis.md`](reports/2026-06-25_scoring-diagnosis.md) | 2026-06-25 — reconstruction-error diagnosis (English) |
-
-## `archive/`
-
-Superseded session handoffs and plans for approaches since abandoned. Kept for
-provenance; **conclusions here may be outdated or explicitly retracted** — the
-decision records above supersede them.
+- **English throughout**, including in code comments and docstrings.
+- Results are reported against **bars pre-registered before the run**. This is
+  standing discipline after a headline result was retracted as a partition
+  artifact (see [`01_scoring-history.md`](01_scoring-history.md) §2.1).
+- Superseded documents are deleted, not archived — they remain in the git
+  history. A reader should never have to work out which document is current.
 
 ## References
 
@@ -50,4 +38,5 @@ decision records above supersede them.
 2. Lacki et al. 2020 — *One of Everything: The Breakthrough Listen Exotica Catalog* — [arXiv:2006.11304](https://arxiv.org/abs/2006.11304)
 3. Gong et al. 2019 — *Memorizing Normality to Detect Anomaly (MemAE)* — [arXiv:1904.02639](https://arxiv.org/abs/1904.02639)
 4. He et al. 2022 — *Masked Autoencoders Are Scalable Vision Learners* — [arXiv:2111.06377](https://arxiv.org/abs/2111.06377)
-5. Qi et al. 2024 — *Unsupervised Spectrum Anomaly Detection With Distillation and Memory-Enhanced Autoencoders* — IEEE IoT Journal 11(24):39361
+5. Park et al. 2020 — *Learning Memory-guided Normality for Anomaly Detection* — [arXiv:2003.13228](https://arxiv.org/abs/2003.13228)
+6. Qi et al. 2024 — *Unsupervised Spectrum Anomaly Detection With Distillation and Memory-Enhanced Autoencoders* — IEEE IoT Journal 11(24):39361

@@ -5,7 +5,7 @@ Operates on UDMA's ``(6, 64)`` anomaly map, whose rows correspond 1:1, in
 order, to the 6 observations of an ABACAD cadence (ON, OFF, ON, OFF, ON, OFF).
 
 Design rationale, hand-validated thresholds and rejected alternatives:
-``docs/decisions/candidate-filtering.md``.
+``docs/04_candidate-filtering.md``.
 """
 
 import numpy as np
@@ -29,7 +29,7 @@ def off_noise_ceiling(
 
     Replaces a Gaussian ``median + 3*MAD_sigma`` threshold; a raw high quantile
     of the unclipped values is not a valid substitute either. See
-    ``docs/decisions/candidate-filtering.md`` §3 for both failure modes, and
+    ``docs/04_candidate-filtering.md`` §3 for both failure modes, and
     §3.1 for a known scale limitation of the derived short-list floor.
 
     Args:
@@ -160,7 +160,7 @@ def on_off_contrast(
     tolerate drift between observations minutes apart.
 
     Pure diagnostic — ranks plots, never thresholds or discards. See
-    ``docs/decisions/candidate-filtering.md`` §4.
+    ``docs/04_candidate-filtering.md`` §4.
 
     Args:
         anomaly_map: ``(6, 64)`` map from ``UDMA.anomaly_map`` /
@@ -224,7 +224,7 @@ def full_row_hits(
     ``off_leak`` requires >=2 OFF rows to clear ``threshold`` *and* reach at
     least ``leak_frac`` of the weakest ON row's peak.
 
-    See ``docs/decisions/candidate-filtering.md`` §5 for the blind-spot trade,
+    See ``docs/04_candidate-filtering.md`` §5 for the blind-spot trade,
     the magnitude gate's motivation, and the rejected column-coherence gate.
 
     Args:

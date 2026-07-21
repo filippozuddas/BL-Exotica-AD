@@ -11,7 +11,7 @@ Unsupervised anomaly detection pipeline for searching technosignatures in Green 
 > and a full search pass over the Exotica `0000.h5` heldout set are implemented
 > and have been run. Results and known limitations are documented in
 > [`docs/`](docs/README.md) — read
-> [`docs/decisions/scoring-history.md`](docs/decisions/scoring-history.md) first
+> [`docs/01_scoring-history.md`](docs/01_scoring-history.md) first
 > for the context behind the current design.
 
 ## Motivation
@@ -226,11 +226,12 @@ BL-Exotica-AD/
 │   ├── fit_udma_teacher_norm.py        # offline teacher feature mu/sigma for UDMA
 │   ├── scan_headers.py                 # .h5 header census
 │   └── debug/                          # diagnostics, not part of the pipeline (see scripts/debug/README.md)
-├── docs/                     # design rationale and decision records (see docs/README.md)
-│   ├── decisions/                # topic-grouped decision records — start here
-│   ├── design/                   # UDMA specification and paper alignment
-│   ├── reports/                  # dated mentor-facing writeups
-│   └── archive/                  # superseded handoffs, kept for provenance
+├── docs/                     # design rationale and results (see docs/README.md)
+│   ├── 01_scoring-history.md     # why reconstruction error fails — start here
+│   ├── 02_udma-architecture.md   # the production model + alignment with the paper
+│   ├── 03_teacher-localization.md
+│   ├── 04_candidate-filtering.md
+│   └── 05_results.md             # validation results and known limitations
 ├── tests/
 ├── notebooks/                # exploration only
 ├── outputs/                  # checkpoints, logs, results (gitignored)
@@ -247,11 +248,11 @@ lives in [`docs/`](docs/README.md).
 
 | Document | Covers |
 |---|---|
-| [`docs/decisions/scoring-history.md`](docs/decisions/scoring-history.md) | **Start here.** Why reconstruction-error scoring fails, the five scorer families that failed before UDMA, and the constraints that history imposed |
-| [`docs/decisions/teacher-localization.md`](docs/decisions/teacher-localization.md) | Why the teacher is domain-matched, and the three refuted hypotheses behind that choice |
-| [`docs/decisions/candidate-filtering.md`](docs/decisions/candidate-filtering.md) | Detection thresholds, the OFF-noise ceiling, ON/OFF short-list rules |
-| [`docs/design/udma-spec.md`](docs/design/udma-spec.md) | UDMA specification with pre-registered acceptance bars |
-| [`docs/reports/`](docs/README.md#reports) | Dated writeups for mentors |
+| [`01_scoring-history.md`](docs/01_scoring-history.md) | **Start here.** Why reconstruction error fails, and the five scorer families that failed before UDMA |
+| [`02_udma-architecture.md`](docs/02_udma-architecture.md) | The production model, its pre-registered acceptance bars, and how it relates to Qi et al. 2024 |
+| [`03_teacher-localization.md`](docs/03_teacher-localization.md) | Why the teacher is domain-matched, and the three refuted hypotheses behind that choice |
+| [`04_candidate-filtering.md`](docs/04_candidate-filtering.md) | Detection thresholds, the OFF-noise ceiling, ON/OFF short-list rules |
+| [`05_results.md`](docs/05_results.md) | Validation results and known limitations |
 
 ## Design Choices
 

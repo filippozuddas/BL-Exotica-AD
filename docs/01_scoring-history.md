@@ -4,9 +4,9 @@ The single most important piece of context in this repository. Six scorer
 families were built and evaluated on GBT `0000.fil`; five failed. This document
 records the mechanism behind each failure so they are not re-attempted.
 
-**Related:** [`../reports/2026-06-25_scoring-diagnosis.md`](../reports/2026-06-25_scoring-diagnosis.md)
-(the mentor-facing writeup) · [`../design/udma-spec.md`](../design/udma-spec.md) ·
-[`teacher-localization.md`](teacher-localization.md)
+**Related:** [`02_udma-architecture.md`](02_udma-architecture.md) ·
+[`03_teacher-localization.md`](03_teacher-localization.md) ·
+[`05_results.md`](05_results.md)
 
 ---
 
@@ -87,8 +87,9 @@ direct attack on §1's mechanism.
 | Low-SNR floor | 0% below SNR 10 | **non-zero at SNR 5–7** |
 
 UDMA passed every pre-registered acceptance bar and is the production scorer.
-See [`../design/udma-spec.md`](../design/udma-spec.md) for the full Q1–Q10
-specification and the bars themselves.
+See [`02_udma-architecture.md`](02_udma-architecture.md) for the full
+specification and the bars themselves, and [`05_results.md`](05_results.md)
+for the measured outcome.
 
 ## 5. Why `topk_mse` exists
 
@@ -106,7 +107,7 @@ unlike a raw per-pixel max, which is already confounded by heavy-tailed
 background residual.
 
 Production `topk_frac` is **0.01** (swept; see
-[`teacher-localization.md`](teacher-localization.md) §7).
+[`03_teacher-localization.md`](03_teacher-localization.md) §7).
 
 ## 6. Mechanism confirmed at the memory level
 

@@ -36,7 +36,7 @@ Blocks
                    frame energy (adaptive caliper tightened until the
                    energy-only AUC collapses to ~0.5). This is the number
                    comparable to the historical 0.77-0.79 for the AE-vs-MemAE
-                   disagreement scorer (docs/decisions/scoring-history.md §3),
+                   disagreement scorer (docs/01_scoring-history.md §3),
                    and the one that says whether the model reads MORPHOLOGY or
                    just brightness.
   6. OCCUPANCY   — confound-free control: same line, same sites, same SNR,
@@ -59,7 +59,7 @@ Outcome (2026-07-20): UDMA beats trivial statistics by +0.07-0.09 AUC at matched
 energy vs real RFI, so the memory unit earns its place. Two caveats: clean
 negatives give the OPPOSITE answer, and equal-weight fusion dilutes ``ss``,
 which is by far the best single term at SNR 10. Full record in
-``docs/decisions/teacher-localization.md`` §6.
+``docs/03_teacher-localization.md`` §6.
 
 Usage:
     PYTHONPATH=/path/to/BL-Exotica-AD python scripts/debug/udma_component_attribution.py \\

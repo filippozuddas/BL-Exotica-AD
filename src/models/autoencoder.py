@@ -35,7 +35,7 @@ The 4th and 5th backbones are selected by ``architecture`` rather than the CNN f
   "students" (one plain, one memory-augmented) are trained to regress; the
   anomaly score is their prediction disagreement on the teacher's feature grid,
   not pixel reconstruction. No pixel decoder. See
-  ``docs/design/udma-spec.md``.
+  ``docs/02_udma-architecture.md``.
 
 All five are pure ``nn.Module`` wrappers exposing ``compute_loss`` (training)
 and ``anomaly_score`` (search-time scoring); the first four also expose

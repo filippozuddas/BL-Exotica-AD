@@ -2,7 +2,7 @@
 # 5th build_autoencoder backbone. architecture: udma routes build_autoencoder()
 # to build_udma(), bypassing the CNN encoder/bottleneck/decoder top-level config
 # keys (the student section below reuses that schema, but nested under `student:`).
-# See src/models/udma.py and docs/design/udma-spec.md (Q1-Q10).
+# See src/models/udma.py and docs/02_udma-architecture.md (Q1-Q10).
 #
 # Frozen ViT-MAE teacher (self-supervised, read at an intermediate transformer
 # block) supplies a (128, 6, 64) token-feature target; two CNN students (one

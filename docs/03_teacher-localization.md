@@ -7,8 +7,8 @@ Rationale behind `scripts/debug/teacher_row_leakage_test.py`,
 `scripts/debug/teacher_sensitivity_test.py`, and the teacher block of
 `configs/model/udma.yaml`.
 
-**Related:** [`../design/udma-paper-alignment.md`](../design/udma-paper-alignment.md) ·
-[`candidate-filtering.md`](candidate-filtering.md)
+**Related:** [`02_udma-architecture.md`](02_udma-architecture.md) §11 ·
+[`04_candidate-filtering.md`](04_candidate-filtering.md)
 
 ---
 

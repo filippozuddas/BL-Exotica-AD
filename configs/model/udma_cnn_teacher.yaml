@@ -6,12 +6,12 @@
 # data itself, unlike the retired in-domain self-supervised ViT-MAE teacher
 # whose too-learnable target collapsed student disagreement.
 #
-# Gate results (docs/design/udma-paper-alignment.md, 5.1/5.2, memory
+# Gate results (docs/03_teacher-localization.md
 # udma_resnet_teacher_gate): P and T both PASS all 4 gates (G1/G2/G3a/G3b)
 # with the corrected setigen injector and a widened SNR sweep.
 #
 # student.mem_slots stays 500 (NOT 30) -- Fase 1 (mem_slots=30) was KILLED
-# 2026-07-15 (docs/decisions/teacher-localization.md §7), no capacity restriction
+# 2026-07-15 (docs/03_teacher-localization.md §7), no capacity restriction
 # carried over into this arm.
 
 architecture: udma

@@ -24,7 +24,7 @@ OFF-row motion is pure receptive-field leakage.
 Cost: n_frames * len(snr_list) * len(stages) frozen forwards. No training.
 
 Outcome (2026-07-16): all three hypotheses refuted; only domain-matched
-training localizes. Full record in ``docs/decisions/teacher-localization.md``.
+training localizes. Full record in ``docs/03_teacher-localization.md``.
 
 Usage (run on the data host; --cache must point at a preprocessed cache):
 

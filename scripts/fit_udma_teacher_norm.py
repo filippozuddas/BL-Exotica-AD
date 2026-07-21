@@ -1,6 +1,6 @@
 """One-shot: fit the UDMA teacher's per-channel token normalization (Q2/Q7).
 
-Checklist step 3 (docs/design/udma-spec.md) — MUST run before any
+Checklist step 3 (docs/02_udma-architecture.md) — MUST run before any
 UDMA training launch. ``TeacherViT.mu``/``sigma`` default to identity (0/1);
 without this step the students would regress raw, unnormalized teacher
 features, which violates Q2 and invalidates the run.

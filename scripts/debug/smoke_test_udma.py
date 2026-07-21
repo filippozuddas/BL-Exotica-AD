@@ -1,5 +1,5 @@
 """One-shot CPU smoke test for the UDMA backbone (checklist step 4,
-docs/design/udma-spec.md).
+docs/02_udma-architecture.md).
 
 Random input only — no real dataset — but DOES need the pinned ViT-MAE
 checkpoint (``build_udma`` loads it via a strict ``state_dict``), so this is a

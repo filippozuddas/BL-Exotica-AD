@@ -38,7 +38,7 @@ def topk_mse(y_true: torch.Tensor, y_pred: torch.Tensor, frac: float = 0.02) -> 
     few dozen. Averaging the top fraction keeps the local signal without
     degenerating into a single-outlier statistic like a per-pixel max.
 
-    Production value is ``frac=0.01``. See ``docs/decisions/scoring-history.md``
+    Production value is ``frac=0.01``. See ``docs/01_scoring-history.md``
     §5.
     """
     sq_err = (y_true - y_pred) ** 2
