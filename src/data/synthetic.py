@@ -461,6 +461,7 @@ class _SetigenInjector:
         f_profile,
         t_profile_builder,
         on_indices: Tuple[int, ...] = (0, 2, 4),
+        path_builder=None,
     ) -> Tuple[np.ndarray, dict]:
         """Inject an already-parameterized signal into ON observations only.
 
@@ -482,6 +483,14 @@ class _SetigenInjector:
 
         ``t_profile_builder(intensity, n_bins) -> t_profile`` defers profile
         construction until the reference intensity is known.
+
+        ``path_builder(f_start_hz, drift_rate_hz_s) -> setigen path`` defaults to
+        ``stg.constant_path`` (a straight line in the time-frequency plane).
+        Pass a builder to render a non-linear track — accelerating, sinusoidal,
+        or any custom ``path(t)`` — while keeping every other aspect of the
+        ON-only cadence assembly identical. ``drift_rate`` is then whatever the
+        builder chooses to interpret it as (typically the drift at t=0), and is
+        still recorded verbatim in ``info``.
         """
         obs_windows = np.asarray(obs_windows, dtype=float)
         n_obs, tchans_per_obs, fchans = obs_windows.shape
@@ -497,10 +506,11 @@ class _SetigenInjector:
         # full range or later ON frames sample past its domain (np.interp
         # would silently clamp to the edge value instead of the true envelope).
         t_profile = t_profile_builder(intensity, n_obs * tchans_per_obs)
-        path = stg.constant_path(
-            f_start=ref_frame.get_frequency(index=start_channel),
-            drift_rate=drift_rate * u.Hz / u.s,
-        )
+        f_start_hz = ref_frame.get_frequency(index=start_channel)
+        if path_builder is None:
+            path = stg.constant_path(f_start=f_start_hz, drift_rate=drift_rate * u.Hz / u.s)
+        else:
+            path = path_builder(f_start_hz, drift_rate)
         bp_profile = stg.constant_bp_profile(level=1)
 
         for i in on_indices:
