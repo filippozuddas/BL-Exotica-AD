@@ -53,7 +53,7 @@ def overlay_anomaly_map(ax, base_img: np.ndarray, amap: np.ndarray, cmap: str = 
 
 
 def plot_candidate(original, reconstruction, score, sigma, method, cad_idx,
-                    target, f_start, df, anomaly_map=None, n_obs=6):
+                    target, f_start, df, anomaly_map=None, n_obs=6, show_overlay=True):
     """Build (but don't save) the original|reconstruction|error figure for one
     candidate; caller decides whether to write it to PNG, a per-cadence PDF,
     or both.
@@ -61,7 +61,11 @@ def plot_candidate(original, reconstruction, score, sigma, method, cad_idx,
     ``reconstruction``/error panels for pixel-decoder backbones; if
     ``reconstruction`` is None (UDMA, no pixel decoder), ``anomaly_map`` — its
     native (nh,nw) disagreement grid — is shown instead (see
-    ``UDMA.anomaly_map`` / ``scripts/debug/udma_anomaly_maps.py``).
+    ``UDMA.anomaly_map`` / ``scripts/debug/udma_anomaly_maps.py``). The
+    bilinear-overlay panel (native grid resampled onto the full-res waterfall)
+    is optional — set ``show_overlay=False`` to drop it and keep just
+    original + native anomaly_map (2 panels instead of 3); no effect on the
+    ``reconstruction`` path, which always shows all 3 panels.
 
     Horizontal lines mark the ``n_obs`` observation boundaries (ABACAD
     cadence stacking) on every panel drawn at ``original``'s native time
@@ -71,7 +75,9 @@ def plot_candidate(original, reconstruction, score, sigma, method, cad_idx,
     n_rows = original.shape[0]
     vmin, vmax = np.percentile(original, [1, 99])
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    show_overlay = show_overlay or reconstruction is not None
+    n_panels = 3 if show_overlay else 2
+    fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 5))
 
     im0 = axes[0].imshow(original, aspect="auto", origin="upper",
                           vmin=vmin, vmax=vmax, cmap="viridis")
@@ -101,9 +107,10 @@ def plot_candidate(original, reconstruction, score, sigma, method, cad_idx,
         axes[1].set_xlabel("Freq patch col")
         axes[1].set_ylabel("Time patch row")
         plt.colorbar(im1, ax=axes[1], fraction=0.046)
-        overlay_anomaly_map(axes[2], original, anomaly_map,
-                             title="anomaly_map (bilinear overlay)")
-        add_obs_dividers(axes[2], n_rows, n_obs)
+        if show_overlay:
+            overlay_anomaly_map(axes[2], original, anomaly_map,
+                                 title="anomaly_map (bilinear overlay)")
+            add_obs_dividers(axes[2], n_rows, n_obs)
 
     f_center_mhz = f_start * df / 1e6
     score_line = f"{method} score={score:.4f}"
