@@ -1,0 +1,43 @@
+# UDMA training config — BOTTLENECK ablation, LOOSE arm (2026-07-22).
+#
+# Re-imposes the paper's third capacity limiter (a narrow spatial bottleneck
+# in the students) with the memory held fixed at 500 slots, isolating the one
+# variable the mem_slots=30 experiment could not. Rationale, geometry and
+# pre-registered bars live in configs/model/udma_bottleneck_loose.yaml.
+#
+# The training block below is byte-identical to
+# udma_gbt_fine_old_teacher_fixed_preproc.yaml -- same batch/lr/epochs/seed
+# AND same num_gpus: 2, because batch_size is per-device under Lightning DDP
+# and dropping to 1 GPU would change the global batch, confounding the
+# comparison against the 79.11/95.56/100.0 baseline. Run the two arms
+# sequentially on both GPUs, not in parallel on one each.
+#
+# Goal-(b) lane: this is a SCORER-level ablation, benchmarked with
+# scripts/inject_recover.py on the frozen Tier A cadence list. It is not a
+# candidate to replace the production search model -- promoting a new
+# checkpoint would force a fresh ~30h scan plus full manual short-list
+# re-review, which does not fit before 2026-08-14. The frozen production
+# model remains 20260707_093113_6d0d1ba/epoch=057.
+
+data: configs/data/gbt_fine.yaml
+model: configs/model/udma_bottleneck_loose.yaml
+
+training:
+  batch_size: 256
+  epochs: 60
+  learning_rate: 1.0e-3
+  optimizer: adamw
+  weight_decay: 0.01
+  loss: mse            # unused by UDMA (its own compute_loss owns the objective); kept for schema parity
+  seed: 42
+
+  patience: 8
+  min_delta: 1.0e-5
+  monitor: val_st_sum
+
+hardware:
+  num_gpus: 2
+  mixed_precision: true
+  num_workers: 16
+
+output_dir: outputs/training/

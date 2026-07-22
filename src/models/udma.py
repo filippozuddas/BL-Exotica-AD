@@ -212,6 +212,19 @@ class FeatureStudent(nn.Module):
     same ``(H', W')`` grid as the teacher tokens (both come from a 16x
     downsampling of a (96,1024) input) — no upsampling/pooling is needed to
     align them.
+
+    ``squeeze_shape``/``squeeze_channels`` optionally re-impose the paper's
+    third capacity limiter (Qi et al. 2024 §V: students are encoder-decoders
+    with a narrow ``1x8x32`` bottleneck). Our trunk keeps the full ``(H',W')``
+    grid at ``latent_dim`` channels — 24576 dims for the default (6,64)x64 —
+    which is ~96x the paper's 256, a deliberate anti-dilution deviation that
+    left the student expressive enough to potentially track the teacher onto
+    anomalies. The squeeze is placed **after** the memory rather than before
+    it, so that enabling it moves exactly one variable: the memory keeps its
+    384 per-position queries of dim ``latent_dim`` unchanged. (Paper-faithful
+    placement would put it before the memory, but that would also change the
+    memory's query geometry from 384x64 to 8x32, confounding the two limiters
+    the way the mem_slots=30 experiment already showed is unreadable.)
     """
 
     def __init__(
@@ -229,6 +242,8 @@ class FeatureStudent(nn.Module):
         shrink_threshold: Optional[float] = None,
         head_hidden: int = 128,
         head_context_convs: int = 2,
+        squeeze_shape: Optional[Tuple[int, int]] = None,
+        squeeze_channels: Optional[int] = None,
     ):
         super().__init__()
         self.trunk = build_encoder(
@@ -243,6 +258,26 @@ class FeatureStudent(nn.Module):
         )
         self.memory = MemoryUnit(mem_slots, latent_dim, shrink_threshold=shrink_threshold) if memory else None
 
+        self.squeeze = None
+        if squeeze_shape is not None:
+            sh, sw = int(squeeze_shape[0]), int(squeeze_shape[1])
+            sc = int(squeeze_channels if squeeze_channels is not None else latent_dim)
+            factor = 2 ** len(list(filters))
+            gh, gw = input_shape[0] // factor, input_shape[1] // factor
+            if gh % sh or gw % sw:
+                raise ValueError(
+                    f"student.bottleneck.squeeze.shape {(sh, sw)} must divide the trunk "
+                    f"grid {(gh, gw)} (input {input_shape[:2]} / {factor}); the squeeze "
+                    f"uses non-overlapping kernel=stride=({gh // sh},{gw // sw})."
+                )
+            ks = (gh // sh, gw // sw)
+            self.squeeze = nn.Sequential(
+                nn.Conv2d(latent_dim, sc, kernel_size=ks, stride=ks),
+                nn.ReLU(inplace=True),
+                nn.ConvTranspose2d(sc, latent_dim, kernel_size=ks, stride=ks),
+                nn.ReLU(inplace=True),
+            )
+
         head_layers = []
         prev = latent_dim
         for _ in range(head_context_convs):
@@ -256,6 +291,8 @@ class FeatureStudent(nn.Module):
         att = None
         if self.memory is not None:
             z, att = self.memory(z)
+        if self.squeeze is not None:
+            z = self.squeeze(z)
         out = self.head(z)
         return (out, att) if self.memory is not None else out
 
@@ -465,7 +502,11 @@ def build_udma(
     activation = enc_cfg.get("activation", "relu")
     use_batchnorm = enc_cfg.get("use_batchnorm", True)
     convs_per_block = int(enc_cfg.get("convs_per_block", 2))
-    latent_dim = int(student_cfg["bottleneck"]["latent_dim"])
+    bottleneck_cfg = student_cfg["bottleneck"]
+    latent_dim = int(bottleneck_cfg["latent_dim"])
+    squeeze_cfg = bottleneck_cfg.get("squeeze") or {}
+    squeeze_shape = squeeze_cfg.get("shape")
+    squeeze_channels = squeeze_cfg.get("channels")
     head_hidden = int(student_cfg.get("head_hidden", 128))
     head_context_convs = int(student_cfg.get("head_context_convs", 2))
     mem_slots = int(student_cfg.get("mem_slots", 500))
@@ -504,6 +545,8 @@ def build_udma(
             shrink_threshold=shrink_threshold,
             head_hidden=head_hidden,
             head_context_convs=head_context_convs,
+            squeeze_shape=squeeze_shape,
+            squeeze_channels=squeeze_channels,
         )
 
     student_ae = _make_student(memory=False)
