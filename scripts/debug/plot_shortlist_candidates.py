@@ -222,7 +222,7 @@ def main():
             fig = plot_candidate(
                 original=snippet, reconstruction=recon, score=score, sigma=None,
                 method=method, cad_idx=cad_idx, target=target or "unknown",
-                f_start=fs, df=df, anomaly_map=amap,
+                f_start=fs, df=df, anomaly_map=amap, show_overlay=False,
             )
         else:
             fig, ax = plt.subplots(figsize=(9, 5))
