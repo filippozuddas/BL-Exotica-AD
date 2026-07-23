@@ -6,7 +6,7 @@ windows of real cadences, and compares against an RFI-inclusive background
 built in-script from a full random probe of the same cadences (not just the
 quiet half used for injection sites).
 
-Injection uses setigen natively (NarrowbandDriftingGenerator.inject_on_only_cadence
+Injection goes through src/data/morphologies.py (inject_on_only_cadence
 in src/data/synthetic.py): one setigen Frame per observation assembled into a
 Cadence (t_overwrite=True) so the drift phase stays correct across the OFF
 observations' real duration (slew is negligible, per-obs duration is not), but
@@ -51,7 +51,7 @@ sys.path.insert(0, str(ROOT))
 from src.models.autoencoder import build_autoencoder
 from src.data.preprocessing import bandpass_correct, core_transform
 from src.data.torch_dataset import _load_full_obs
-from src.data.synthetic import NarrowbandParams, NarrowbandDriftingGenerator
+from src.data.morphologies import MORPHOLOGIES, build_morphology
 from src.utils.visualization import overlay_anomaly_map
 
 INPUT_SHAPE = (96, 1024, 1)
@@ -157,6 +157,16 @@ def parse_args():
                         "n=200 undersamples the RFI tail and biases the threshold low).")
     p.add_argument("--snr_list", type=float, nargs="+",
                    default=[3, 5, 7, 10, 15, 20, 30, 50])
+    p.add_argument("--morphology", default="narrowband_drift", choices=list(MORPHOLOGIES),
+                   help="Signal class to inject. ONE per run, unlike "
+                        "pipeline_sensitivity.py which sweeps all of them in a "
+                        "single pass: this script's aggregation (eta^2, the "
+                        "per-cadence tables, both CSVs, the plots) is indexed by "
+                        "scoring method throughout, and the default keeps the "
+                        "historical narrowband benchmark path bit-identical so "
+                        "new runs stay comparable to the recorded "
+                        "79.11/95.56/100.0 baseline. Outputs are stamped with "
+                        "the morphology name, so runs do not overwrite each other.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--methods", nargs="+", default=None,
                    help="Scoring methods to test (default: all supported by model)")
@@ -169,6 +179,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    # One subdirectory per morphology. Without this a second run at a different
+    # morphology silently overwrites the first's CSVs, plots and run.log, and
+    # the two become indistinguishable after the fact — the same failure the
+    # RESOLVED ARGS block below exists to prevent.
+    args.out_dir = args.out_dir / args.morphology
     args.out_dir.mkdir(parents=True, exist_ok=True)
     setup_logging(args.out_dir)
 
@@ -196,7 +211,6 @@ def main():
     with open(args.model_config) as f:
         model_cfg = yaml.safe_load(f)
 
-    nb_params = NarrowbandParams.from_config(data_cfg)
     total_tchans = INPUT_SHAPE[0]
 
     cadence_lines = [
@@ -301,18 +315,13 @@ def main():
         cad_inj = {m: {snr: [] for snr in args.snr_list} for m in methods}
         for j, fs in enumerate(injection_fstarts):
             site_seed = args.seed + cad_idx * 1000 + j
-            gen = NarrowbandDriftingGenerator(nb_params, seed=site_seed)
-            drift_rate, start_channel, f_profile, t_profile_builder, sig_meta = \
-                gen.sample_cadence_signal_params(fchans, total_tchans)
+            injector = build_morphology(args.morphology, data_cfg, seed=site_seed)
+            site = injector.sample_site(fchans, total_tchans)
 
             obs_windows = extract_obs_windows(obs_arrays, fs, fchans)
 
             for snr in args.snr_list:
-                raw_inj, _ = gen.inject_on_only_cadence(
-                    obs_windows, snr=snr, drift_rate=drift_rate,
-                    start_channel=start_channel, f_profile=f_profile,
-                    t_profile_builder=t_profile_builder,
-                )
+                raw_inj, _ = injector.inject(obs_windows, site, snr)
                 snip_inj = preprocess_injected(raw_inj, preproc)
 
                 for m in methods:
@@ -586,17 +595,12 @@ def main():
                     "recon", args.device) for fs in probe_fstarts]
     quiet_fs = probe_fstarts[np.argmin(probe_scores)]
 
-    example_gen = NarrowbandDriftingGenerator(nb_params, seed=args.seed + 9999)
-    ex_drift_rate, ex_start_channel, ex_f_profile, ex_t_profile_builder, ex_meta = \
-        example_gen.sample_cadence_signal_params(fchans, total_tchans)
+    example_injector = build_morphology(args.morphology, data_cfg, seed=args.seed + 9999)
+    example_site = example_injector.sample_site(fchans, total_tchans)
     example_obs_windows = extract_obs_windows(obs_arrays, quiet_fs, fchans)
 
     for snr in [5, 10, 20]:
-        raw_inj, _ = example_gen.inject_on_only_cadence(
-            example_obs_windows, snr=snr, drift_rate=ex_drift_rate,
-            start_channel=ex_start_channel, f_profile=ex_f_profile,
-            t_profile_builder=ex_t_profile_builder,
-        )
+        raw_inj, _ = example_injector.inject(example_obs_windows, example_site, snr)
         snip_inj = preprocess_injected(raw_inj, preproc)
         snip_clean = preprocess_raw_window(obs_arrays, quiet_fs, fchans, preproc)
         try:

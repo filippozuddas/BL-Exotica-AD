@@ -71,7 +71,7 @@ sys.path.insert(0, str(ROOT))
 import scripts.inference as inf
 from scripts.inject_recover import extract_obs_windows, preprocess_injected
 from src.data.torch_dataset import _load_full_obs
-from src.data.synthetic import NarrowbandParams, NarrowbandDriftingGenerator
+from src.data.morphologies import MORPHOLOGIES, build_morphology
 from src.search.candidates import off_noise_ceiling, on_off_contrast, full_row_hits
 
 INPUT_SHAPE = (96, 1024, 1)
@@ -124,6 +124,11 @@ def parse_args():
                         "completeness.")
     p.add_argument("--loose_quantile", type=float, default=0.95,
                    help="Alternative (looser) FAR cut, to price the 0.99 choice.")
+    p.add_argument("--morphologies", nargs="+", default=list(MORPHOLOGIES),
+                   choices=list(MORPHOLOGIES),
+                   help="Signal classes to sweep. All morphologies share each "
+                        "injection site and its background, so the comparison "
+                        "between them is paired.")
     p.add_argument("--method", default="topk")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
@@ -153,7 +158,7 @@ def main():
     weights = model.score_weights
     print(f"  score_weights={weights}  topk_frac={model.topk_frac}")
 
-    nb_params = NarrowbandParams.from_config(data_cfg)
+    print(f"  morphologies: {', '.join(args.morphologies)}")
 
     score_cache = args.map_dir / "_scores"
     rows = []
@@ -226,59 +231,79 @@ def main():
         quiet_f = all_f[all_s <= np.median(all_s)]
         sites = rng.choice(quiet_f, size=min(args.n_sites, len(quiet_f)), replace=False)
 
+        # The fix proposed in docs/06_threshold-audit.md. Free to evaluate here:
+        # it is a second comparison against the same scalar score, no extra
+        # forward pass. Reported alongside the shipped cut rather than behind a
+        # flag, because a single-arm result cannot distinguish "the model did
+        # not see the signal" from "the pre-cut discarded it" — and on 32.7% of
+        # cadences far_thresh sits above off_ceiling (max 162x), so that
+        # distinction decides how the whole sweep reads.
+        min_thresh = min(far_thresh, off_ceiling)
+
         for site_i, f_start in enumerate(sites):
             f_start = int(f_start)
-            # Fresh generator per site with a deterministic seed (same pattern as
-            # inject_recover.py): the morphology is then reproducible per site and
-            # independent of how many sites/SNRs ran before it.
-            site_seed = args.seed + 1000 * cad_idx + site_i
-            gen = NarrowbandDriftingGenerator(nb_params, seed=site_seed)
-            drift_rate, start_channel, f_profile, t_builder, sig_meta = \
-                gen.sample_cadence_signal_params(fchans, INPUT_SHAPE[0])
+            # The site (and therefore its background) is drawn ONCE and reused by
+            # every morphology, so morphologies are compared paired: the between-
+            # cadence and between-site variance that dominates this measurement
+            # (eta^2 ~ 0.94, see udma_heldout_injection_recovery) cancels in the
+            # comparison instead of being sampled independently per class.
             raw = extract_obs_windows(obs_arrays, f_start, fchans)
 
-            for snr in args.snr_list:
-                injected, _ = gen.inject_on_only_cadence(
-                    raw, snr=snr, drift_rate=drift_rate, start_channel=start_channel,
-                    f_profile=f_profile, t_profile_builder=t_builder,
-                    on_indices=(0, 2, 4))
-                snip = preprocess_injected(injected, preproc)
-                x = torch.from_numpy(snip).float().unsqueeze(0).unsqueeze(0).to(args.device)
-                with torch.no_grad():
-                    score = float(model.anomaly_score(x, method=args.method).item())
-                    amap = model.anomaly_map(x)[0].cpu().numpy()
+            for m_idx, morph_name in enumerate(args.morphologies):
+                # Deterministic per (cadence, site, morphology): reproducible and
+                # independent of how many sites/SNRs/morphologies ran before it.
+                site_seed = args.seed + 1000 * cad_idx + site_i + 100000 * m_idx
+                injector = build_morphology(morph_name, data_cfg, seed=site_seed)
+                site = injector.sample_site(fchans, INPUT_SHAPE[0])
 
-                fr = full_row_hits(amap, threshold=off_ceiling)
-                contrast = on_off_contrast(amap, threshold=off_ceiling)["on_off_contrast"]
+                for snr in args.snr_list:
+                    injected, inj_info = injector.inject(
+                        raw, site, snr, on_indices=(0, 2, 4))
+                    snip = preprocess_injected(injected, preproc)
+                    x = torch.from_numpy(snip).float().unsqueeze(0).unsqueeze(0).to(args.device)
+                    with torch.no_grad():
+                        score = float(model.anomaly_score(x, method=args.method).item())
+                        amap = model.anomaly_map(x)[0].cpu().numpy()
 
-                pass_far = score > far_thresh
-                pass_loose = score > loose_thresh
-                pass_rows = fr["n_on_hits_full"] >= 2
-                pass_short = bool(fr["in_short_list"])
-                survives = pass_short and pass_far
-                # Where the injection would land in this cadence's plot ordering.
-                # Not a filter — it prices review budget: rank r means it needs
-                # a cap of r+1 to be rendered.
-                rank = int((incumbent > contrast).sum()) if survives else -1
+                    fr = full_row_hits(amap, threshold=off_ceiling)
+                    contrast = on_off_contrast(amap, threshold=off_ceiling)["on_off_contrast"]
 
-                rows.append({
-                    "cadence_idx": cad_idx, "target": meta["source"],
-                    "site": site_i, "f_start": f_start, "snr": snr,
-                    "drift_rate": drift_rate,
-                    "score": score, "on_off_contrast": contrast,
-                    "n_on_hits_full": fr["n_on_hits_full"],
-                    "n_off_hits_full": fr["n_off_hits_full"],
-                    "far_thresh": far_thresh, "loose_thresh": loose_thresh,
-                    "thresh_3": thresh_3, "off_ceiling": off_ceiling,
-                    "rank_in_shortlist": rank,
-                    "n_incumbent": len(incumbent),
-                    "s0_sigma3": bool(score > thresh_3),
-                    "s1_far1pct": bool(pass_far),
-                    "s1b_loose": bool(pass_loose),
-                    "s2_on_rows": bool(pass_rows),
-                    "s3_short_list": bool(pass_short),
-                    "survives_pipeline": bool(survives),
-                })
+                    pass_far = score > far_thresh
+                    pass_min = score > min_thresh
+                    pass_loose = score > loose_thresh
+                    pass_rows = fr["n_on_hits_full"] >= 2
+                    pass_short = bool(fr["in_short_list"])
+                    survives = pass_short and pass_far
+                    survives_min = pass_short and pass_min
+                    # Where the injection would land in this cadence's plot ordering.
+                    # Not a filter — it prices review budget: rank r means it needs
+                    # a cap of r+1 to be rendered.
+                    rank = int((incumbent > contrast).sum()) if survives else -1
+
+                    rows.append({
+                        "cadence_idx": cad_idx, "target": meta["source"],
+                        "morphology": morph_name,
+                        "site": site_i, "f_start": f_start, "snr": snr,
+                        "drift_rate": inj_info.get("drift_rate"),
+                        "min_thresh": min_thresh,
+                        "s1_min": bool(pass_min),
+                        "survives_pipeline_min": bool(survives_min),
+                        "score": score, "on_off_contrast": contrast,
+                        "n_on_hits_full": fr["n_on_hits_full"],
+                        "n_off_hits_full": fr["n_off_hits_full"],
+                        "far_thresh": far_thresh, "loose_thresh": loose_thresh,
+                        "thresh_3": thresh_3, "off_ceiling": off_ceiling,
+                        "rank_in_shortlist": rank,
+                        "n_incumbent": len(incumbent),
+                        "s0_sigma3": bool(score > thresh_3),
+                        "s1_far1pct": bool(pass_far),
+                        "s1b_loose": bool(pass_loose),
+                        "s2_on_rows": bool(pass_rows),
+                        "s3_short_list": bool(pass_short),
+                        "survives_pipeline": bool(survives),
+                        **{f"sig_{k}": v for k, v in inj_info.items()
+                           if k not in ("snr", "drift_rate")},
+                    })
 
         del obs_arrays
         n_done += 1
@@ -292,15 +317,17 @@ def main():
         print("\nNo results.")
         return
 
-    stages = ["s0_sigma3", "s1_far1pct", "s1b_loose", "s2_on_rows",
-              "s3_short_list", "survives_pipeline"]
+    stages = ["s0_sigma3", "s1_far1pct", "s1b_loose", "s1_min", "s2_on_rows",
+              "s3_short_list", "survives_pipeline", "survives_pipeline_min"]
     labels = {
         "s0_sigma3":         "score > 3sigma (scorer only, historical metric)",
         "s1_far1pct":        "survives FAR 1% cut          [pipeline stage 1]",
         "s1b_loose":         f"  ...would survive FAR {100*(1-args.loose_quantile):.0f}% cut",
+        "s1_min":            "  ...would survive min(far,ceiling)  [docs/06 fix]",
         "s2_on_rows":        ">=2 ON rows over OFF ceiling [pipeline stage 2]",
         "s3_short_list":     "in short list (no off_leak)  [pipeline stage 3]",
-        "survives_pipeline": "SURVIVES THE PIPELINE        [stage 1 AND 3]",
+        "survives_pipeline": "SURVIVES THE PIPELINE        [as shipped]",
+        "survives_pipeline_min": "SURVIVES THE PIPELINE        [with docs/06 fix]",
     }
     summary = df.groupby("snr")[stages].mean() * 100
 
@@ -311,8 +338,30 @@ def main():
             print(f"{label:<48}  " + " ".join(fmt.format(v) for v in vals))
 
     n_per_snr = len(df) // len(args.snr_list)
-    table(f"END-TO-END SURVIVAL (%)   n={n_per_snr} injections/SNR, {n_done} cadences",
+    table(f"END-TO-END SURVIVAL (%)   n={n_per_snr} injections/SNR, {n_done} cadences"
+          f"  [all morphologies pooled]",
           [(labels[st], [summary.loc[s, st] for s in summary.index]) for st in stages],
+          [f"SNR{int(s)}" for s in summary.index])
+
+    # Per morphology. Pooling hides the thing the sweep exists to measure: the
+    # thesis is that this search is sensitive to signal classes turboSETI is
+    # not, which is a statement about the SPREAD between these rows, not about
+    # their average.
+    for morph in df["morphology"].unique():
+        sub = df[df.morphology == morph]
+        msum = sub.groupby("snr")[stages].mean() * 100
+        n_m = len(sub) // max(len(args.snr_list), 1)
+        table(f"MORPHOLOGY: {morph}   n={n_m} injections/SNR",
+              [(labels[st], [msum.loc[s, st] for s in msum.index]) for st in stages],
+              [f"SNR{int(s)}" for s in msum.index])
+
+    # The gap the two arms open is the cost of the shipped pre-cut, per class.
+    table("COST OF THE FAR 1% PRE-CUT (percentage points recovered by docs/06 fix)",
+          [(f"  {m:<44}",
+            [(df[(df.morphology == m) & (df.snr == s)]["survives_pipeline_min"].mean()
+              - df[(df.morphology == m) & (df.snr == s)]["survives_pipeline"].mean()) * 100
+             for s in summary.index])
+           for m in df["morphology"].unique()],
           [f"SNR{int(s)}" for s in summary.index])
 
     # Review budget: of the injections that survive the pipeline, how many are

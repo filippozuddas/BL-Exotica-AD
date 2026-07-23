@@ -106,8 +106,8 @@ class SetigenMorphology:
     def rng(self) -> np.random.Generator:
         return self._gen.rng
 
-    def sample_site(self, fchans: int, total_tchans: int) -> Site:
-        return self._sampler(self._gen, fchans, total_tchans)
+    def sample_site(self, fchans: int, total_tchans: int, n_obs: int = 6) -> Site:
+        return self._sampler(self._gen, fchans, total_tchans, n_obs)
 
     def inject(self, obs_windows: np.ndarray, site: Site, snr: float,
                on_indices: Tuple[int, ...] = ON_INDICES) -> Tuple[np.ndarray, dict]:
@@ -131,7 +131,7 @@ class SetigenMorphology:
 # except amplitude.
 # --------------------------------------------------------------------------
 
-def _sample_drifting(gen, fchans: int, total_tchans: int) -> Site:
+def _sample_drifting(gen, fchans: int, total_tchans: int, n_obs: int = 6) -> Site:
     """Trick 1 — linear narrowband drift. The historical baseline.
 
     Delegates verbatim to the existing, validated sampler so this morphology is
@@ -159,7 +159,7 @@ def _band_and_duration(gen, fchans: int, total_tchans: int) -> Tuple[float, floa
     return float(fchans) * p.df, float(total_tchans) * p.dt
 
 
-def _sample_accelerating(gen, fchans: int, total_tchans: int) -> Site:
+def _sample_accelerating(gen, fchans: int, total_tchans: int, n_obs: int = 6) -> Site:
     """Trick 2a — quadratically accelerating drift (``squared_path``).
 
     Physically: a transmitter whose line-of-sight acceleration is non-negligible
@@ -215,7 +215,7 @@ def _sample_accelerating(gen, fchans: int, total_tchans: int) -> Site:
     )
 
 
-def _sample_sinusoidal(gen, fchans: int, total_tchans: int) -> Site:
+def _sample_sinusoidal(gen, fchans: int, total_tchans: int, n_obs: int = 6) -> Site:
     """Trick 2b — sinusoidally modulated drift (``sine_path``).
 
     Physically: the Doppler signature of a transmitter on a rotating or orbiting
@@ -267,7 +267,7 @@ def _sample_sinusoidal(gen, fchans: int, total_tchans: int) -> Site:
     )
 
 
-def _sample_pulsed(gen, fchans: int, total_tchans: int) -> Site:
+def _sample_pulsed(gen, fchans: int, total_tchans: int, n_obs: int = 6) -> Site:
     """Trick 3 — wide-band periodic pulse train (radar/beacon-like).
 
     Reuses ``WidebandPulsedGenerator``'s frequency-extent and pulse sampling,
@@ -275,10 +275,22 @@ def _sample_pulsed(gen, fchans: int, total_tchans: int) -> Site:
     generator's own single-frame ``inject_signal``, so the OFF observations stay
     untouched exactly as for every other morphology here.
 
-    The pulse period is sampled against the FULL cadence time extent, not one
-    observation: a train whose period is a large fraction of a single 16-bin
-    observation would show one pulse per ON block and be indistinguishable from
-    an intermittent constant signal.
+    **The pulse period is capped at ONE observation's length**, not the cadence's.
+    An ON observation is only ``total_tchans / n_obs`` bins (16 for the 0000
+    product) while the generator's own default allows periods up to half the
+    frame (48 bins); a train with a period longer than an observation can place
+    zero pulses inside an ON block, and the sweep would then record "pulsed
+    signal not recovered" for a window that contains no pulse at all — the same
+    silent failure mode as an out-of-band track, and just as easy to misread as
+    a real negative. Capping at the observation length guarantees at least one
+    pulse per ON block, so the measurement is detectability rather than luck of
+    the beacon's phase.
+
+    The cost is a declared scope restriction: this tests beacons whose period is
+    short relative to a single observation. Longer-period trains are a genuinely
+    different (and interesting) morphology — they degenerate towards "present in
+    some ON blocks only" — but they belong to a separate experiment where the
+    number of illuminated ON blocks is the measured variable, not a nuisance.
 
     ``snr`` is a per-pulse peak level here, not a frame-integrated SNR — the
     train is off for most of the frame, so integrated SNR is roughly
@@ -289,8 +301,10 @@ def _sample_pulsed(gen, fchans: int, total_tchans: int) -> Site:
     width_hz = max(1.0, frac * fchans) * p.df
     f_profile, f_name = gen._select_f_profile(width_hz)
 
-    period_max = max(p.period_bins_min + 1.0, p.period_bins_max_frac * total_tchans)
-    period_bins = float(gen.rng.uniform(p.period_bins_min, period_max))
+    tchans_per_obs = max(1, int(total_tchans // max(1, n_obs)))
+    period_max = min(p.period_bins_max_frac * total_tchans, float(tchans_per_obs))
+    period_min = min(p.period_bins_min, period_max)
+    period_bins = float(gen.rng.uniform(period_min, max(period_min + 1e-9, period_max)))
     pulse_width_bins = float(gen.rng.uniform(1.0, max(1.0, p.duty_max * period_bins)))
     period_s, pulse_width_s = period_bins * p.dt, pulse_width_bins * p.dt
 
@@ -316,6 +330,8 @@ def _sample_pulsed(gen, fchans: int, total_tchans: int) -> Site:
         meta={"path": "constant", "width": width_hz, "width_frac": frac,
               "f_profile": f_name, "t_profile": "periodic_gaussian",
               "period_s": period_s, "pulse_width_s": pulse_width_s,
+              "period_bins": period_bins, "tchans_per_obs": tchans_per_obs,
+              "pulses_per_obs": tchans_per_obs / period_bins,
               "duty": pulse_width_bins / period_bins,
               "start_channel": int(start_channel), "snr_convention": "pulse_peak"},
     )

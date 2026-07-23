@@ -32,12 +32,20 @@ def background():
 
 @pytest.mark.parametrize("name", MORPHOLOGIES)
 def test_off_observations_untouched(name, data_cfg, background):
+    """OFF observations must come back bit-for-bit, as a real signal would vanish.
+
+    Compared in float32 because the injector returns float32: against a float64
+    background every element differs by ~5e-7 from the cast alone, which is not
+    signal. Asserting in the returned dtype keeps this an exact-equality test
+    rather than a tolerance that could hide a genuinely leaking injection.
+    """
     inj = build_morphology(name, data_cfg, seed=1)
     site = inj.sample_site(fchans=1024, total_tchans=96)
     out, _ = inj.inject(background, site, snr=50.0)
 
+    expected = background.astype(np.float32)
     for i in OFF:
-        np.testing.assert_allclose(out[i], background[i], rtol=0, atol=0)
+        np.testing.assert_array_equal(out[i], expected[i])
 
 
 @pytest.mark.parametrize("name", MORPHOLOGIES)
@@ -52,13 +60,17 @@ def test_signal_lands_in_band(name, data_cfg, background):
     site = inj.sample_site(fchans=1024, total_tchans=96)
     out, _ = inj.inject(background, site, snr=50.0)
 
+    # Peak excess, not summed excess: summing 16384 float32 cells carries ~0.02
+    # of accumulation error, a noise floor comparable to a faint injection. A
+    # single-pixel maximum has no such floor.
+    expected = background.astype(np.float32)
     for i in ON:
-        excess = float(out[i].sum() - background[i].sum())
-        assert excess > 0, f"{name}: ON observation {i} received no power"
+        peak = float((out[i] - expected[i]).max())
+        assert peak > 0, f"{name}: ON observation {i} received no power"
 
 
 @pytest.mark.parametrize("name", MORPHOLOGIES)
-@pytest.mark.parametrize("seed", range(8))
+@pytest.mark.parametrize("seed", range(48))
 def test_in_band_across_seeds(name, data_cfg, background, seed):
     """Containment must hold for the whole sampled parameter range, not one draw.
 
@@ -69,10 +81,10 @@ def test_in_band_across_seeds(name, data_cfg, background, seed):
     site = inj.sample_site(fchans=1024, total_tchans=96)
     out, _ = inj.inject(background, site, snr=50.0)
 
-    total_excess = float(out[list(ON)].sum() - background[list(ON)].sum())
-    assert total_excess > 0
+    expected = background.astype(np.float32)
     for i in ON:
-        assert float(out[i].sum() - background[i].sum()) > 0
+        peak = float((out[i] - expected[i]).max())
+        assert peak > 0, f"{name}: ON observation {i} empty at seed {seed}"
 
 
 @pytest.mark.parametrize("name", MORPHOLOGIES)
@@ -89,8 +101,9 @@ def test_morphology_frozen_across_snr(name, data_cfg, background):
     lo, _ = inj.inject(background, site, snr=10.0)
     hi, _ = inj.inject(background, site, snr=40.0)
 
-    support_lo = (lo[list(ON)] - background[list(ON)]) > 1e-9
-    support_hi = (hi[list(ON)] - background[list(ON)]) > 1e-9
+    expected = background.astype(np.float32)
+    support_lo = (lo[list(ON)] - expected[list(ON)]) > 1e-9
+    support_hi = (hi[list(ON)] - expected[list(ON)]) > 1e-9
     # The louder injection may light up marginally more of the profile tail, so
     # require containment rather than equality.
     assert support_lo.sum() > 0
