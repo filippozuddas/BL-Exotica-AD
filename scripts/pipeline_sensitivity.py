@@ -69,7 +69,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import scripts.inference as inf
-from scripts.inject_recover import extract_obs_windows, preprocess_injected
+from scripts.inject_recover import (
+    PREPROC_MODES, extract_obs_windows, preprocess_injected,
+)
 from src.data.torch_dataset import _load_full_obs
 from src.data.morphologies import MORPHOLOGIES, build_morphology
 from src.search.candidates import off_noise_ceiling, on_off_contrast, full_row_hits
@@ -130,6 +132,13 @@ def parse_args():
                         "injection site and its background, so the comparison "
                         "between them is paired.")
     p.add_argument("--method", default="topk")
+    p.add_argument("--preproc_mode", default="per_obs", choices=PREPROC_MODES,
+                   help="Must match the normalization the cached --run_dir scores "
+                        "were produced with, otherwise every threshold read out of "
+                        "maps.npz (thresh_3, far_thresh, off_ceiling) is compared "
+                        "against injection scores from a different domain. The "
+                        "production run used 'per_obs'; runs before 2026-07-23 "
+                        "silently used 'legacy_concat' for the injections only.")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -137,6 +146,18 @@ def parse_args():
 def main():
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Same self-describing convention as inject_recover.py: the thresholds this
+    # script reads are produced by a *different* run, so the arguments that decide
+    # whether the two line up (--run_dir, --map_dir, --preproc_mode, --method) have
+    # to survive in the output, not just in a shell history.
+    print("=" * 70)
+    print("RESOLVED ARGS")
+    print("=" * 70)
+    for key, value in sorted(vars(args).items()):
+        print(f"  {key}: {value}")
+    print("=" * 70)
+
     rng = np.random.default_rng(args.seed)
 
     with open(args.data_config) as f:
@@ -259,7 +280,8 @@ def main():
                 for snr in args.snr_list:
                     injected, inj_info = injector.inject(
                         raw, site, snr, on_indices=(0, 2, 4))
-                    snip = preprocess_injected(injected, preproc)
+                    snip = preprocess_injected(injected, preproc,
+                                               mode=args.preproc_mode)
                     x = torch.from_numpy(snip).float().unsqueeze(0).unsqueeze(0).to(args.device)
                     with torch.no_grad():
                         score = float(model.anomaly_score(x, method=args.method).item())

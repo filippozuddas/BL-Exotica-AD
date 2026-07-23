@@ -57,6 +57,7 @@ from src.utils.visualization import overlay_anomaly_map
 INPUT_SHAPE = (96, 1024, 1)
 DEFAULT_METHODS = ["recon", "cadence"]
 MAD_SCALE = 1.4826
+PREPROC_MODES = ("per_obs", "legacy_concat")
 
 logger = logging.getLogger("inject_recover")
 
@@ -110,16 +111,45 @@ def reconstruct_snippet(model, snippet, device):
     return recon.squeeze().cpu().numpy()
 
 
-def preprocess_raw_window(obs_arrays, f_start, fchans, preproc, tchans=96):
-    """Slice a (tchans, fchans) window from loaded obs arrays and preprocess."""
-    frames = [obs[:, f_start:f_start + fchans] for obs in obs_arrays]
-    stacked = np.concatenate(frames, axis=0)[:tchans, :]
+def normalize_frames(frames, preproc, tchans=96, mode="per_obs"):
+    """Assemble per-observation windows into one preprocessed (tchans, fchans) frame.
+
+    ``per_obs`` normalizes each observation on its own and *then* concatenates —
+    byte-identical to ``scripts/inference.py::_preprocess_at`` and to
+    ``torch_dataset``'s two ``__getitem__``s since commit ``4b5660c``
+    (2026-07-09). This is the domain the production search actually runs in, so
+    it is the default: a benchmark whose background lives in a different domain
+    than the pipeline it is meant to characterise is not measuring that pipeline.
+
+    ``legacy_concat`` is the pre-``4b5660c`` order — concatenate first, then
+    normalize the whole 96-row block once. It leaves the real power step between
+    observations in the frame and divides the whole cadence by one common MAD
+    (see the ``gbt_fine_normalization_bug`` write-up). Every run under
+    ``outputs/inject_recovery/`` before 2026-07-23 was measured this way, and so
+    was the training of the frozen production checkpoint ``6d0d1ba``, so the mode
+    is kept for reproducing those numbers — not because it is correct.
+    """
+    if mode not in PREPROC_MODES:
+        raise ValueError(f"preproc_mode must be one of {PREPROC_MODES}, got '{mode}'")
     method = preproc.get("bandpass_method", "polynomial")
     poly_degree = preproc.get("poly_degree", 3)
     mad_epsilon = preproc.get("mad_epsilon", 1e-6)
+    if mode == "per_obs":
+        normed = [
+            core_transform(bandpass_correct(f, method=method, poly_degree=poly_degree),
+                           mad_epsilon)
+            for f in frames
+        ]
+        return np.concatenate(normed, axis=0)[:tchans, :]
+    stacked = np.concatenate(frames, axis=0)[:tchans, :]
     stacked = bandpass_correct(stacked, method=method, poly_degree=poly_degree)
-    stacked = core_transform(stacked, mad_epsilon)
-    return stacked
+    return core_transform(stacked, mad_epsilon)
+
+
+def preprocess_raw_window(obs_arrays, f_start, fchans, preproc, tchans=96, mode="per_obs"):
+    """Slice a (tchans, fchans) window from loaded obs arrays and preprocess."""
+    frames = [obs[:, f_start:f_start + fchans] for obs in obs_arrays]
+    return normalize_frames(frames, preproc, tchans, mode)
 
 
 def extract_obs_windows(obs_arrays, f_start, fchans, tchans_per_obs=16):
@@ -127,15 +157,9 @@ def extract_obs_windows(obs_arrays, f_start, fchans, tchans_per_obs=16):
     return np.stack([obs[:tchans_per_obs, f_start:f_start + fchans] for obs in obs_arrays])
 
 
-def preprocess_injected(raw_snippet, preproc, tchans=96):
+def preprocess_injected(raw_snippet, preproc, tchans=96, mode="per_obs"):
     """Preprocess an injected raw snippet (n_obs, tchans_per_obs, fchans)."""
-    method = preproc.get("bandpass_method", "polynomial")
-    poly_degree = preproc.get("poly_degree", 3)
-    mad_epsilon = preproc.get("mad_epsilon", 1e-6)
-    frame = np.concatenate(raw_snippet, axis=0)[:tchans, :]
-    frame = bandpass_correct(frame, method=method, poly_degree=poly_degree)
-    frame = core_transform(frame, mad_epsilon)
-    return frame.astype(np.float32)
+    return normalize_frames(list(raw_snippet), preproc, tchans, mode).astype(np.float32)
 
 
 def parse_args():
@@ -168,6 +192,12 @@ def parse_args():
                         "79.11/95.56/100.0 baseline. Outputs are stamped with "
                         "the morphology name, so runs do not overwrite each other.")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--preproc_mode", default="per_obs", choices=PREPROC_MODES,
+                   help="Normalization order (see normalize_frames). 'per_obs' is "
+                        "what the production search runs; 'legacy_concat' reproduces "
+                        "every inject_recovery run before 2026-07-23. This choice "
+                        "moves BOTH the background threshold and the injection-site "
+                        "selection, so runs in different modes are not comparable.")
     p.add_argument("--methods", nargs="+", default=None,
                    help="Scoring methods to test (default: all supported by model)")
     p.add_argument("--topk_frac", type=float, default=None,
@@ -283,7 +313,8 @@ def main():
         need_recon_probe = "recon" not in methods
         recon_probe_list = [] if need_recon_probe else None
         for fs in probe_fstarts:
-            snip = preprocess_raw_window(obs_arrays, fs, fchans, preproc)
+            snip = preprocess_raw_window(obs_arrays, fs, fchans, preproc,
+                                         mode=args.preproc_mode)
             for m in methods:
                 probe_scores[m].append(score_snippet(model, snip, m, args.device, args.topk_frac))
             if need_recon_probe:
@@ -322,7 +353,7 @@ def main():
 
             for snr in args.snr_list:
                 raw_inj, _ = injector.inject(obs_windows, site, snr)
-                snip_inj = preprocess_injected(raw_inj, preproc)
+                snip_inj = preprocess_injected(raw_inj, preproc, mode=args.preproc_mode)
 
                 for m in methods:
                     s = score_snippet(model, snip_inj, m, args.device, args.topk_frac)
@@ -591,7 +622,8 @@ def main():
 
     probe_fstarts = rng.choice((nchans - fchans), size=50, replace=False)
     probe_scores = [score_snippet(model,
-                    preprocess_raw_window(obs_arrays, fs, fchans, preproc),
+                    preprocess_raw_window(obs_arrays, fs, fchans, preproc,
+                                          mode=args.preproc_mode),
                     "recon", args.device) for fs in probe_fstarts]
     quiet_fs = probe_fstarts[np.argmin(probe_scores)]
 
@@ -601,8 +633,9 @@ def main():
 
     for snr in [5, 10, 20]:
         raw_inj, _ = example_injector.inject(example_obs_windows, example_site, snr)
-        snip_inj = preprocess_injected(raw_inj, preproc)
-        snip_clean = preprocess_raw_window(obs_arrays, quiet_fs, fchans, preproc)
+        snip_inj = preprocess_injected(raw_inj, preproc, mode=args.preproc_mode)
+        snip_clean = preprocess_raw_window(obs_arrays, quiet_fs, fchans, preproc,
+                                           mode=args.preproc_mode)
         try:
             recon_arr = reconstruct_snippet(model, snip_inj, args.device)
         except NotImplementedError:
